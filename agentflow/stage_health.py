@@ -103,8 +103,9 @@ def _finished(sessions) -> bool:
     budget on failing to. An attempt that has done neither may still get another session, so
     it is not counted — a stage caught mid-run must never read as a stage producing nothing.
     """
-    return (any(s.verified for s in sessions)
-            or max(s.attempt for s in sessions) >= ATTEMPT_BUDGET)
+    completed = [s for s in sessions if not s.interrupted_by_restart]
+    return (any(s.verified for s in completed)
+            or max((s.attempt for s in completed), default=0) >= ATTEMPT_BUDGET)
 
 
 def stage_health(store_path=None, *, window: int = DROUGHT_WINDOW) -> list[dict]:

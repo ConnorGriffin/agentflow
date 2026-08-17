@@ -73,13 +73,16 @@ def _write_proposal(record, draft):
 
 # --- build-issue staging: the finalizer adopts a session draft as an immutable Proposal --
 
-def test_a_build_issue_turn_picks_the_drafting_prompt(coord_state):
+def test_a_build_issue_turn_picks_the_drafting_prompt(coord_state, monkeypatch):
     """Operator intent alone routes the turn (one input surface, no draft button): a "write this up
     as a build issue" message runs the drafting prompt and asks the session for the structured
     proposal artifact; an ordinary question does not."""
+    revision = "3" * 40
+    monkeypatch.setattr(coordinated_converse, "capture_subject_revision", lambda _root: revision)
     build = coordinated_converse.converse_submission(
         REPO, str(coord_state), "conv-1", 0, "write this up as a build issue")
     assert "ask-proposal-0.json" in build.input_ptr
+    assert build.subject_revision == revision
     plain = coordinated_converse.converse_submission(
         REPO, str(coord_state), "conv-1", 0, "what does the repo do?")
     assert "ask-proposal-0.json" not in plain.input_ptr

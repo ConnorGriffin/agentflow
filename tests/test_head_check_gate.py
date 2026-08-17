@@ -1,11 +1,11 @@
 """The head check gate (ADR 417): a review may not finish clean while the exact reviewed
-commit has a red check.
+commit has a red or pending check.
 
 The gate is decided from GitHub at settlement — a reviewer cannot clear it by not looking. A
 caught red opens a revise round (the machine-fixable failure the revise budget exists for);
-``action_required`` and spent rounds park with the failing check named; pending, absent,
-skipped, and cancelled checks change nothing; an unreadable answer defers only the clean
-settlement while every park still completes.
+``action_required`` and spent rounds park with the failing check named; pending checks park
+without spending a revise round; absent, skipped, and cancelled checks change nothing; an
+unreadable answer defers only the clean settlement while every park still completes.
 """
 
 from types import SimpleNamespace
@@ -16,6 +16,7 @@ from agentflow import coordinated_review, coordinated_revise, github, pipeline
 from agentflow.coordinator.profiles import profile_for
 from agentflow.coordinator.record import Record
 from agentflow.github import HeadChecks, head_checks_from_rollup
+from agentflow.review_policy import UIVerification
 from agentflow.reviewer import Verdict
 
 
@@ -83,6 +84,7 @@ def _completed_review_record(*, profile="reviewed", round=0):
     return Record(
         identity=f"o/r|7|review|sha-a|{profile}", stage="review", pool="codex", demand=2,
         repo="o/r", subject="7", target="sha-a", builder_lineage="claude",
+        change_author_tool="claude",
         source="/work/.agentflow/worktrees/codex-review/pr-42-fix", state="completed",
         auto_merge_allowed=True, round=round)
 
@@ -165,15 +167,57 @@ def test_action_required_parks_immediately_without_spending_a_revise_round(monke
     assert any("deploy" in line for line in world.park_checks)
 
 
-def test_all_pending_or_absent_or_skipped_checks_settle_exactly_as_today(monkeypatch):
-    for rollup in (HeadChecks(sha="sha-a", pending=True),
-                   HeadChecks(sha="sha-a"),
+def test_a_pending_reviewed_head_parks_without_publishing_a_clean_summary(monkeypatch):
+    """A pending required check is not a PASS-by-absence. Parking terminates a check that
+    never resolves without spending or re-running a review."""
+    record = _completed_review_record()
+    world = _wire_clean_settlement(monkeypatch, record, head_checks=HeadChecks(
+        sha="sha-a", pending=True))
+
+    coordinated_review._settle_review(record)
+    assert world.summarized == []
+    assert world.parked == [coordinated_review.PENDING_CHECK_REASON]
+    assert any("still pending" in line and "sha-a" in line for line in world.park_checks)
+
+
+def test_absent_or_skipped_checks_settle_exactly_as_today(monkeypatch):
+    for rollup in (HeadChecks(sha="sha-a"),
                    head_checks_from_rollup([_check_run("dco", conclusion="SKIPPED")], "sha-a")):
         record = _completed_review_record()
         world = _wire_clean_settlement(monkeypatch, record, head_checks=rollup)
         assert (coordinated_review._settle_review(record)
                 == "https://github.com/o/r/pull/42")
         assert world.summarized == [("o/r", 42, "sha-a")] and world.parked == []
+
+
+def test_unavailable_ui_verification_parks_instead_of_settling_pass(monkeypatch):
+    record = _completed_review_record()
+    world = _wire_clean_settlement(monkeypatch, record, head_checks=HeadChecks(sha="sha-a"))
+    monkeypatch.setattr("agentflow.coordinated_review.ui_surfaces", lambda _workdir: ["app/ui/"])
+    monkeypatch.setattr("agentflow.github.pr_content", lambda _repo, _pr: github.PrContent(
+        body="", paths=("app/ui/dashboard.js", "docs/screenshots/dashboard-after.png"), comments=[]))
+    monkeypatch.setattr(coordinated_review, "_review_verdict", lambda _record: Verdict(
+        clean=False, checks=("Replay launch blocked by macOS Chromium permissions",),
+        ui_verification=UIVerification.UNAVAILABLE))
+
+    coordinated_review._settle_review(record)
+
+    assert world.summarized == []
+    assert world.parked == [coordinated_review.UI_VERIFICATION_UNAVAILABLE_REASON]
+    assert any("Replay launch blocked" in line for line in world.park_checks)
+
+
+def test_unreadable_ui_verification_requirement_parks_fail_closed(monkeypatch):
+    record = _completed_review_record()
+    world = _wire_clean_settlement(monkeypatch, record, head_checks=HeadChecks(sha="sha-a"))
+    monkeypatch.setattr("agentflow.coordinated_review.ui_surfaces", lambda _workdir: ["app/ui/"])
+    monkeypatch.setattr("agentflow.gate.ui_evidence_gap", lambda *_args: False)
+    monkeypatch.setattr("agentflow.gate.ui_verification_required", lambda *_args: None)
+
+    coordinated_review._settle_review(record)
+
+    assert world.summarized == []
+    assert world.parked == [coordinated_review.UI_VERIFICATION_UNKNOWN_REASON]
 
 
 def test_only_the_check_read_unreadable_defers_the_clean_settlement_silently(monkeypatch):

@@ -67,6 +67,18 @@ def test_structured_review_requires_recorded_checks():
     assert result.parsed is False and "checks" in result.detail
 
 
+def test_unavailable_ui_verification_cannot_settle_a_pass():
+    result = parse_review_result(json.dumps({
+        "verdict": "PASS", "depth": "targeted", "depth_reason": "one journey",
+        "axis": "combined", "change_author_tool": "claude", "reviewed_sha": "head",
+        "final_sha": "head", "pushed_sha": "", "fixes": [], "follow_ups": [],
+        "checks": ["Replay launch blocked by macOS Chromium permissions"], "findings": [],
+        "uncertainty": None, "decision": "", "ui_verification": "unavailable",
+    }), expected_sha="head")
+
+    assert result.parsed is True and result.clean is False
+
+
 def test_follow_up_proposal_is_zero_or_one_and_required_exactly_for_its_finding():
     base = {
         "verdict": "PASS", "depth": "targeted", "depth_reason": "one journey",
@@ -127,6 +139,15 @@ def test_historical_follow_up_references_do_not_block_one_current_proposal():
          "url": "https://github.com/o/r/issues/9"},
         {"desired_outcome": "new outcome", "evidence": "new evidence"},
     ]
+
+
+def test_durable_finding_decode_rejects_an_unknown_failure_class():
+    payload = json.dumps([{
+        "action": "fix_before_completion", "summary": "fix", "grounding": "contract",
+        "file": "agentflow/example.py", "line": 1, "failure_class": "invented",
+    }])
+
+    assert decode_findings(payload) is None
 
 
 def test_later_review_replaces_or_clears_the_current_follow_up_proposal():
@@ -296,7 +317,7 @@ def test_session_led_reviewer_push_keeps_the_generated_contract_terminal(monkeyp
 
     build = Record(
         identity="o/r|7|build|-", stage="build", pool="claude", demand=5,
-        repo="o/r", subject="7",
+        repo="o/r", subject="7", change_author_tool="claude",
         source="/work/.agentflow/worktrees/claude/issue-7-fix")
     opening = coordinated_review.review_submission(
         build, "old-head", "codex", 42, acceptance="Preserve the public behavior.")
@@ -340,7 +361,7 @@ def _proven_session_led_review(*, state=None, legacy_provenance=False, head_sha=
 
     build = Record(
         identity="o/r|7|build|-", stage="build", pool="claude", demand=5,
-        repo="o/r", subject="7",
+        repo="o/r", subject="7", change_author_tool="claude",
         source="/work/.agentflow/worktrees/claude/issue-7-fix")
     opening = coordinated_review.review_submission(
         build, head_sha, "codex", 42, acceptance="Preserve the public behavior.",
@@ -987,7 +1008,7 @@ def test_taint_recovery_chooses_only_latest_forced_autonomous_record(monkeypatch
     submitted = []
 
     coordinated_review._resume_tainted_reviews(
-        SimpleNamespace(submit_stage=submitted.append))
+        SimpleNamespace(submit_stage=submitted.append, _manages_repository=lambda _repo: True))
 
     assert chosen == ["latest"]
     assert len(submitted) == 1

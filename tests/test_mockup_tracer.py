@@ -17,7 +17,9 @@ from agentflow.coordinator.record import Record
 from agentflow.worktree_ref import WorktreeRef
 
 
-def test_mockup_submission_is_one_stable_variant_round_on_the_original_lineage():
+def test_mockup_submission_is_one_stable_variant_round_on_the_original_lineage(monkeypatch):
+    revision = "2" * 40
+    monkeypatch.setattr(worktree_ref, "capture_subject_revision", lambda _root: revision)
     cfg = SimpleNamespace(repo="o/r", workdir="/home/w")
     issue = {"number": 11, "title": "Compare navigation concepts", "body": "Draw variants"}
 
@@ -26,6 +28,7 @@ def test_mockup_submission_is_one_stable_variant_round_on_the_original_lineage()
 
     assert first == again
     assert first.stage == "mockup" and first.subject == "11" and first.target is None
+    assert first.subject_revision == revision
     assert first.pool == first.builder_lineage == "claude"
     assert first.complexity == "deep" and first.claim is True
     # State the owned worktree through the layout owner, not a hand-written path: the submission
@@ -301,6 +304,8 @@ def test_public_prepare_proves_drawing_claim_before_creating_or_admitting_worktr
                 else frozenset({"agentflow:needs-mockup"}))
 
     monkeypatch.setattr("agentflow.stage_worktree._run", git)
+    monkeypatch.setattr("agentflow.stage_worktree.mark_worktree_owned", lambda *_a, **_k: None)
+    monkeypatch.setattr("agentflow.worktree_ref.capture_subject_revision", lambda _workdir: "a" * 40)
     monkeypatch.setattr("agentflow.github.issue_labels", issue_labels)
     monkeypatch.setattr("agentflow.runner.ClaudeRunner.provision", lambda self, wt: None)
     adapter = MockupStageAdapter(
@@ -324,7 +329,7 @@ def test_public_prepare_proves_drawing_claim_before_creating_or_admitting_worktr
     coord.cycle("claude")
     assert record_of(coord, ident).attempts == 1 and permits(coord, "claude") == 5
     added = next(call for call in calls if "worktree" in call and "add" in call)
-    assert "origin/main" in added
+    assert "a" * 40 in added
 
 
 def test_drawing_ownership_comes_only_from_durable_mockup_records():

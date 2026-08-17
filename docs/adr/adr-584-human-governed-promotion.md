@@ -29,6 +29,11 @@ and merge-tree digests. Neither component adds an Evidence verb.
 the pointer and requires the active scope version to be the declared prior version. Exact replay
 returns its durable receipt without reconstructing unavailable source content.
 
+Issue #694 makes allocation explicit: a promotion must name the immediate successor of its prior
+version, not merely a greater integer. The Evaluation bootstrap owns fleet-policy version 1, so the
+first later fleet promotion is `1-to-2`; skipped versions and a second `0-to-1` transition are
+rejected without weakening exact authority verification or the single-winner transaction.
+
 SQLite schema v4 marks every newly verified receipt with the exact merged-PR promotion contract.
 The transactional v3→v4 migration demotes all pre-584 `verified` receipts to
 `legacy_unverifiable`; those receipts remain durable history but cannot replay as active policy.

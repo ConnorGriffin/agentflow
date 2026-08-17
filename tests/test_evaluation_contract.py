@@ -57,6 +57,16 @@ def _thaw(value: object) -> object:
     return value
 
 
+def _input_matches_declared_schema(candidate: dict[str, object], case: dict[str, object]) -> bool:
+    contracts = {row["operation_id"]: row for row in candidate["operation_contracts"]}
+    operation = contracts.get(case["operation_id"])
+    if operation is None:
+        return True
+    schema = candidate["schemas"][operation["input_schema"]]
+    return evaluation_contract._value_matches(
+        case["input_value"], schema["root"], schema["definitions"])
+
+
 def _write_artifact(root: Path, relative: str, value: object) -> tuple[PurePosixPath, str]:
     path = root / relative
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -83,49 +93,73 @@ def test_pinned_bytes_and_closed_fixture_directory_are_exact():
 
 def test_every_declared_fixture_calls_exact_evaluate_v1_and_returns_immutable_result(contract):
     cases = [json.loads(path.read_text()) for path in _case_files()]
-    results = [contract.evaluate(case["operation_id"], case["input_value"]) for case in cases]
+    candidate = json.loads(CONTRACT.read_text())
+    accepted = [case for case in cases if _input_matches_declared_schema(candidate, case)]
+    rejected = [case for case in cases if case not in accepted]
+    results = [contract.evaluate(case["operation_id"], case["input_value"]) for case in accepted]
 
     assert len(cases) == 33
-    assert [_thaw(result) for result in results] == [case["expected_result"] for case in cases]
+    assert [_thaw(result) for result in results] == [case["expected_result"] for case in accepted]
+    for case in rejected:
+        with pytest.raises(EvaluationContractError) as malformed:
+            contract.evaluate(case["operation_id"], case["input_value"])
+        assert (malformed.value.code, malformed.value.basename) == ("E_SEMANTIC", "<module>")
     with pytest.raises(TypeError):
         results[0]["status"] = "changed"
 
 
-def test_evaluate_dispatches_exact_module_before_local_input_rejection(contract):
-    result = contract.evaluate(
-        contract.operation_ids["schedule"],
-        {"case_id_pages": [], "partition": 1.5, "seed": 0},
-    )
+def test_evaluate_rejects_invalid_declared_input_before_semantics(contract):
+    with pytest.raises(EvaluationContractError) as malformed:
+        contract.evaluate(
+            contract.operation_ids["schedule"],
+            {"case_id_pages": [], "partition": 1.5, "seed": 0},
+        )
 
-    assert _thaw(result) == {
-        "code": "EVAL_V1_PAIRING",
-        "operation_id": contract.operation_ids["schedule"],
-        "path": "/partition",
-        "status": "error",
-    }
+    assert (malformed.value.code, malformed.value.basename) == ("E_SEMANTIC", "<module>")
+
+
+def test_evaluate_rejects_undeclared_and_boolean_schedule_input_before_semantics(contract):
+    with pytest.raises(EvaluationContractError) as malformed:
+        contract.evaluate(contract.operation_ids["schedule"], {
+            "case_id_pages": [{"case_ids": ["case-a"]}],
+            "partition": "corpus",
+            "seed": False,
+            "undeclared": True,
+        })
+
+    assert (malformed.value.code, malformed.value.basename) == ("E_SEMANTIC", "<module>")
 
 
 def test_negative_fixture_mutations_cover_each_declared_rejection_code(contract):
     candidate = json.loads(CONTRACT.read_text())
     expected_codes = set(candidate["semantic_errors"].values())
     observed_codes: set[str] = set()
+    rejected_codes: set[str] = set()
     for path in sorted((FIXTURES / "negative").glob("*.json")):
         case = json.loads(path.read_text())
+        if not _input_matches_declared_schema(candidate, case):
+            with pytest.raises(EvaluationContractError) as malformed:
+                contract.evaluate(case["operation_id"], case["input_value"])
+            assert (malformed.value.code, malformed.value.basename) == ("E_SEMANTIC", "<module>")
+            rejected_codes.add(case["expected_result"]["code"])
+            continue
         result = contract.evaluate(case["operation_id"], case["input_value"])
         assert result["status"] == "error"
         assert result["code"] in case["coverage"]
         observed_codes.add(result["code"])
-    assert observed_codes == expected_codes
+    assert observed_codes | rejected_codes == expected_codes
 
 
 def test_adr_606_missingness_and_canonical_lineage_branches(contract):
     cases = {path.stem: json.loads(path.read_text()) for path in _case_files()}
-    unavailable = contract.evaluate(cases["unavailable-arm"]["operation_id"], cases["unavailable-arm"]["input_value"])
-    reported = contract.evaluate(cases["reported-optional-null"]["operation_id"], cases["reported-optional-null"]["input_value"])
+    with pytest.raises(EvaluationContractError) as unavailable:
+        contract.evaluate(cases["unavailable-arm"]["operation_id"], cases["unavailable-arm"]["input_value"])
+    with pytest.raises(EvaluationContractError) as reported:
+        contract.evaluate(cases["reported-optional-null"]["operation_id"], cases["reported-optional-null"]["input_value"])
     forged = contract.evaluate(cases["forged-lineage"]["operation_id"], cases["forged-lineage"]["input_value"])
 
-    assert _thaw(unavailable) == cases["unavailable-arm"]["expected_result"]
-    assert _thaw(reported) == cases["reported-optional-null"]["expected_result"]
+    assert (unavailable.value.code, unavailable.value.basename) == ("E_SEMANTIC", "<module>")
+    assert (reported.value.code, reported.value.basename) == ("E_SEMANTIC", "<module>")
     assert forged["code"] == "EVAL_V1_LINEAGE"
 
 
@@ -260,17 +294,13 @@ def test_dispatch_uses_sealed_auditor_when_module_global_is_replaced(contract, m
 
     monkeypatch.setattr(evaluation_contract, "_audit_module", replacement)
     operation_id = contract.operation_ids["schedule"]
-    result = contract.evaluate(
-        operation_id, {"case_id_pages": [], "partition": 1.5, "seed": 0},
-    )
+    with pytest.raises(EvaluationContractError) as malformed:
+        contract.evaluate(
+            operation_id, {"case_id_pages": [], "partition": 1.5, "seed": 0},
+        )
 
     assert calls == []
-    assert _thaw(result) == {
-        "code": "EVAL_V1_PAIRING",
-        "operation_id": operation_id,
-        "path": "/partition",
-        "status": "error",
-    }
+    assert (malformed.value.code, malformed.value.basename) == ("E_SEMANTIC", "<module>")
 
 
 def test_path_like_coercion_failures_are_sanitized(contract, tmp_path):

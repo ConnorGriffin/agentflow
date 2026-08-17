@@ -39,6 +39,7 @@ from agentflow.review_policy import (
     ReviewAxis,
     ReviewDepth,
     ReviewFinding,
+    UIVerification,
     Uncertainty,
     parse_review_result,
 )
@@ -82,6 +83,7 @@ class Verdict:
     actions: tuple[ReviewFinding, ...] = ()
     uncertainty: Uncertainty | None = None
     decision: str = ""
+    ui_verification: UIVerification = UIVerification.NOT_REQUIRED
 
     @property
     def blocking(self) -> list[Finding]:
@@ -149,7 +151,7 @@ def parse_verdict(payload: str, expected_sha: str | None = None, *,
                 depth=result.depth, depth_reason=result.depth_reason, axis=result.axis,
                 change_author_tool=result.change_author_tool, follow_ups=result.follow_ups,
                 checks=result.checks, actions=result.findings, uncertainty=result.uncertainty,
-                decision=result.decision)
+                decision=result.decision, ui_verification=result.ui_verification)
 
         raw_findings = data.get("findings", [])
         if not isinstance(raw_findings, list):
@@ -222,8 +224,9 @@ Judge the PR as a merge-ready artifact — its body and evidence, not only its d
 
 Also read the checks reported on the exact head you are reviewing (`gh pr checks {pr}`) and
 record what you saw in your "checks" proof. A red check you can fix, fix and push like any other
-correction. A red check you cannot fix is `fix_before_completion` — never PASS over it. Pending
-checks block nothing. (A mechanical gate also reads the reviewed head's checks at settlement,
+correction. A red check you cannot fix is `fix_before_completion` — never PASS over it. A pending
+required check also cannot support PASS: record `BLOCK` and explain the exact check state. (A
+mechanical gate also reads the reviewed head's checks at settlement,
 independent of your verdict — you cannot waive this one.)
 
 If your local test run fails for reasons that look environmental, a differential run against
@@ -319,10 +322,18 @@ schema natively, so you do not hand-write or fence the JSON; just produce these 
   empty list and "pushed_sha" is an empty string; those earlier fixes are already recorded
   and restating them here contradicts your own push provenance and voids the verdict.
 - "checks": exact proof/checks you completed
+- "ui_verification": "not_required" when the PR changes no declared user-facing surface,
+  "passed" only after you ran the required UI verification, or "unavailable" when the browser
+  verification could not run. If it is unavailable after the prescribed recovery, return `BLOCK`
+  and record the exact failed command and environment cause in "checks"; never replace UI proof
+  with an explanation.
 - "follow_ups": zero or one necessary follow-up proposal as {{"evidence", "desired_outcome"}}.
   Supply exactly one when a `necessary_follow_up` finding is present, otherwise supply none.
 - "findings": unresolved/discarded observations as {{"action", "file", "line", "summary",
-  "grounding"}}. Do not report already-fixed issues as unresolved findings.
+  "grounding", "failure_class"}}. Classify failure independently from action as exactly one of
+  `fix_introduced_defect`, `original_defect`, `plan_gap`, `reviewer_false_claim`,
+  `slice_scope_error`, or `speculative_preference`. Do not report already-fixed issues as
+  unresolved findings.
 - "uncertainty": null, or {{"options": [exactly two], "missing_guidance", "recommendation"}}
 - "decision": the grounded choice for a decision-axis pass, otherwise an empty string
 - "depth", "depth_reason", "axis", and "change_author_tool": repeat the assigned durable values.""" + SHELL_CRIB

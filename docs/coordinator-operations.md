@@ -4,12 +4,14 @@ All provider work is coordinator-owned. There is no legacy execution mode or byp
 
 ## Activate
 
+Complete [capacity calibration](getting-started.md#calibrate-capacity) before
+activation; it is a prerequisite.
+
 Validate the repository configuration, start the daemon under the process supervisor,
 then inspect it while still paused:
 
 ```bash
 uv run agentflow check
-uv run agentflow capacity calibrate
 uv run agentflow service install
 uv run agentflow status
 ```
@@ -56,6 +58,10 @@ The console's `live-sessions.json` is a generated projection. Do not use or edit
 ownership, attempts, permits, claims, or recovery; use the coordinator records and GitHub outcome.
 An orphaned visible claim is held for a one-hour safety grace before removal so a short,
 deterministic interactive scope operation cannot race the daemon.
+
+For the read-only observational report over one repository and UTC window, see
+[Learning pipeline: Run the report](learning-pipeline.md#run-the-report) for its
+bounded facts, missingness, and non-action contract.
 
 ## Console service
 
@@ -110,6 +116,28 @@ different responses:
 Either way, unattended research will never pick this ticket up again, and removing the label
 does not restart it: the run's record is terminal, so a new question wants a new research
 ticket. Do not restore `wayfinder:resolving` by hand.
+
+## Maintenance
+
+Inventory disposable residue without changing Git, worktrees, files, or Codebase Memory:
+
+```bash
+uv run agentflow maintenance
+```
+
+The command emits JSONL records with `action`, `eligible`, `reason`, and either `path` or
+`project`. Review that complete inventory, then apply the same guarded reconciliation explicitly:
+
+```bash
+uv run agentflow maintenance --apply
+```
+
+Apply removes only missing Git registrations; inactive, clean worktrees carrying AgentFlow's
+validated disposable ownership marker; exact known historical probes in such worktrees; and graph
+projects whose recorded roots are missing or were removed in that run. It refuses dirty, live,
+held, retained, unknown-owned, reachable, and unreachable entries. A second run is a no-op unless
+new eligible residue appeared. Maintenance is operator-invoked and does not run in the dispatch
+loop.
 
 ## Pause and drain
 

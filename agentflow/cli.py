@@ -71,9 +71,13 @@ def main(argv: list[str] | None = None) -> int | None:
     )
     capability_probe.add_argument("--repo", required=True)
     capability_probe.add_argument("--provider", required=True, choices=("claude", "codex"))
+    maintenance_command = commands.add_parser(
+        "maintenance", help="inventory and prune proven disposable AgentFlow residue"
+    )
+    maintenance_command.add_argument("--apply", action="store_true")
     enroll_command.add_argument(
         "--audit", action="store_true",
-        help="print the fleet-wide UI-surface declaration census and exit",
+        help="print the read-only fleet UI-surface and CI-policy census and exit",
     )
     enroll_command.add_argument(
         "--sync", action="store_true",
@@ -101,6 +105,14 @@ def main(argv: list[str] | None = None) -> int | None:
                                help="UTC start date, inclusive (YYYY-MM-DD)")
     spend_command.add_argument("--to", dest="spend_to", required=True,
                                help="UTC end date, exclusive (YYYY-MM-DD)")
+    learning_command = commands.add_parser("learning", help="report observational learning facts")
+    learning_commands = learning_command.add_subparsers(dest="learning_command", required=True)
+    learning_report = learning_commands.add_parser("report", help="report terminal review and revise facts")
+    learning_report.add_argument("--repo", required=True, help="OWNER/REPO to read")
+    learning_report.add_argument("--from", dest="learning_from", required=True,
+                                 help="UTC start date, inclusive (YYYY-MM-DD)")
+    learning_report.add_argument("--to", dest="learning_to", required=True,
+                                 help="UTC end date, exclusive (YYYY-MM-DD)")
     floodgates_command = commands.add_parser(
         "floodgates", help="fleet-wide headroom override (ADR 0025 amendment)"
     )
@@ -161,6 +173,10 @@ def main(argv: list[str] | None = None) -> int | None:
     )
     authority_commands.add_parser("deploy", help="publish the sealed authority if absent")
     authority_commands.add_parser("status", help="inspect the sealed authority without repair")
+    recover_capability = commands.add_parser(
+        "recover-capability", help="recover zero-attempt capability-held stages"
+    )
+    recover_capability.add_argument("repository", metavar="OWNER/REPO")
     args = parser.parse_args(argv)
 
     if args.command == "check":
@@ -175,6 +191,23 @@ def main(argv: list[str] | None = None) -> int | None:
             f"configuration valid: {count} {noun} "
             f"({workspace_count} workspace)"
         )
+    elif args.command == "recover-capability":
+        from agentflow import daemon
+        from agentflow.pipeline import recover_capability
+
+        try:
+            config = load_config()
+        except ConfigurationError:
+            print(json.dumps({"repository": args.repository, "revision": "", "results": [{"predecessor": "", "successor": "", "status": "skipped", "reason": "repository-unconfigured"}]}, separators=(",", ":")))
+            return 1
+        status, report = recover_capability(
+            args.repository,
+            config,
+            acquire_lock=daemon._acquire_lock,
+            release_lock=daemon._release_lock,
+        )
+        print(json.dumps(report, separators=(",", ":")))
+        return status
     elif args.command == "doctor":
         from agentflow.enroll import doctor, print_doctor
 
@@ -220,6 +253,22 @@ def main(argv: list[str] | None = None) -> int | None:
             parser.error(str(exc))
         print(format_spend_report(report))
         return 0
+    elif args.command == "learning":
+        from datetime import date
+
+        from agentflow.coordinator.errors import StoreUnavailable
+        from agentflow.coordinator.store import default_store_path
+        from agentflow.learning import dumps
+
+        try:
+            start = date.fromisoformat(args.learning_from)
+            end = date.fromisoformat(args.learning_to)
+            if start >= end:
+                raise ValueError("--from must be before --to")
+            sys.stdout.write(dumps(args.repo, start, end, default_store_path()))
+        except (StoreUnavailable, ValueError) as exc:
+            parser.error(str(exc))
+        return 0
     elif args.command == "enroll":
         from agentflow.enroll import _audit_command, configured_repositories, enroll_repository, sync_fleet
 
@@ -248,6 +297,27 @@ def main(argv: list[str] | None = None) -> int | None:
         ready, detail = prove_native_discovery(args.repo, args.provider)
         print(detail)
         return 0 if ready else 1
+    elif args.command == "maintenance":
+        from agentflow.maintenance import (
+            CodebaseMemoryIndex, maintain, maintenance_sources,
+        )
+
+        try:
+            config = load_config()
+        except ConfigurationError as exc:
+            parser.error(str(exc))
+        live, held, state_available = maintenance_sources(config.repositories)
+        records = maintain(
+            config.repositories,
+            apply=args.apply,
+            live_sources=live,
+            held_sources=held,
+            state_available=state_available,
+            index=CodebaseMemoryIndex(),
+        )
+        for record in records:
+            print(json.dumps(record, sort_keys=True, separators=(",", ":")))
+        return 0
     elif args.command == "decision-map-probe":
         from agentflow.operator_projection import decision_map_probe
 

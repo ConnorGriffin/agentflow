@@ -1,8 +1,7 @@
 """The coordinator's public seam (ADR 0030): idempotent logical-stage submission and pool
 cycling, with the admission matrix, continuation priority, atomic permit reservation, and
 provider observations kept private. Everything here is driven through ``submit_stage`` and
-``cycle`` — the only two calls stage orchestration makes. Also asserts the dormant guarantee:
-nothing here is wired into the daemon yet.
+``cycle`` — the only two calls stage orchestration makes.
 """
 
 from __future__ import annotations
@@ -18,9 +17,69 @@ from conftest import FakeSession, NeverStartsLauncher, permits, record_of
 from agentflow.coordinator import Coordinator, StageOutcome, Submission
 from agentflow.coordinator.admission import ADMISSION_MATRIX, PERMIT_BUDGET, admission_demand
 from agentflow.coordinator.providers import ProviderCause
-from agentflow.coordinator.store import ReservationLimits
+from agentflow.coordinator.store import ReservationLimits, Store
 from agentflow.capability_contracts import CapabilityPreflightResult, ContractRequirement
 from agentflow.coordinator.record import Record
+
+
+def test_submission_binds_one_subject_revision_and_route_through_store_seam_before_persistence(
+        make_coord, monkeypatch):
+    calls = []
+    original = Store.route_selection_identity
+
+    def public_identity(store, selection):
+        calls.append(selection)
+        return original(store, selection)
+
+    monkeypatch.setattr(Store, "route_selection_identity", public_identity)
+    coord = make_coord(FakeSession())
+    revision = "a" * 40
+
+    identity = coord.submit_stage(Submission(
+        repo="o/r", subject="627", stage="build", pool="claude", effort="low",
+        subject_revision=revision))
+
+    record = coord.stage_record(identity)
+    assert record is not None
+    assert record.subject_revision == revision
+    assert record.route_id == "production/build/deep/low"
+    assert len(record.route_cell_digest) == 64
+    assert len(record.launch_config_digest) == 64
+    assert len(calls) == 1
+
+
+def test_scoped_coordinator_rejects_foreign_submission_without_persistence(make_coord):
+    route_selections = []
+    coord = make_coord(
+        FakeSession(), managed_repositories=frozenset({"owner/b"}),
+        route_selector=lambda *args, **kwargs: route_selections.append((args, kwargs)))
+
+    with pytest.raises(ValueError, match="outside this coordinator's configured repositories"):
+        coord.submit_stage(Submission(
+            repo="owner/a", subject="680", stage="build", pool="claude", effort="low",
+            subject_revision="a" * 40))
+
+    assert coord._store.load() == {}
+    assert route_selections == []
+
+
+def test_scoped_coordinator_cannot_withdraw_foreign_identity(make_coord, monkeypatch):
+    owner = make_coord(FakeSession())
+    identity = owner.submit_stage(Submission(
+        repo="owner/a", subject="680", stage="build", pool="claude", effort="low"))
+    before = owner.stage_record(identity)
+    assert before is not None
+    discard_calls = []
+    original_discard = Store.discard
+    monkeypatch.setattr(
+        Store, "discard", lambda store, record: discard_calls.append(record) or
+        original_discard(store, record))
+    scoped = make_coord(FakeSession(), managed_repositories=frozenset({"owner/b"}))
+
+    assert scoped.withdraw_stage(identity) is False
+
+    assert scoped.stage_record(identity) == before
+    assert discard_calls == []
 
 
 @pytest.mark.parametrize("provider", ("claude", "codex"))
@@ -95,8 +154,9 @@ def test_historical_record_preflights_retained_source_not_unrelated_capability_r
     calls = []
     monkeypatch.setattr(
         "agentflow.provider_skills.materialize_launch_capabilities",
-        lambda source, destination, provider: calls.append(
-            (source, destination, provider)) or (True, "ok"),
+        lambda source, destination, provider, *, materialize_runtime, requirement_ids:
+            calls.append((source, destination, provider, materialize_runtime, requirement_ids)) or
+            (True, "ok"),
     )
     monkeypatch.setattr(
         "agentflow.capability_contracts.preflight",
@@ -111,7 +171,10 @@ def test_historical_record_preflights_retained_source_not_unrelated_capability_r
     result = pipeline._capability_preflight(record, True)
 
     assert result is not None and result.ready
-    assert calls[0] == (unrelated, retained, "claude")
+    assert calls[0] == (
+        unrelated, retained, "claude", True,
+        {"ui-craft", "drive-local-webapp", "playwright"},
+    )
     assert calls[1][0] == retained
     assert calls[1][3] == ("ui-craft", "drive-local-webapp", "playwright")
 
@@ -127,7 +190,8 @@ def test_pre_582_record_without_capability_facts_derives_real_worktree_root(
     calls = []
     monkeypatch.setattr(
         "agentflow.provider_skills.materialize_launch_capabilities",
-        lambda source, destination, provider: calls.append((source, destination)) or (True, "ok"),
+        lambda source, destination, provider, *, materialize_runtime, requirement_ids:
+            calls.append((source, destination, materialize_runtime, requirement_ids)) or (True, "ok"),
     )
     monkeypatch.setattr(
         "agentflow.capability_contracts.preflight",
@@ -141,7 +205,7 @@ def test_pre_582_record_without_capability_facts_derives_real_worktree_root(
     result = pipeline._capability_preflight(record, True)
 
     assert result is not None and result.ready
-    assert calls == [(main, retained)]
+    assert calls == [(main, retained, False, {"tdd", "codebase-design", "domain-modeling"})]
 
 
 def test_pre_582_record_without_any_safe_surface_fact_fails_closed(tmp_path):
@@ -183,7 +247,7 @@ def test_failed_launch_materialization_never_carries_a_ready_fact(tmp_path, monk
     (launch / "AGENTS.md").write_text("profile: reviewed\nui-surfaces: none\n")
     monkeypatch.setattr(
         "agentflow.provider_skills.materialize_launch_capabilities",
-        lambda *_args: (False, "copy failed"),
+        lambda *_args, **_kwargs: (False, "copy failed"),
     )
     record = Record(
         identity="o/r|5|build|-", stage="build", pool="claude", demand=1,
@@ -644,6 +708,35 @@ def test_delayed_launcher_result_cannot_disown_a_newer_attempt(make_coord):
     assert permits(first, "claude") == before.demand
 
 
+def test_same_cycle_launch_observation_cannot_reconcile_a_newer_attempt(make_coord):
+    """A's post-launch sweep owns v1, never B's successor v2 for the same stage identity."""
+    fake = FakeSession()
+    successor = []
+
+    def gate(_record):
+        return True
+
+    def advance_to_successor(record):
+        fake.kill(record.identity)
+        second = make_coord(fake)  # a distinct Coordinator and Store over the same durable ledger
+        second.cycle("claude")
+        durable = record_of(second, record.identity)
+        successor.append((durable.launch_token, durable.family))
+        fake.kill(record.identity)  # v2 is gone before A reaches its final launch observation
+
+    gate.started = advance_to_successor
+    first = make_coord(fake, gate=gate)
+    identity = first.submit_stage(Submission(
+        repo="o/r", subject="launch-token-race", stage="review", pool="claude"))
+
+    assert first.cycle("claude") == []
+    token, family = successor.pop()
+    durable = record_of(first, identity)
+    assert durable.launch_token == token and durable.family == family
+    assert durable.state == "running" and durable.attempts == 2
+    assert durable.process_alive and durable.claim and not fake.is_alive(family)
+
+
 def test_concurrent_descendant_submissions_are_atomically_registered(make_coord):
     """Two public submissions racing on one root both survive its revision changes, and the
     root's completion retires both children that share its reservation."""
@@ -848,7 +941,7 @@ def test_public_surface_keeps_completed_boundary_settlement_private(make_coord):
     # whether a submission produced runnable work before claiming the issue (#245); ``withdraw_stage``
     # rolls back a never-started submission whose GitHub claim was lost to a race (#245).
     assert public == {"submit_stage", "cycle", "park_completed", "retire_stale_review",
-                      "retire_stale_revise", "retire_stale_intake", "park_stale_review",
+                      "retire_stale_revise", "retire_stale_intake", "retire_stale_hold", "park_stale_review",
                       "stage_record", "withdraw_stage"}
     assert not hasattr(coord, "permits")      # permit accounting is an internal invariant
     assert not hasattr(coord, "records")      # the working set is private (_records)

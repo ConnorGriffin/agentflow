@@ -1,21 +1,57 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 import hashlib
+import json
 from importlib.resources import files
 from pathlib import Path
 import shutil
+import subprocess
 from types import SimpleNamespace
 import tomllib
 
+import pytest
+
 from agentflow.capability_contracts import ContractRequirement, preflight
 from agentflow.cli import main
-from agentflow.enroll import doctor, enroll_repository
+from agentflow.enroll import doctor, enroll_repository, repair_capability_refusal
+from agentflow.prompts import requirements_for
 from agentflow.provider_skills import (
     NATIVE_DISCOVERY_MARKER, NATIVE_DISCOVERY_SKILL,
     materialize_launch_capabilities, provider_skill_status,
     native_discovery_output_is_proof, native_discovery_output_is_unavailable,
-    native_discovery_prompt, record_native_discovery_receipt, skill_destination_status)
+    native_discovery_prompt, prove_native_discovery, record_native_discovery_receipt,
+    skill_destination_status)
+
+
+def _ready_ui_launch_source(tmp_path):
+    """Create an enrolled source with a minimal runnable selected Codex UI runtime."""
+    checkout = Path(__file__).parents[1]
+    source = tmp_path / "source"
+    shutil.copytree(
+        checkout / ".agents",
+        source / ".agents",
+        ignore=shutil.ignore_patterns("node_modules"),
+    )
+    (source / "scripts").mkdir()
+    shutil.copy2(checkout / "scripts" / "screenshots.mjs", source / "scripts")
+    runtime = source / ".agents" / "skills" / "drive-local-webapp" / "node_modules"
+    (runtime / "playwright" / "lib").mkdir(parents=True)
+    (runtime / "playwright" / "package.json").write_text('{"version":"1.61.1"}\n')
+    (runtime / "playwright" / "lib" / "program.js").write_text(
+        'module.exports = "1.61.1";\n'
+    )
+    (runtime / "playwright" / "cli.js").write_text(
+        'console.log(require("./lib/program"));\n'
+    )
+    (runtime / ".bin").mkdir()
+    (runtime / ".bin" / "playwright").symlink_to("../playwright/cli.js")
+    return source
+
+
+def _ui_runtime_requirement():
+    return (ContractRequirement("playwright", "1.61.1", runtime=True),)
 
 
 def test_native_discovery_prompts_are_provider_and_mode_specific():
@@ -78,6 +114,57 @@ def test_negative_discovery_predicate_rejects_native_or_command_evidence():
     assert native_discovery_output_is_unavailable("claude", "SKILL_UNAVAILABLE")
 
 
+@pytest.mark.parametrize(
+    "ending",
+    ("success", "provider-refusal", "timeout", "interruption", "exception"),
+)
+def test_provider_discovery_probe_is_disposable_on_every_ending(
+    tmp_path, monkeypatch, ending
+):
+    repo = tmp_path / "repo"
+    (repo / ".agents" / "skills").mkdir(parents=True)
+    probe_roots = []
+
+    monkeypatch.setattr(
+        "agentflow.provider_skills.native_discovery_status",
+        lambda *_args: ("missing", "receipt missing"),
+    )
+    monkeypatch.setattr(
+        "agentflow.provider_skills.record_native_discovery_receipt",
+        lambda *_args: tmp_path / "receipt.json",
+    )
+
+    def run(root, _provider):
+        probe_roots.append(root)
+        if ending == "success":
+            return SimpleNamespace(returncode=0, stdout=NATIVE_DISCOVERY_MARKER, stderr="")
+        if ending == "provider-refusal":
+            return SimpleNamespace(returncode=1, stdout="SKILL_UNAVAILABLE", stderr="")
+        if ending == "timeout":
+            raise subprocess.TimeoutExpired(["codex"], 300)
+        if ending == "interruption":
+            raise KeyboardInterrupt
+        raise RuntimeError("provider failed")
+
+    monkeypatch.setattr("agentflow.provider_skills._run_native_discovery_probe", run)
+
+    if ending in {"timeout", "exception"}:
+        with pytest.raises((subprocess.TimeoutExpired, RuntimeError)):
+            prove_native_discovery(repo, "codex")
+    elif ending == "interruption":
+        with pytest.raises(KeyboardInterrupt):
+            prove_native_discovery(repo, "codex")
+    else:
+        ready, _detail = prove_native_discovery(repo, "codex")
+        assert ready is (ending == "success")
+
+    assert len(probe_roots) == 1
+    assert probe_roots[0] != repo
+    assert not probe_roots[0].exists()
+    for provider_root in (repo / ".agents" / "skills", repo / ".claude" / "skills"):
+        assert not (provider_root / NATIVE_DISCOVERY_SKILL).exists()
+
+
 def test_recommended_native_discovery_repair_is_runnable_idempotent_and_releases_hold(
     tmp_path, monkeypatch
 ):
@@ -120,9 +207,7 @@ def test_recommended_native_discovery_repair_is_runnable_idempotent_and_releases
     assert runs == [True]
 
 
-def test_public_enrollment_installs_methodology_contracts_for_headless_dispatch(
-    tmp_path, monkeypatch
-):
+def _methodology_enrollment_fixture(tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     repo.mkdir()
     source = tmp_path / "methodology-source" / "skills"
@@ -155,6 +240,7 @@ def test_public_enrollment_installs_methodology_contracts_for_headless_dispatch(
         enrollment.shutil, "which", lambda command: f"/usr/bin/{command}"
     )
 
+    lock = repo / "skills-lock.json"
     commands = []
 
     def run(command, **_kwargs):
@@ -165,9 +251,28 @@ def test_public_enrollment_installs_methodology_contracts_for_headless_dispatch(
             name = command[command.index("--skill") + 1]
             target = repo / ".agents" / "skills" / name
             shutil.copytree(source / name, target)
+            document = json.loads(lock.read_text()) if lock.exists() else {
+                "version": 1, "skills": {}
+            }
+            document["skills"][name] = {
+                "source": str(tmp_path / "deleted-temp-clone"),
+                "sourceType": "local",
+                "computedHash": "hash",
+                "skillPath": "SKILL.md",
+            }
+            lock.write_text(json.dumps(document) + "\n")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(enrollment, "_run_command", run)
+    return enrollment, repo, source, names, fixture_commit, lock, commands
+
+
+def test_public_enrollment_installs_methodology_contracts_for_headless_dispatch(
+    tmp_path, monkeypatch
+):
+    enrollment, repo, source, names, fixture_commit, lock, commands = (
+        _methodology_enrollment_fixture(tmp_path, monkeypatch)
+    )
 
     report = enroll_repository(str(repo), apply=True)
 
@@ -187,6 +292,11 @@ def test_public_enrollment_installs_methodology_contracts_for_headless_dispatch(
     for location in (".agents/skills", ".claude/skills"):
         for name in names:
             assert (repo / location / name / "SKILL.md").is_file()
+    lock_entries = json.loads(lock.read_text())["skills"]
+    assert all(entry["source"] == str(source.parent) for entry in lock_entries.values())
+    assert all(entry["sourceType"] == "git" for entry in lock_entries.values())
+    assert all(entry["ref"] == fixture_commit for entry in lock_entries.values())
+    assert "deleted-temp-clone" not in lock.read_text()
 
     shutil.rmtree(repo / ".claude" / "skills" / "tdd")
     regressed = doctor(str(repo), stage="build", provider="codex")
@@ -195,6 +305,579 @@ def test_public_enrollment_installs_methodology_contracts_for_headless_dispatch(
         cell.context == "headless" and not cell.ready
         for cell in regressed.stage_matrix
     )
+
+
+def test_enrollment_materializes_missing_claude_methodology_destinations(
+    tmp_path, monkeypatch
+):
+    enrollment, repo, source, names, _commit, _lock, commands = (
+        _methodology_enrollment_fixture(tmp_path, monkeypatch)
+    )
+    for name in names:
+        shutil.copytree(source / name, repo / ".agents" / "skills" / name)
+
+    report = enrollment.enroll_repository(str(repo), apply=True)
+
+    assert all(
+        item.available for item in report.capabilities if item.id in names
+    )
+    assert all("check-ignore" in command for command in commands)
+    for name in names:
+        destination = repo / ".claude" / "skills" / name
+        assert destination.is_dir()
+        assert not destination.is_symlink()
+        assert (destination / "SKILL.md").read_bytes() == (
+            source / name / "SKILL.md"
+        ).read_bytes()
+
+
+def test_enrollment_refuses_an_ignored_required_capability_file(
+    tmp_path, monkeypatch, capsys
+):
+    import agentflow.enroll as enrollment
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / ".gitignore").write_text("lib/\n")
+    (repo / "AGENTS.md").write_text("# repo\n\nprofile: reviewed\nui-surfaces: frontend/\n")
+    (repo / "frontend").mkdir()
+    monkeypatch.setattr(enrollment, "_checkout_problem", lambda _root: None)
+    monkeypatch.setattr(enrollment, "_config_problem", lambda: None)
+    monkeypatch.setattr(enrollment, "_tooling_problem", lambda _surfaces: None)
+    monkeypatch.setattr(enrollment, "_managed_files_problem", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(enrollment, "_skills_problem", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(enrollment, "_methodology_problem", lambda _root: None)
+    monkeypatch.setattr(
+        enrollment, "_apply_enrollment",
+        lambda *_args, **_kwargs: pytest.fail("ignored capability file must refuse before apply"),
+    )
+
+    report = enrollment.enroll_repository(str(repo), apply=True)
+
+    assert report.ready is False
+    output = capsys.readouterr().out
+    assert ".agents/skills/ui-craft/scripts/lib/design-parser.mjs" in output
+    assert "lib/" in output
+    assert not (repo / "CLAUDE.md").exists()
+
+
+def test_enrollment_with_no_ignored_capability_file_keeps_materializing(
+    tmp_path, monkeypatch
+):
+    enrollment, repo, source, names, _commit, _lock, _commands = (
+        _methodology_enrollment_fixture(tmp_path, monkeypatch)
+    )
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    original_run = enrollment._run_command
+
+    def run(command, **kwargs):
+        if command[:4] == ["git", "-C", str(repo), "check-ignore"]:
+            return subprocess.run(command, capture_output=True, text=True)
+        return original_run(command, **kwargs)
+
+    monkeypatch.setattr(enrollment, "_run_command", run)
+
+    report = enrollment.enroll_repository(str(repo), apply=True)
+
+    assert report.ready is False  # no local Claude or Codex runner in this focused fixture
+    for name in names:
+        assert (repo / ".agents" / "skills" / name / "SKILL.md").is_file()
+        assert (repo / ".claude" / "skills" / name / "SKILL.md").is_file()
+
+
+def test_capability_repair_materializes_only_absent_claude_destinations(
+    tmp_path, monkeypatch
+):
+    enrollment, repo, source, names, commit, _lock, commands = (
+        _methodology_enrollment_fixture(tmp_path, monkeypatch)
+    )
+    for name in names:
+        shutil.copytree(source / name, repo / ".agents" / "skills" / name)
+    requirements = tuple(ContractRequirement(name, commit) for name in names)
+
+    result = repair_capability_refusal(repo, "claude", requirements)
+
+    assert result is not None and result.repaired
+    assert "Claude" in result.detail
+    assert not commands
+    for name in names:
+        destination = repo / ".claude" / "skills" / name
+        assert destination.is_dir() and not destination.is_symlink()
+        assert (destination / "SKILL.md").read_bytes() == (
+            source / name / "SKILL.md"
+        ).read_bytes()
+
+
+def test_capability_repair_installs_an_absent_pinned_runtime(tmp_path, monkeypatch):
+    import agentflow.enroll as enrollment
+
+    root = _ready_ui_launch_source(tmp_path)
+    runtime = root / ".agents" / "skills" / "drive-local-webapp" / "node_modules"
+    shutil.rmtree(runtime)
+    installs = []
+
+    def install(selected_root, *, provider=None):
+        installs.append((selected_root, provider))
+        (runtime / "playwright").mkdir(parents=True)
+        (runtime / "playwright" / "package.json").write_text(
+            '{"version":"1.61.1"}\n'
+        )
+        return "DO:   installed pinned Playwright and Chromium; self-check passed"
+
+    monkeypatch.setattr(enrollment, "_install_ui_runtime", install)
+
+    result = repair_capability_refusal(
+        root, "codex", _ui_runtime_requirement()
+    )
+
+    assert result is not None and result.repaired
+    assert "Playwright" in result.detail
+    assert installs == [(root, "codex")]
+    assert (runtime / "playwright" / "package.json").is_file()
+
+
+def test_capability_repair_materializes_claude_ui_skills_before_runtime(
+    tmp_path, monkeypatch
+):
+    import agentflow.enroll as enrollment
+
+    root = _ready_ui_launch_source(tmp_path)
+    manifest = tomllib.loads(files("agentflow").joinpath("capabilities.toml").read_text())
+    specs = {item["id"]: item for item in manifest["capabilities"]}
+    requirements = (
+        ContractRequirement("ui-craft", specs["ui-craft"]["version"]),
+        ContractRequirement("drive-local-webapp", specs["drive-local-webapp"]["version"]),
+        ContractRequirement("playwright", manifest["playwright"]["version"], runtime=True),
+    )
+    installs = []
+
+    def install(selected_root, *, provider=None):
+        installs.append((selected_root, provider))
+        for name in ("ui-craft", "drive-local-webapp"):
+            assert (root / ".claude" / "skills" / name).is_dir()
+        runtime = root / ".claude" / "skills" / "drive-local-webapp" / "node_modules"
+        assert (runtime / "playwright" / "package.json").is_file()
+        return "ok:   pinned Playwright, Chromium, and screenshot harness are ready"
+
+    monkeypatch.setattr(enrollment, "_install_ui_runtime", install)
+
+    result = repair_capability_refusal(root, "claude", requirements)
+
+    assert result is not None and result.repaired
+    assert installs == [(root, "claude")]
+    assert "Claude" in result.detail and "Playwright" in result.detail
+
+
+def test_failed_runtime_repair_preserves_concurrent_operator_content(
+    tmp_path, monkeypatch
+):
+    import agentflow.enroll as enrollment
+
+    root = _ready_ui_launch_source(tmp_path)
+    manifest = tomllib.loads(files("agentflow").joinpath("capabilities.toml").read_text())
+    specs = {item["id"]: item for item in manifest["capabilities"]}
+    requirements = (
+        ContractRequirement("ui-craft", specs["ui-craft"]["version"]),
+        ContractRequirement("drive-local-webapp", specs["drive-local-webapp"]["version"]),
+        ContractRequirement("playwright", manifest["playwright"]["version"], runtime=True),
+    )
+    operator_note = root / ".agents" / "skills" / "tdd" / "operator-note.txt"
+
+    def fail_install(_selected_root, *, provider=None):
+        assert provider == "claude"
+        operator_note.write_text("authored while npm was running\n")
+        claude_skill = root / ".claude" / "skills" / "ui-craft" / "SKILL.md"
+        claude_skill.write_text("operator changed this during repair\n")
+        return "WARN: UI runtime setup failed — npm exited 1"
+
+    monkeypatch.setattr(enrollment, "_install_ui_runtime", fail_install)
+
+    result = repair_capability_refusal(root, "claude", requirements)
+
+    changed = root / ".claude" / "skills" / "ui-craft" / "SKILL.md"
+    assert result is not None and not result.repaired
+    assert operator_note.read_text() == "authored while npm was running\n"
+    assert changed.read_text() == "operator changed this during repair\n"
+
+
+def test_failed_runtime_repair_removes_ownership_markers_with_created_skills(
+    tmp_path, monkeypatch
+):
+    import agentflow.enroll as enrollment
+
+    root = _ready_ui_launch_source(tmp_path)
+    manifest = tomllib.loads(files("agentflow").joinpath("capabilities.toml").read_text())
+    specs = {item["id"]: item for item in manifest["capabilities"]}
+    requirements = (
+        ContractRequirement("ui-craft", specs["ui-craft"]["version"]),
+        ContractRequirement("drive-local-webapp", specs["drive-local-webapp"]["version"]),
+        ContractRequirement("playwright", manifest["playwright"]["version"], runtime=True),
+    )
+    monkeypatch.setattr(
+        enrollment, "_install_ui_runtime",
+        lambda *_args, **_kwargs: "WARN: UI runtime setup failed",
+    )
+
+    result = repair_capability_refusal(root, "claude", requirements)
+
+    assert result is not None and not result.repaired
+    assert not (root / ".claude" / "skills" / "ui-craft").exists()
+    assert not (root / ".agentflow" / "skill-ownership" / "claude" / "ui-craft.json").exists()
+
+
+@pytest.mark.parametrize("destination_kind", ("drifted", "symlinked"))
+def test_capability_repair_preserves_occupied_claude_destinations(
+    tmp_path, monkeypatch, destination_kind
+):
+    _enrollment, repo, source, names, commit, _lock, commands = (
+        _methodology_enrollment_fixture(tmp_path, monkeypatch)
+    )
+    for name in names:
+        shutil.copytree(source / name, repo / ".agents" / "skills" / name)
+    destination = repo / ".claude" / "skills" / names[0]
+    destination.parent.mkdir(parents=True)
+    if destination_kind == "drifted":
+        destination.mkdir()
+        (destination / "SKILL.md").write_text("operator edit\n")
+    else:
+        destination.symlink_to(Path("../../.agents/skills") / names[0])
+    requirements = tuple(ContractRequirement(name, commit) for name in names)
+    probes = []
+    monkeypatch.setattr(
+        "agentflow.provider_skills.prove_native_discovery",
+        lambda *_args: probes.append(True),
+    )
+
+    result = repair_capability_refusal(repo, "claude", requirements)
+
+    assert result is None
+    assert not probes
+    assert not commands
+    assert not (repo / ".claude" / "skills" / names[1]).exists()
+    if destination_kind == "drifted":
+        assert (destination / "SKILL.md").read_text() == "operator edit\n"
+    else:
+        assert destination.is_symlink()
+
+
+def test_capability_repair_preserves_an_unknown_harness(tmp_path, monkeypatch):
+    root = _ready_ui_launch_source(tmp_path)
+    harness = root / "scripts" / "screenshots.mjs"
+    harness.write_text("operator-authored harness\n")
+    probes = []
+    monkeypatch.setattr(
+        "agentflow.provider_skills.prove_native_discovery",
+        lambda *_args: probes.append(True),
+    )
+
+    result = repair_capability_refusal(root, "codex", _ui_runtime_requirement())
+
+    assert result is None
+    assert not probes
+    assert harness.read_text() == "operator-authored harness\n"
+
+
+def test_capability_repair_refuses_an_unreadable_native_discovery_receipt(
+    tmp_path, monkeypatch
+):
+    root = _ready_ui_launch_source(tmp_path)
+    manifest = tomllib.loads(files("agentflow").joinpath("capabilities.toml").read_text())
+    spec = next(item for item in manifest["capabilities"] if item["id"] == "domain-modeling")
+    receipts = tmp_path / "receipts"
+    monkeypatch.setattr(
+        "agentflow.provider_skills._repository_key", lambda _root: ("repo-key", receipts)
+    )
+    monkeypatch.setattr(
+        "agentflow.provider_skills._provider_fingerprint",
+        lambda provider: (f"/providers/{provider}", f"{provider}-sha"),
+    )
+    receipt = record_native_discovery_receipt(root, "codex")
+    receipt.write_text("operator-authored receipt\n")
+    probes = []
+    monkeypatch.setattr(
+        "agentflow.provider_skills.prove_native_discovery",
+        lambda *_args: probes.append(True) or (True, "should not run"),
+    )
+
+    result = repair_capability_refusal(
+        root, "codex", (ContractRequirement("domain-modeling", spec["version"]),)
+    )
+
+    assert result is None
+    assert not probes
+    assert receipt.read_text() == "operator-authored receipt\n"
+
+
+@pytest.mark.parametrize("destination_kind", ("drifted", "symlinked"))
+def test_enrollment_refuses_occupied_claude_methodology_destinations(
+    tmp_path, monkeypatch, destination_kind
+):
+    enrollment, repo, source, names, _commit, _lock, commands = (
+        _methodology_enrollment_fixture(tmp_path, monkeypatch)
+    )
+    for name in names:
+        shutil.copytree(source / name, repo / ".agents" / "skills" / name)
+    destination = repo / ".claude" / "skills" / names[0]
+    destination.parent.mkdir(parents=True)
+    if destination_kind == "drifted":
+        destination.mkdir()
+        (destination / "SKILL.md").write_text("operator edit\n")
+    else:
+        destination.symlink_to(Path("../../.agents/skills") / names[0])
+
+    report = enrollment.enroll_repository(str(repo), apply=True)
+
+    assert report.ready is False
+    assert not commands
+    assert not (repo / "AGENTS.md").exists()
+    assert not (repo / "CLAUDE.md").exists()
+    if destination_kind == "drifted":
+        assert (destination / "SKILL.md").read_text() == "operator edit\n"
+    else:
+        assert destination.is_symlink()
+
+
+def test_capability_repair_is_single_writer_for_a_shared_root(tmp_path, monkeypatch):
+    _enrollment, repo, source, names, commit, _lock, _commands = (
+        _methodology_enrollment_fixture(tmp_path, monkeypatch)
+    )
+    for name in names:
+        shutil.copytree(source / name, repo / ".agents" / "skills" / name)
+    requirements = tuple(ContractRequirement(name, commit) for name in names)
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        results = list(workers.map(
+            lambda _index: repair_capability_refusal(repo, "claude", requirements),
+            range(2),
+        ))
+
+    assert sum(result is not None and result.repaired for result in results) == 1
+    assert sum(result is None for result in results) == 1
+    for name in names:
+        assert (repo / ".claude" / "skills" / name / "SKILL.md").is_file()
+
+
+def test_capability_repair_probes_a_shared_root_once(tmp_path, monkeypatch):
+    root = _ready_ui_launch_source(tmp_path)
+    manifest = tomllib.loads(files("agentflow").joinpath("capabilities.toml").read_text())
+    spec = next(item for item in manifest["capabilities"] if item["id"] == "domain-modeling")
+    receipts = tmp_path / "receipts"
+    monkeypatch.setattr(
+        "agentflow.provider_skills._repository_key", lambda _root: ("repo-key", receipts)
+    )
+    monkeypatch.setattr(
+        "agentflow.provider_skills._provider_fingerprint",
+        lambda provider: (f"/providers/{provider}", f"{provider}-sha"),
+    )
+    probes = []
+    monkeypatch.setattr(
+        "agentflow.provider_skills._run_native_discovery_probe",
+        lambda _root, _provider: probes.append(True) or SimpleNamespace(
+            returncode=0, stdout=NATIVE_DISCOVERY_MARKER, stderr=""),
+    )
+    requirements = (ContractRequirement("domain-modeling", spec["version"]),)
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        results = list(workers.map(
+            lambda _index: repair_capability_refusal(root, "codex", requirements), range(2),
+        ))
+
+    assert sum(result is not None and result.repaired for result in results) == 1
+    assert sum(result is None for result in results) == 1
+    assert probes == [True]
+
+
+def test_enrollment_rolls_back_partial_claude_methodology_materialization(
+    tmp_path, monkeypatch
+):
+    enrollment, repo, source, names, _commit, _lock, _commands = (
+        _methodology_enrollment_fixture(tmp_path, monkeypatch)
+    )
+    for name in names:
+        shutil.copytree(source / name, repo / ".agents" / "skills" / name)
+    original_wire = enrollment._wire_claude_skill
+    materialized = 0
+
+    def fail_after_second_methodology_skill(root, name):
+        nonlocal materialized
+        outcome = original_wire(root, name)
+        if name in names:
+            materialized += 1
+            if materialized == 2:
+                return "WARN: injected methodology materialization failure"
+        return outcome
+
+    monkeypatch.setattr(enrollment, "_wire_claude_skill", fail_after_second_methodology_skill)
+
+    report = enrollment.enroll_repository(str(repo), apply=True)
+
+    assert report.ready is False
+    assert materialized == 3
+    assert not (repo / ".claude").exists()
+    assert not (repo / "AGENTS.md").exists()
+    assert not (repo / "CLAUDE.md").exists()
+
+
+def test_enrollment_warns_and_rolls_back_for_a_non_object_lock(
+    tmp_path, monkeypatch
+):
+    enrollment, repo, _source, _names, _commit, lock, _commands = (
+        _methodology_enrollment_fixture(tmp_path, monkeypatch)
+    )
+    lock.write_text("[]\n")
+
+    report = enrollment.enroll_repository(str(repo), apply=True)
+
+    assert report.ready is False
+    assert lock.read_text() == "[]\n"
+
+
+def test_enrollment_warns_and_rolls_back_when_lock_write_fails(
+    tmp_path, monkeypatch
+):
+    enrollment, repo, _source, names, _commit, lock, _commands = (
+        _methodology_enrollment_fixture(tmp_path, monkeypatch)
+    )
+    stale = {
+        "version": 1,
+        "skills": {
+            names[0]: {
+                "source": str(tmp_path / "deleted-temp-clone"),
+                "sourceType": "local",
+                "computedHash": "hash",
+                "skillPath": "SKILL.md",
+            }
+        },
+    }
+    lock.write_text(json.dumps(stale) + "\n")
+    original_write_text = Path.write_text
+
+    def fail_lock_write(path, *args, **kwargs):
+        if path == lock:
+            raise OSError("read-only lock")
+        return original_write_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", fail_lock_write)
+
+    report = enrollment.enroll_repository(str(repo), apply=True)
+
+    assert report.ready is False
+    assert json.loads(lock.read_text()) == stale
+
+
+def test_enrollment_normalizes_installer_lock_to_manifest_git_revision(tmp_path):
+    import agentflow.enroll as enrollment
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    lock = repo / "skills-lock.json"
+    lock.write_text(json.dumps({
+        "version": 1,
+        "skills": {
+            "tdd": {
+                "source": str(tmp_path / "deleted-temp-clone"),
+                "sourceType": "local",
+                "computedHash": "hash",
+                "skillPath": "SKILL.md",
+            },
+            "unrelated": {"source": "keep", "sourceType": "git"},
+        },
+    }) + "\n")
+
+    before = lock.read_bytes()
+    enrollment._normalize_skill_lock(
+        repo,
+        ["tdd"],
+        source="https://github.com/ConnorGriffin/skills",
+        commit="a" * 40,
+    )
+    first = lock.read_bytes()
+    enrollment._normalize_skill_lock(
+        repo,
+        ["tdd"],
+        source="https://github.com/ConnorGriffin/skills",
+        commit="a" * 40,
+    )
+
+    assert first != before
+    assert lock.read_bytes() == first
+    entry = json.loads(first)["skills"]["tdd"]
+    assert entry["source"] == "https://github.com/ConnorGriffin/skills"
+    assert entry["sourceType"] == "git"
+    assert entry["ref"] == "a" * 40
+    assert entry["computedHash"] == "hash"
+    assert entry["skillPath"] == "SKILL.md"
+    assert "deleted-temp-clone" not in lock.read_text()
+
+
+def test_repeated_enrollment_migrates_existing_public_and_methodology_locks(
+    tmp_path, monkeypatch
+):
+    import agentflow.enroll as enrollment
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    manifest = deepcopy(enrollment._manifest())
+    public_names = tuple(manifest["connor_skills"]["skills"])
+    methodology_names = tuple(manifest["methodology_skills"]["skills"])
+    all_names = public_names + methodology_names
+    for name in all_names:
+        content = f"# {name}\n"
+        for location in (".agents/skills", ".claude/skills"):
+            target = repo / location / name
+            target.mkdir(parents=True)
+            (target / "SKILL.md").write_text(content)
+        capability = next(
+            item for item in manifest["capabilities"] if item.get("skill") == name
+        )
+        capability["files"] = [{
+            "path": "SKILL.md",
+            "sha256": hashlib.sha256(content.encode()).hexdigest(),
+        }]
+
+    public_commit = "b" * 40
+    methodology_commit = "c" * 40
+    manifest["connor_skills"].update(
+        source="https://github.com/ConnorGriffin/skills",
+        commit=public_commit,
+    )
+    manifest["methodology_skills"].update(
+        source="https://github.com/ConnorGriffin/skills",
+        commit=methodology_commit,
+    )
+    stale_source = str(tmp_path / "deleted-temp-clone")
+    lock = repo / "skills-lock.json"
+    lock.write_text(json.dumps({
+        "version": 1,
+        "skills": {
+            name: {
+                "source": stale_source,
+                "sourceType": "local",
+                "computedHash": f"hash-{name}",
+                "skillPath": "SKILL.md",
+            }
+            for name in all_names
+        },
+    }) + "\n")
+    monkeypatch.setattr(enrollment, "_manifest", lambda: manifest)
+
+    assert enrollment._install_connor_skills(repo).startswith("ok:")
+    assert enrollment._install_methodology_skills(repo).startswith("ok:")
+    migrated = lock.read_bytes()
+    assert enrollment._install_connor_skills(repo).startswith("ok:")
+    assert enrollment._install_methodology_skills(repo).startswith("ok:")
+    assert lock.read_bytes() == migrated
+
+    entries = json.loads(migrated)["skills"]
+    for name in public_names:
+        assert entries[name]["source"] == manifest["connor_skills"]["source"]
+        assert entries[name]["ref"] == public_commit
+    for name in methodology_names:
+        assert entries[name]["source"] == manifest["methodology_skills"]["source"]
+        assert entries[name]["ref"] == methodology_commit
+    assert all(entries[name]["sourceType"] == "git" for name in all_names)
+    assert stale_source not in lock.read_text()
 
 
 def test_provider_discovery_requires_provider_specific_native_receipts(tmp_path, monkeypatch):
@@ -290,3 +973,386 @@ def test_launch_materialization_rejects_provider_root_escape_before_writing(tmp_
 
     assert ready is False and "root" in detail
     assert not (outside / "skills").exists()
+
+
+def test_launch_materialization_ignores_missing_unrequired_ui_skill(tmp_path):
+    checkout = Path(__file__).parents[1]
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    shutil.copytree(checkout / ".agents", source / ".claude")
+    shutil.rmtree(source / ".claude" / "skills" / "ui-craft")
+    destination.mkdir()
+
+    requirements = requirements_for("build", {"ui": False})
+    ready, detail = materialize_launch_capabilities(
+        source, destination, "claude",
+        requirement_ids={requirement.id for requirement in requirements},
+    )
+
+    assert ready is True and "materialized" in detail
+    assert all(
+        (destination / ".claude" / "skills" / requirement.id).is_dir()
+        for requirement in requirements
+    )
+    assert not (destination / ".claude" / "skills" / "ui-craft").exists()
+
+
+def test_launch_materialization_rejects_missing_required_ui_skill(tmp_path):
+    checkout = Path(__file__).parents[1]
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    shutil.copytree(checkout / ".agents", source / ".claude")
+    shutil.rmtree(source / ".claude" / "skills" / "ui-craft")
+    destination.mkdir()
+
+    requirements = requirements_for("review", {"ui": True})
+    ready, detail = materialize_launch_capabilities(
+        source, destination, "claude",
+        requirement_ids={requirement.id for requirement in requirements},
+    )
+
+    assert ready is False
+    assert detail == "claude source skill ui-craft is not intact"
+
+
+def test_launch_materialization_refuses_runtime_without_drive_skill_requirement(tmp_path):
+    source = _ready_ui_launch_source(tmp_path)
+    destination = tmp_path / "destination"
+    destination.mkdir()
+
+    ready, detail = materialize_launch_capabilities(
+        source, destination, "codex", materialize_runtime=True,
+        requirement_ids={"playwright"},
+    )
+
+    assert ready is False
+    assert detail == "codex launch runtime requires drive-local-webapp"
+
+
+def test_launch_materialization_copies_verified_ui_runtime_into_fresh_root(tmp_path, monkeypatch):
+    source = _ready_ui_launch_source(tmp_path)
+    destination = tmp_path / "destination"
+    destination.mkdir()
+    (destination / "scripts").mkdir()
+    shutil.copy2(source / "scripts" / "screenshots.mjs", destination / "scripts")
+    monkeypatch.setattr(
+        "agentflow.provider_skills.native_discovery_status", lambda *_args: ("ok", "proven")
+    )
+    executable = shutil.which
+    monkeypatch.setattr(
+        "agentflow.capability_contracts.shutil.which",
+        lambda name: "/bin/codex" if name == "codex" else executable(name),
+    )
+    requirements = _ui_runtime_requirement()
+
+    assert preflight(source, "build", "codex", requirements).ready
+    ready, detail = materialize_launch_capabilities(
+        source, destination, "codex", materialize_runtime=True
+    )
+
+    runtime = destination / ".agents" / "skills" / "drive-local-webapp" / "node_modules"
+    assert ready is True and "materialized" in detail
+    assert preflight(destination, "build", "codex", requirements).ready
+    assert (runtime / "playwright" / "package.json").read_text() == '{"version":"1.61.1"}\n'
+    assert not (runtime / "playwright" / "package.json").samefile(
+        source / ".agents" / "skills" / "drive-local-webapp" / "node_modules"
+        / "playwright" / "package.json"
+    )
+    launcher = runtime / ".bin" / "playwright"
+    assert launcher.is_symlink()
+    assert launcher.readlink() == Path("../playwright/cli.js")
+    assert launcher.resolve().is_relative_to(runtime)
+    result = subprocess.run(
+        ["node", str(launcher)], capture_output=True, check=False, text=True,
+    )
+    assert result.returncode == 0
+    assert result.stdout == "1.61.1\n"
+    assert materialize_launch_capabilities(
+        source, destination, "codex", materialize_runtime=True
+    )[0] is True
+
+
+def test_launch_materialization_refreshes_a_known_old_pinned_harness(tmp_path):
+    source = _ready_ui_launch_source(tmp_path)
+    destination = tmp_path / "destination"
+    shutil.copytree(source / ".agents", destination / ".agents", symlinks=True)
+    (destination / "scripts").mkdir()
+    checkout = Path(__file__).parents[1]
+    old = (checkout / "tests" / "fixtures" / "old-screenshots.mjs").read_bytes()
+    manifest = tomllib.loads(files("agentflow").joinpath("capabilities.toml").read_text())
+    harness = next(
+        item for item in manifest["capabilities"] if item["id"] == "screenshot-harness"
+    )
+    assert hashlib.sha256(old).hexdigest() in harness["known_old_sha256"]
+    destination_harness = destination / "scripts" / "screenshots.mjs"
+    destination_harness.write_bytes(old)
+
+    lines = []
+    ready, detail = materialize_launch_capabilities(
+        source, destination, "codex", materialize_runtime=True, _log=lines.append
+    )
+
+    assert ready is True and "materialized" in detail
+    assert destination_harness.read_bytes() == (
+        source / "scripts" / "screenshots.mjs"
+    ).read_bytes()
+    assert lines == [
+        f"capability repair root={destination} requirements=screenshot-harness; "
+        "outcome=ready — materialized missing codex capabilities into the launch root"
+    ]
+
+
+@pytest.mark.parametrize("harness_kind", ("unknown", "symlinked"))
+def test_launch_materialization_preserves_an_occupied_harness(tmp_path, harness_kind):
+    source = _ready_ui_launch_source(tmp_path)
+    destination = tmp_path / "destination"
+    shutil.copytree(source / ".agents", destination / ".agents", symlinks=True)
+    (destination / "scripts").mkdir()
+    destination_harness = destination / "scripts" / "screenshots.mjs"
+    if harness_kind == "unknown":
+        destination_harness.write_text("operator-authored harness\n")
+    else:
+        external = tmp_path / "operator-harness.mjs"
+        external.write_text("operator-authored harness\n")
+        destination_harness.symlink_to(external)
+
+    ready, detail = materialize_launch_capabilities(
+        source, destination, "codex", materialize_runtime=True
+    )
+
+    assert ready is False and "harness" in detail
+    assert destination_harness.read_text() == "operator-authored harness\n"
+    assert destination_harness.is_symlink() is (harness_kind == "symlinked")
+
+
+def test_launch_materialization_installs_a_missing_pinned_harness(tmp_path):
+    source = _ready_ui_launch_source(tmp_path)
+    destination = tmp_path / "destination"
+    shutil.copytree(source / ".agents", destination / ".agents", symlinks=True)
+
+    ready, detail = materialize_launch_capabilities(
+        source, destination, "codex", materialize_runtime=True
+    )
+
+    destination_harness = destination / "scripts" / "screenshots.mjs"
+    assert ready is True and "materialized" in detail
+    assert destination_harness.read_bytes() == (
+        source / "scripts" / "screenshots.mjs"
+    ).read_bytes()
+
+
+def test_launch_rollback_preserves_a_concurrently_edited_created_harness(
+    tmp_path, monkeypatch
+):
+    import agentflow.provider_skills as provider_skills
+
+    source = _ready_ui_launch_source(tmp_path)
+    destination = tmp_path / "destination"
+    destination.mkdir()
+    harness = destination / "scripts" / "screenshots.mjs"
+    lines = []
+
+    def fail_skill_copy(*_args, **_kwargs):
+        assert harness.is_file()
+        harness.write_text("operator changed this during materialization\n")
+        raise shutil.Error("copy failed")
+
+    monkeypatch.setattr(provider_skills.shutil, "copytree", fail_skill_copy)
+
+    ready, detail = materialize_launch_capabilities(
+        source, destination, "codex", materialize_runtime=True, _log=lines.append
+    )
+
+    assert ready is False and "rollback failed" in detail
+    assert harness.read_text() == "operator changed this during materialization\n"
+    assert len(lines) == 1
+    assert f"root={destination}" in lines[0]
+    assert "requirements=screenshot-harness" in lines[0]
+    assert "outcome=failed" in lines[0]
+
+
+def test_launch_rollback_never_follows_a_concurrently_substituted_harness_symlink(
+    tmp_path, monkeypatch
+):
+    import agentflow.provider_skills as provider_skills
+
+    source = _ready_ui_launch_source(tmp_path)
+    destination = tmp_path / "destination"
+    (destination / "scripts").mkdir(parents=True)
+    checkout = Path(__file__).parents[1]
+    old = (checkout / "tests" / "fixtures" / "old-screenshots.mjs").read_bytes()
+    harness = destination / "scripts" / "screenshots.mjs"
+    harness.write_bytes(old)
+    external = tmp_path / "operator-harness.mjs"
+    current = (source / "scripts" / "screenshots.mjs").read_bytes()
+    external.write_bytes(current)
+
+    def fail_skill_copy(*_args, **_kwargs):
+        harness.unlink()
+        harness.symlink_to(external)
+        raise shutil.Error("copy failed")
+
+    monkeypatch.setattr(provider_skills.shutil, "copytree", fail_skill_copy)
+
+    ready, detail = materialize_launch_capabilities(
+        source, destination, "codex", materialize_runtime=True
+    )
+
+    assert ready is False and "rollback failed" in detail
+    assert harness.is_symlink()
+    assert external.read_bytes() == current
+
+
+def test_launch_materialization_refuses_occupied_drifted_ui_runtime(tmp_path, monkeypatch):
+    source = _ready_ui_launch_source(tmp_path)
+    destination = tmp_path / "destination"
+    shutil.copytree(source / ".agents", destination / ".agents")
+    (destination / "scripts").mkdir()
+    shutil.copy2(source / "scripts" / "screenshots.mjs", destination / "scripts")
+    runtime = destination / ".agents" / "skills" / "drive-local-webapp" / "node_modules"
+    (runtime / "playwright" / "package.json").write_text('{"version":"0.0.0"}\n')
+    monkeypatch.setattr(
+        "agentflow.provider_skills.native_discovery_status", lambda *_args: ("ok", "proven")
+    )
+
+    ready, detail = materialize_launch_capabilities(
+        source, destination, "codex", materialize_runtime=True
+    )
+
+    assert ready is False and "runtime destination" in detail
+    assert (runtime / "playwright" / "package.json").read_text() == '{"version":"0.0.0"}\n'
+
+
+def test_launch_materialization_refuses_symlinked_destination_runtime_before_skills(tmp_path):
+    source = _ready_ui_launch_source(tmp_path)
+    destination = tmp_path / "destination"
+    destination_runtime = (
+        destination / ".agents" / "skills" / "drive-local-webapp" / "node_modules"
+    )
+    destination_runtime.parent.mkdir(parents=True)
+    shutil.copytree(
+        source / ".agents" / "skills" / "drive-local-webapp",
+        destination_runtime.parent,
+        ignore=shutil.ignore_patterns("node_modules"), dirs_exist_ok=True,
+    )
+    external_runtime = tmp_path / "external-runtime"
+    shutil.copytree(
+        source / ".agents" / "skills" / "drive-local-webapp" / "node_modules",
+        external_runtime, symlinks=True,
+    )
+    destination_runtime.symlink_to(external_runtime, target_is_directory=True)
+    (destination / "scripts").mkdir()
+    shutil.copy2(source / "scripts" / "screenshots.mjs", destination / "scripts")
+
+    ready, detail = materialize_launch_capabilities(
+        source, destination, "codex", materialize_runtime=True
+    )
+
+    assert ready is False and "runtime destination" in detail
+    assert destination_runtime.is_symlink()
+    assert not (destination / ".agents" / "skills" / "tdd").exists()
+
+
+@pytest.mark.parametrize("launcher_target", ("external", "broken"))
+def test_launch_materialization_rejects_unsafe_source_runtime_before_writing(
+    tmp_path, launcher_target
+):
+    source = _ready_ui_launch_source(tmp_path)
+    destination = tmp_path / "destination"
+    outside = tmp_path / "outside.js"
+    destination.mkdir()
+    (destination / "scripts").mkdir()
+    shutil.copy2(source / "scripts" / "screenshots.mjs", destination / "scripts")
+    launcher = source / ".agents" / "skills" / "drive-local-webapp" / "node_modules" / ".bin" / "playwright"
+    launcher.unlink()
+    if launcher_target == "external":
+        outside.write_text("outside\n")
+        launcher.symlink_to(outside)
+    else:
+        launcher.symlink_to("../playwright/missing.js")
+
+    ready, detail = materialize_launch_capabilities(
+        source, destination, "codex", materialize_runtime=True
+    )
+
+    assert ready is False and "source Playwright runtime" in detail
+    assert not (destination / ".agents").exists()
+
+
+def test_launch_materialization_rolls_back_skills_after_copy_failure(tmp_path, monkeypatch):
+    source = _ready_ui_launch_source(tmp_path)
+    destination = tmp_path / "destination"
+    destination.mkdir()
+    original_copytree = shutil.copytree
+    copies = 0
+
+    def fail_after_first_skill(source_path, destination_path, *args, **kwargs):
+        nonlocal copies
+        if Path(source_path).parent.name == "skills":
+            copies += 1
+            if copies == 2:
+                raise OSError("injected skill copy failure")
+        return original_copytree(source_path, destination_path, *args, **kwargs)
+
+    monkeypatch.setattr("agentflow.provider_skills.shutil.copytree", fail_after_first_skill)
+
+    ready, detail = materialize_launch_capabilities(source, destination, "codex")
+
+    assert ready is False and "copy failed" in detail
+    assert copies == 2
+    assert not (destination / ".agents").exists()
+
+
+def test_launch_materialization_preserves_concurrent_skill_destination(tmp_path, monkeypatch):
+    source = _ready_ui_launch_source(tmp_path)
+    destination = tmp_path / "destination"
+    destination.mkdir()
+    raced = destination / ".agents" / "skills" / "tdd"
+    sentinel = raced / "sentinel"
+    original_mkdir = Path.mkdir
+
+    def inject_concurrent_destination(path, *args, **kwargs):
+        if path == raced:
+            original_mkdir(path)
+            sentinel.write_text("concurrent owner\n")
+            raise FileExistsError("injected concurrent destination")
+        return original_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", inject_concurrent_destination)
+
+    ready, detail = materialize_launch_capabilities(source, destination, "codex")
+
+    assert ready is False and "appeared concurrently" in detail
+    assert sentinel.read_text() == "concurrent owner\n"
+
+
+@pytest.mark.parametrize("cleanup_denied", (False, True))
+def test_launch_materialization_reports_failed_mkdir_rollback(
+    tmp_path, monkeypatch, cleanup_denied
+):
+    source = _ready_ui_launch_source(tmp_path)
+    destination = tmp_path / "destination"
+    destination.mkdir()
+    provider_root = destination / ".agents"
+    skills = provider_root / "skills"
+    original_mkdir = Path.mkdir
+    original_rmdir = Path.rmdir
+
+    def fail_skill_root_creation(path, *args, **kwargs):
+        if path == skills:
+            raise OSError("injected skill root creation failure")
+        return original_mkdir(path, *args, **kwargs)
+
+    def deny_cleanup(path):
+        if cleanup_denied and path == provider_root:
+            raise OSError("injected cleanup denial")
+        return original_rmdir(path)
+
+    monkeypatch.setattr(Path, "mkdir", fail_skill_root_creation)
+    monkeypatch.setattr(Path, "rmdir", deny_cleanup)
+
+    ready, detail = materialize_launch_capabilities(source, destination, "codex")
+
+    assert ready is False and "creation failed" in detail
+    assert ("rollback failed" in detail) is cleanup_denied
+    assert provider_root.exists() is cleanup_denied

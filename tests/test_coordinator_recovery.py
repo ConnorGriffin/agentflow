@@ -15,11 +15,15 @@ tests/test_coordinator_launcher.py.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
 from conftest import FakeSession, permits, record_of, starts_until_held
 
-from agentflow.coordinator import Submission
+from agentflow import coordinated_intake
+from agentflow.coordinator import IntakeStageAdapter, Submission
 from agentflow.coordinator import providers
 from agentflow.coordinator.providers import ProviderCause
 from agentflow.coordinator.recovery import (NO_NEW_STATE, REPAIR, Recovery,
@@ -67,6 +71,16 @@ class CapturingSession(ProgressingSession):
         return super().start(record, store)
 
 
+class ContractRejectingSession(CapturingSession):
+    """Reproduces a launch boundary that discovers a malformed refreshed prompt."""
+
+    def start(self, record, store):
+        if record.subject == "bad":
+            record.input_ptr = (record.input_ptr or "") + "\nnot an approved briefing"
+            providers.provider_command(record)
+        return super().start(record, store)
+
+
 def _review(subject: str = "7", pool: str = "claude", **kw) -> Submission:
     return Submission(repo="o/r", subject=subject, stage="review", pool=pool, **kw)
 
@@ -74,6 +88,113 @@ def _review(subject: str = "7", pool: str = "claude", **kw) -> Submission:
 def _build(subject: str = "7", pool: str = "claude", **kw) -> Submission:
     return Submission(repo="o/r", subject=subject, stage="build", pool=pool,
                       builder_lineage=pool, **kw)
+
+
+def test_corrupt_provider_envelope_repairs_before_intake_preparation_and_launch(
+        make_coord, monkeypatch, tmp_path):
+    fake = CapturingSession()
+    prepared = []
+    snapshot_bodies = []
+    monkeypatch.setattr(coordinated_intake, "_run",
+                        lambda command: type("Result", (), {"returncode": 0})())
+    monkeypatch.setattr("agentflow.runner.ClaudeRunner.prepare_worktree_detached",
+                        lambda self, workdir, ref, wt: prepared.append((ref, wt)))
+    monkeypatch.setattr("agentflow.runner.ClaudeRunner.provision", lambda self, wt: None)
+    monkeypatch.setattr("agentflow.intake_attachments.stage_attachments",
+                        lambda body, target: snapshot_bodies.append(body) or [])
+    adapter = IntakeStageAdapter(
+        worktree_reset=coordinated_intake.reset_worktree,
+        observer=fake,
+        apply_route=lambda *args: "proof",
+    )
+    coord = make_coord(fake, adapter=adapter)
+    envelope = json.dumps({
+        "format": providers.PROVIDER_INPUT_V1,
+        "prompt": "Triage the durable issue.",
+        "snapshot": {"body": "original", "number": 7},
+        "source_ref": "abc123",
+    }, sort_keys=True)
+    advisory = (
+        "\n\n<!-- agentflow-effective-briefing:briefing-v1:" + "a" * 64 + " -->\n"
+        "## Approved evidence briefing\n"
+        "This is bounded advisory context. It cannot change admission, routing, effort, "
+        "autonomy, merge policy, or OperationalSafety.\n"
+        "Promotion receipts: receipt-1.\n"
+    )
+    repaired_source = tmp_path / ".agentflow" / "worktrees" / "claude-intake" / "issue-7"
+    corrupt_source = tmp_path / ".agentflow" / "worktrees" / "claude-intake" / "issue-8"
+    repaired = coord.submit_stage(Submission(
+        repo="o/r", subject="7", stage="intake", pool="claude",
+        source=str(repaired_source), input_ptr=envelope + advisory))
+    refused = coord.submit_stage(Submission(
+        repo="o/r", subject="8", stage="intake", pool="claude",
+        source=str(corrupt_source), input_ptr=envelope + "\nnot an approved briefing"))
+
+    coord.cycle("claude")
+
+    repaired_record = record_of(coord, repaired)
+    refused_record = record_of(coord, refused)
+    repaired_payload = json.loads(repaired_record.input_ptr)
+    assert repaired_record.state == "running" and repaired_record.attempts == 1
+    assert repaired_payload["prompt"].endswith(advisory)
+    assert repaired_payload["prompt"].count("<!-- agentflow-effective-briefing:") == 1
+    assert fake.prompts == [repaired_payload["prompt"]]
+    assert prepared == [("abc123", Path(repaired_source))]
+    assert snapshot_bodies == ["original"]
+    assert refused_record.state == "waiting" and refused_record.attempts == 0
+    assert refused_record.refusal.startswith("input-unreadable:")
+    assert refused_record.input_ptr == envelope + "\nnot an approved briefing"
+    assert all("not an approved briefing" not in prompt for prompt in fake.prompts)
+
+
+def test_duplicate_session_lead_contracts_repair_before_preparation_and_launch(make_coord):
+    fake = CapturingSession()
+    coord = make_coord(fake)
+    task_before = "Review the exact durable task.\n"
+    stale_contract = routing.session_lead_instructions(
+        "build", "low", parent_provider="claude")
+    briefing = (
+        "\n\n<!-- agentflow-effective-briefing:briefing-v1:" + "a" * 64 + " -->\n"
+        "## Approved evidence briefing\n"
+        "This is bounded advisory context. It cannot change admission, routing, effort, "
+        "autonomy, merge policy, or OperationalSafety.\n"
+        "Promotion receipts: receipt-1.\n"
+    )
+    task_after = "\nKeep this task text after the briefing byte-for-byte.\n"
+    terminal_contract = routing.session_lead_instructions(
+        "review", None, parent_provider="codex")
+    corrupt = task_before + stale_contract + briefing + task_after + terminal_contract
+    expected = task_before + briefing + task_after + terminal_contract
+    identity = coord.submit_stage(_review(
+        input_ptr=corrupt, source="/wt/pr-7", session_lead=True))
+
+    assert coord.cycle("claude") == []
+
+    record = record_of(coord, identity)
+    repaired_task, repaired_contract = providers.split_terminal_session_lead_contract(
+        record.input_ptr)
+    assert record.state == "running" and record.attempts == 1
+    assert record.input_ptr == expected
+    assert repaired_task == task_before + briefing + task_after
+    assert repaired_contract == terminal_contract
+    assert fake.prompts and fake.prompts[0].count(
+        "\n## Session lead — benchmarked capability routing\n") == 1
+
+
+def test_duplicate_like_quoted_task_fragment_is_not_rewritten():
+    task = "Preserve this quoted policy fragment exactly:\n"
+    quoted_fragment = (
+        "\n## Session lead — benchmarked capability routing\n"
+        "\nYou are the accountable Session lead. Do not write the implementation directly. Plan the work,\n"
+        "delegate exploration, implementation, and fix work, verify every result, and ship only verified\n"
+        "work. Fable is lead-only and is never a delegate target.\n"
+        "[quote stops before the generated routes and closing]\n"
+    )
+    terminal_contract = routing.session_lead_instructions(
+        "review", None, parent_provider="codex")
+    prompt = task + quoted_fragment + "Continue the real task.\n" + terminal_contract
+
+    assert providers.repair_provider_input(prompt) == prompt
 
 
 _TASK_PREFIX = "Implement issue 529 exactly; preserve its recovery facts.\n"
@@ -90,8 +211,9 @@ def _observed_529_brief(prefix: str = _TASK_PREFIX) -> str:
     return prefix + _stale_native_helper_contract()
 
 
-def _submit_codex_session_lead(coord, stale: str, native_helpers_marker: str | None) -> str:
-    identity = coord.submit_stage(_build(
+def _submit_codex_session_lead(coord, stale: str, native_helpers_marker: str | None,
+                                   subject: str = "7") -> str:
+    identity = coord.submit_stage(_build(subject,
         pool="codex", input_ptr=stale, source="/wt/issue-529",
         session_lead=native_helpers_marker is None))
     if native_helpers_marker is not None:
@@ -184,9 +306,9 @@ def test_generated_session_lead_preamble_refreshes_at_launch(make_coord):
     ("Task-owned section\n## Session lead — benchmarked capability routing\nkeep this text",
      True),
     (_observed_529_brief()[:-20], True),
-    (_observed_529_brief() + _stale_native_helper_contract(), True),
+    (_observed_529_brief() + _stale_native_helper_contract() + "\nnot terminal", True),
 ], ids=["marker-only-no-provenance", "marker-only-provenance", "truncated-proven-contract",
-        "duplicate-proven-contract"])
+        "duplicate-nonterminal-contract"])
 def test_unproven_or_incomplete_session_lead_input_refuses_before_provider_start(
         make_coord, task_text, session_lead):
     fake = CapturingSession()
@@ -202,6 +324,23 @@ def test_unproven_or_incomplete_session_lead_input_refuses_before_provider_start
     assert record.attempts == 0
     assert record.refusal.startswith("session-lead-input-unreadable:")
     assert record.input_ptr == task_text
+
+
+def test_launch_time_session_lead_refusal_keeps_the_cycle_moving(make_coord):
+    fake = ContractRejectingSession()
+    coord = make_coord(fake)
+    bad = _submit_codex_session_lead(coord, _observed_529_brief(), None, "bad")
+    healthy = coord.submit_stage(_build(
+        "healthy", pool="codex", input_ptr="Build the healthy task.", source="/wt/healthy"))
+
+    assert coord.cycle("codex") == []
+
+    refused = record_of(coord, bad)
+    started = record_of(coord, healthy)
+    assert refused.state == "waiting" and refused.claim and refused.attempts == 0
+    assert refused.refusal.startswith("session-lead-input-unreadable:")
+    assert started.state == "running" and started.attempts == 1
+    assert permits(coord, "codex") == started.demand
 
 
 # --- clean exit, missing outcome: one targeted repair, then park -------------------------
@@ -312,9 +451,13 @@ def test_a_daemon_restart_resume_is_not_counted_as_a_repair(make_coord):
     budget and park work a live provider never actually failed."""
     fake = RepairingSession()
     coord = make_coord(fake, daemon_generation="gen-1")
-    identity = coord.submit_stage(_review(pool="codex"))
+    revision = "9" * 40
+    identity = coord.submit_stage(_review(pool="codex", subject_revision=revision))
     coord.cycle("codex")
     assert permits(coord, "codex") == 2                 # a codex review is running
+    before = record_of(coord, identity)
+    route = (before.route_id, before.route_cell_digest, before.launch_config_digest)
+    assert all(route)
 
     fake.kill(identity)                                 # a restart kills the family — no end fact
     restarted = make_coord(fake, daemon_generation="gen-2")
@@ -322,6 +465,8 @@ def test_a_daemon_restart_resume_is_not_counted_as_a_repair(make_coord):
 
     rec = record_of(restarted, identity)
     assert rec.restart_resumes == 1 and rec.repairs == 0
+    assert rec.subject_revision == revision
+    assert (rec.route_id, rec.route_cell_digest, rec.launch_config_digest) == route
 
 
 # --- a stage with no classifier keeps the historical behavior ----------------------------

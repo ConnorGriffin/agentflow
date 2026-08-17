@@ -10,8 +10,8 @@ from __future__ import annotations
 import os
 import threading
 
-from agentflow import (coordinated_build, coordinated_respond, coordinated_review, github, loop,
-                       pipeline)
+from agentflow import (coordinated_build, coordinated_hold, coordinated_respond, coordinated_review,
+                       github, loop, pipeline)
 from agentflow.balancer import pick_pair, pick_session_lead
 from agentflow.intake import replies_since_intake
 from agentflow.labels import BUILDING, RESOLVING, TRIAGING, claim, complexity_from_labels, effort_from_labels
@@ -273,13 +273,19 @@ def run_cycle(repos, *, submit_new: bool = True, coordinator=None, _log=None) ->
     """
     _log = _log or (lambda _m: None)
     _refresh_claude_quota(_log)
-    coord = coordinator if coordinator is not None else pipeline.build_coordinator(_log)
+    coord = coordinator if coordinator is not None else pipeline.build_coordinator(
+        _log, repositories={cfg.repo: cfg.workdir for cfg in repos})
     if submit_new:
         threads = [_spawn(lambda cfg=cfg: _submit_repo(cfg, coord, _log)) for cfg in repos]
         for thread in threads:
             thread.join()
     else:
         _log("dispatch paused — reconciling coordinator-owned work only")
+    # This is the daemon's full dispatch pass, not its cheap change-probe tick. Held records are
+    # terminal to ordinary reconciliation, so settle their GitHub subjects here before the normal
+    # pass publishes the durable board; running it any lower would make every narrow reconciler
+    # pay this cold API cost.
+    coordinated_hold._retire_closed_holds(coord)
     pipeline.reconcile_and_project(coord, _log=_log)
     for cfg in repos:
         pipeline.reconcile_orphaned_claims(cfg, _log=_log)

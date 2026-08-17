@@ -40,6 +40,7 @@ def intake_submission(cfg, issue: dict, extra: str, comments: str, tool: str) ->
     if not source_ref:
         return None
     return Submission(repo=cfg.repo, subject=str(n), stage="intake", target=target,
+                      subject_revision=source_ref,
                       pool=tool, complexity="deep", source=str(source_path), claim=True,
                       input_ptr=json.dumps({"format": PROVIDER_INPUT_V1,
                                             "snapshot": snapshot, "source_ref": source_ref,
@@ -174,7 +175,8 @@ def _retire_dead_intakes(coord) -> None:
     from agentflow.coordinator import tracer
     from agentflow.coordinator.record import RUNNING
     for record in tracer.load_records():
-        if record.stage not in ("intake", "attack") or record.retired or not record.claim:
+        if (not coord._manages_repository(record.repo)
+                or record.stage not in ("intake", "attack") or record.retired or not record.claim):
             continue
         state = github.issue_state(record.repo, int(record.subject))
         if state != "CLOSED":

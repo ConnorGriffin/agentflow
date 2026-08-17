@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from agentflow.coordinator.launcher import pid_family_supervisor
 from agentflow.coordinator.record import RUNNING, STALL_STALLED_AFTER, Record, stalled_for
 from agentflow.coordinator.store import Store, default_store_path
 from agentflow.worktree_ref import WorktreeRef
@@ -120,7 +121,7 @@ def live_projection(records) -> list[dict]:
             "model": record.model,
             "branch": branch,
             "worktree": record.source or "",
-            "pid": int(record.family) if record.family and record.family.isdigit() else None,
+            "pid": pid_family_supervisor(record.family),
             "started_at": started_at,
         })
     return entries

@@ -48,7 +48,7 @@ remain pure compatibility interfaces.
 allowance and raises the spend ceiling to 100 for both pools, fleet-wide (`floodgates_active`,
 env `AGENTFLOW_FLOODGATES` or the flag file) or per-dispatch (the `floodgates` parameter threaded
 through `pick_pair`/`_query_pool`/the dispatch-status wrappers, and the coordinator's per-record
-flag). It never touches the hard five-permit ledger, which stays the real concurrency cap.
+flag). It never touches the hard permit ledger, which stays the real concurrency cap.
 """
 
 from __future__ import annotations
@@ -93,12 +93,11 @@ ACTIVE_PACE = int(os.environ.get("AGENTFLOW_ACTIVE_PACE", "1"))
 # Conservative in-flight reservation (#305). Claude's provider quota fact is only observed after
 # a session ends, so work admitted from one below-ceiling reading is not yet reflected in it. The
 # reservation is charged *per running permit* (demand unit), not per running session: a heavier
-# session already reserved more of the pool's five permits and consumes proportionally more of the
+# session already reserved more of the pool's permits and consumes proportionally more of the
 # five-hour quota, so a demand-4 deep build reserves 4x this before another session admits. This is
 # deliberate — it errs on the safe side of the conservative-reservation criterion. It is also
-# calibrated against the pool's own five-permit ledger: at the 15% default a fully-seated pool
-# (five permits) reserves 75%, which stays just under the 85% idle ceiling, so the hard permit
-# ledger — not this soft reservation — remains the real concurrency cap. Env-overridable.
+# calibrated independently of the pool's hard permit ledger, so the hard ledger — not this soft
+# reservation — remains the real concurrency cap. Env-overridable.
 CLAUDE_INFLIGHT_RESERVE_PCT = float(
     os.environ.get("AGENTFLOW_CLAUDE_INFLIGHT_RESERVE_PCT", "15"))
 
@@ -279,8 +278,10 @@ def _codex_spent_pct(windows: tuple[RateLimitWindow, ...], now: float) -> float:
 
 
 def _codex_dispatch_status(status: PoolStatus, now: float, floodgates: bool = False) -> PoolStatus:
-    if status.windows is None:
-        return PoolStatus(status.tool, False, 100.0, "limit facts unavailable", None)
+    if not status.windows:
+        return PoolStatus(status.tool, False, 100.0,
+                          status.reason or "limit facts unavailable", status.windows,
+                          status.active, status.ceiling, status.observed_at)
     fg = floodgates or floodgates_active()
     paced, pace_reason = _codex_pacing(status.windows, now, floodgates=fg)
     spent_pct = _codex_spent_pct(status.windows, now)

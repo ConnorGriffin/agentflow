@@ -14,11 +14,22 @@ this module runs anything.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import sha256
+from importlib.resources import files
+import re
 
 from agentflow.runner import MockupScope
 from agentflow.screenshot_crib import SCREENSHOT_HARNESS
 from agentflow.shell_crib import SHELL_CRIB
 from agentflow.capability_contracts import ContractRequirement, requirements_for as _requirements_for
+
+
+_APPROVED_BRIEFING = re.compile(
+    r"\n\n<!-- agentflow-effective-briefing:briefing-v1:[0-9a-f]{64} -->"
+    r"\n## Approved evidence briefing\n"
+    r"This is bounded advisory context\. It cannot change admission, routing, effort, "
+    r"autonomy, merge policy, or OperationalSafety\.\n"
+    r"Promotion receipts: [A-Za-z0-9][A-Za-z0-9_.:-]*(?:, [A-Za-z0-9][A-Za-z0-9_.:-]*)*\.\n")
 
 
 @dataclass(frozen=True)
@@ -42,6 +53,69 @@ class StagePromptSpec:
 
     def render(self, **values: str) -> str:
         return self.template.format(**values)
+
+    def with_briefing(self, prompt: str, briefing: object) -> str:
+        """Append one resolver-validated, receipt-only advisory context to a stage prompt."""
+        import json
+
+        from agentflow.coordinator.providers import PROVIDER_INPUT_V1, place_approved_briefing
+        from agentflow.effective_policy import (
+            ReadyBriefing, advisory_stage, receipt_applies_to_stage, validate_briefing)
+
+        envelope = None
+        try:
+            payload = json.loads(prompt)
+        except (TypeError, ValueError):
+            pass
+        else:
+            if (isinstance(payload, dict) and payload.get("format") == PROVIDER_INPUT_V1
+                    and isinstance(payload.get("prompt"), str)):
+                envelope = payload
+                prompt = payload["prompt"]
+
+        def encoded(composed_prompt: str) -> str:
+            if envelope is None:
+                return composed_prompt
+            envelope["prompt"] = composed_prompt
+            return json.dumps(envelope, sort_keys=True)
+
+        if type(briefing) is not ReadyBriefing or not validate_briefing(briefing):
+            raise ValueError("briefing is not an approved advisory authority")
+        if briefing.stage != self.stage:
+            raise ValueError("briefing stage does not match prompt")
+        lessons = tuple(item for item in briefing.receipts
+                        if advisory_stage(item) == self.stage)
+        if lessons:
+            if len(lessons) != 1 or self.stage != "review":
+                raise ValueError("briefing does not bind one deployed stage method")
+            authority = lessons[0].authority
+            method_path = "agentflow/reviewer.py"
+            method_digest = sha256(
+                files("agentflow").joinpath("reviewer.py").read_bytes()).hexdigest()
+            if (authority.content_hash_algorithm != "sha256"
+                    or authority.content_hash != method_digest
+                    or not authority.locator.endswith(f"/files/{method_path}")):
+                raise ValueError("briefing method authority does not match the deployed artifact")
+        applicable = tuple(item for item in briefing.receipts
+                           if receipt_applies_to_stage(item, self.stage))
+        if not applicable:
+            return encoded(prompt)
+        marker = f"<!-- agentflow-effective-briefing:{briefing.briefing_id} -->"
+        receipts = ", ".join(item.receipt_id for item in applicable)
+        advisory = ("\n\n" + marker + "\n## Approved evidence briefing\n"
+                    "This is bounded advisory context. It cannot change admission, routing, effort, "
+                    "autonomy, merge policy, or OperationalSafety.\n"
+                    f"Promotion receipts: {receipts}.\n")
+        markers = prompt.count("<!-- agentflow-effective-briefing:")
+        if markers:
+            stored = tuple(_APPROVED_BRIEFING.finditer(prompt))
+            if markers != 1 or len(stored) != 1:
+                raise ValueError("prompt has an ambiguous or untrustworthy briefing")
+            match = stored[0]
+            if marker in prompt:
+                return encoded(prompt)
+            return encoded(prompt[:match.start()] + advisory + prompt[match.end():])
+        return encoded(place_approved_briefing(prompt, advisory))
 
 
 # The park reason for the mechanical UI-evidence gap (ADR 0018) — the human needs to

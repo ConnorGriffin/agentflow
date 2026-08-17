@@ -18,6 +18,7 @@ import signal
 import subprocess
 import sys
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -63,6 +64,51 @@ def test_durable_started_then_dead_recovery_consumes_exactly_one_attempt(make_co
     recovered = make_coord(fake)
     # The durable `started` counts, so only two attempts remain before the hold.
     assert starts_until_held(recovered, fake, identity, "codex") == 2
+
+
+def test_local_launcher_rejects_a_live_pid_that_is_not_its_process_family(monkeypatch):
+    """Recovery must not adopt or signal a PID reused by an unrelated process group."""
+    probes = []
+    monkeypatch.setattr(launcher_mod.os, "kill",
+                        lambda pid, signal: probes.append((pid, signal)))
+    monkeypatch.setattr(launcher_mod.os, "getpgid", lambda _pid: 12345)
+
+    assert not LocalLauncher.is_alive("89850")
+    assert probes == [(89850, 0)]
+
+
+def test_local_launcher_rejects_a_proven_missing_pid(monkeypatch):
+    """A missing PID is definite evidence that the recorded family ended."""
+    def missing(*_args):
+        raise ProcessLookupError
+
+    monkeypatch.setattr(launcher_mod.os, "kill", missing)
+    monkeypatch.setattr(launcher_mod.os, "getpgid",
+                        lambda _pid: pytest.fail("missing PID must not reach the group probe"))
+
+    assert not LocalLauncher.is_alive("89850")
+
+
+@pytest.mark.parametrize("probe", ["kill", "getpgid"])
+def test_local_launcher_keeps_permission_denied_probe_conservatively_alive(monkeypatch, probe):
+    """Recovery waits when the OS cannot determine whether the recorded family still exists."""
+    def denied(*_args):
+        raise PermissionError
+
+    monkeypatch.setattr(launcher_mod.os, "kill", denied if probe == "kill"
+                        else lambda _pid, _signal: None)
+    monkeypatch.setattr(launcher_mod.os, "getpgid", denied if probe == "getpgid"
+                        else lambda _pid: 89850)
+
+    assert LocalLauncher.is_alive("89850")
+
+
+def test_local_launcher_keeps_an_ambiguous_reused_group_leader_alive(monkeypatch):
+    """Matching PID and PGID cannot prove the original process birth without new persistence."""
+    monkeypatch.setattr(launcher_mod.os, "kill", lambda _pid, _signal: None)
+    monkeypatch.setattr(launcher_mod.os, "getpgid", lambda _pid: 89850)
+
+    assert LocalLauncher.is_alive("89850")
 
 
 @pytest.mark.parametrize(("result", "legacy_exit"), [
@@ -133,6 +179,109 @@ def test_durable_started_and_alive_recovery_keeps_the_reservation(make_coord):
     assert permits(recovered, "codex") == 2
     assert recovered.cycle("codex") == []       # idempotent across repeated reconciliation
     assert permits(recovered, "codex") == 2
+
+
+def test_same_cycle_vanished_launch_settles_its_durable_result(make_coord):
+    """A provider lost during launch settles before this daemon's cycle returns."""
+    class VanishingSession(FakeSession):
+        def start(self, record, store):
+            result = super().start(record, store)
+            self.end(record.identity, success=True)
+            return result
+
+    fake = VanishingSession()
+    coord = make_coord(fake)
+    identity = coord.submit_stage(review())
+
+    assert [outcome.status for outcome in coord.cycle("codex")] == ["completed"]
+    durable = record_of(coord, identity)
+    assert durable.state == "completed" and durable.attempts == 1
+    assert not durable.process_alive
+    assert coord.cycle("codex") == []
+
+
+def test_same_cycle_vanished_launch_enters_recoverable_continuation(make_coord):
+    """A provider lost during launch retains its work and first-attempt accounting."""
+    class VanishingSession(FakeSession):
+        def start(self, record, store):
+            result = super().start(record, store)
+            self.kill(record.identity)
+            self.gate_open = False
+            return result
+
+    fake = VanishingSession()
+    coord = make_coord(fake)
+    identity = coord.submit_stage(review())
+
+    assert coord.cycle("codex") == []
+    durable = record_of(coord, identity)
+    assert durable.state == "waiting" and durable.continuation and durable.claim
+    assert durable.attempts == 1 and not durable.process_alive
+    assert coord.cycle("codex") == []
+    durable = record_of(coord, identity)
+    assert durable.state == "waiting" and durable.attempts == 1 and durable.claim
+
+
+def test_same_cycle_live_launch_remains_observed(make_coord):
+    """The post-launch reconciliation leaves an exact live family running."""
+    fake = FakeSession()
+    coord = make_coord(fake)
+    identity = coord.submit_stage(review())
+
+    assert coord.cycle("codex") == []
+    durable = record_of(coord, identity)
+    assert durable.state == "running" and durable.attempts == 1
+    assert durable.process_alive and permits(coord, "codex") == durable.demand
+
+
+def test_same_cycle_permission_denied_launch_remains_observed(make_coord, monkeypatch):
+    """An uncertain process probe never turns a fresh launch into a recoverable ending."""
+    class PermissionDeniedSession(FakeSession):
+        def is_alive(self, family):
+            return LocalLauncher.is_alive(family)
+
+    monkeypatch.setattr(launcher_mod.os, "kill",
+                        lambda _pid, _signal: (_ for _ in ()).throw(PermissionError))
+    fake = PermissionDeniedSession()
+    coord = make_coord(fake)
+    identity = coord.submit_stage(review())
+
+    assert coord.cycle("codex") == []
+    durable = record_of(coord, identity)
+    assert durable.state == "running" and durable.attempts == 1 and durable.process_alive
+
+
+def test_recovery_settles_an_absent_family_from_its_durable_result(make_coord):
+    """An ended family with a durable result completes immediately, never until its deadline."""
+    fake = FakeSession()
+    started = make_coord(fake)
+    identity = started.submit_stage(review())
+    started.cycle("codex")
+    fake.end(identity, success=True)
+
+    recovered = make_coord(fake)
+    assert [outcome.status for outcome in recovered.cycle("codex")] == ["completed"]
+    durable = record_of(recovered, identity)
+    assert durable.state == "completed" and durable.attempts == 1
+    assert not durable.process_alive
+    assert recovered.cycle("codex") == []
+
+
+def test_recovery_closes_an_absent_family_without_a_result_once(make_coord):
+    """A vanished family follows the normal closed recovery path without a second attempt."""
+    fake = FakeSession()
+    started = make_coord(fake)
+    identity = started.submit_stage(review())
+    started.cycle("codex")
+    fake.kill(identity)
+    fake.gate_open = False
+
+    recovered = make_coord(fake)
+    assert recovered.cycle("codex") == []
+    durable = record_of(recovered, identity)
+    assert durable.state == "waiting" and durable.continuation
+    assert durable.attempts == 1 and durable.claim
+    assert not durable.process_alive
 
 
 # --- ADR 0030 / issue #175: a daemon restart resumes an attempt without charging it ---------
@@ -264,20 +413,26 @@ def test_real_launcher_spawns_a_provider_and_the_start_is_durable(coord_state):
 
 
 
-def test_real_launcher_releases_when_the_spawned_provider_exits(coord_state):
-    """A provider that exits is detected as a dead family and its permit is released."""
-    gate = {"open": True}
-    exiting_provider = lambda record: [sys.executable, "-c", ""]
-    coord = Coordinator(launcher=LocalLauncher(exiting_provider, timeout=5),
-                        gate=lambda record: gate["open"])
-    coord.submit_stage(review(pool="claude"))
-    assert coord.cycle("claude") == []
-    assert permits(coord, "claude") == 1  # started
+def test_real_launcher_recovers_a_known_dead_family_in_its_launch_cycle(
+        coord_state):
+    """A real launch whose liveness is known dead recovers in its launch cycle."""
+    class KnownDeadFamilyLauncher(LocalLauncher):
+        def is_alive(self, _family):
+            return False
 
-    time.sleep(0.5)                      # the provider exits
-    gate["open"] = False                 # do not immediately re-admit the continuation
-    coord.cycle("claude")
-    assert permits(coord, "claude") == 0  # the dead family's reservation is released
+    exiting_provider = lambda record: [sys.executable, "-c", ""]
+    coord = Coordinator(launcher=KnownDeadFamilyLauncher(exiting_provider, timeout=5))
+    identity = coord.submit_stage(review(pool="claude"))
+
+    assert coord.cycle("claude") == []
+    durable = record_of(coord, identity)
+
+    # The start fact and family prove LocalLauncher completed the real bootstrap handshake;
+    # the injected liveness seam makes the final same-cycle observation deterministic.
+    assert durable.start_fact == "started" and durable.family is not None
+    assert durable.state == "waiting" and durable.continuation and durable.claim
+    assert not durable.process_alive
+    assert permits(coord, "claude") == 0
 
 
 def test_launched_session_is_observed_from_its_durable_artifacts(coord_state):
@@ -344,6 +499,38 @@ def test_real_supervisor_preserves_partial_output_signal_and_timeout(coord_state
     assert observation.signal in {15, 9}
     assert "partial stdout" in observation.partial_output
     assert "partial stderr" in observation.partial_output
+    assert observation.cause is ProviderCause.TIMEOUT
+
+
+def test_forced_provider_stop_preserves_durable_timeout_result(coord_state):
+    """A provider that ignores SIGTERM is force-stopped without killing the result writer."""
+    from agentflow.coordinator.providers import ClaudeProviderAdapter
+    from agentflow.coordinator.store import Store, default_store_path
+
+    script = (
+        "import signal,time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "print('ignoring SIGTERM', flush=True)\n"
+        "time.sleep(30)\n"
+    )
+    provider = lambda _record: [sys.executable, "-c", script]
+    coord = Coordinator(launcher=LocalLauncher(provider, timeout=5, session_timeout=0.5))
+    identity = coord.submit_stage(review(subject="forced-timeout", pool="claude"))
+    coord.cycle("claude")
+
+    deadline = time.monotonic() + 7
+    while time.monotonic() < deadline:
+        record = Store(default_store_path()).load()[identity]
+        if not pid_family_alive(record.family):
+            break
+        time.sleep(0.02)
+    else:
+        pytest.fail("force-stopped provider family did not finish")
+
+    observation = ClaudeProviderAdapter().observe(record)
+    assert observation.has_end_fact is True
+    assert observation.timed_out is True
+    assert observation.exit_status is None and observation.signal == signal.SIGKILL
     assert observation.cause is ProviderCause.TIMEOUT
 
 
@@ -712,16 +899,21 @@ def test_bounded_worker_snapshot_rechecks_current_authorization(
         def child_start(self, identity, token, family):
             return True
 
+        def child_provider_group(self, identity, token, supervisor_pid, provider_pgid):
+            return True
+
         def close(self):
             pass
 
     class Provider:
         pid = 123
 
-        def __init__(self, *args, **kwargs):
-            output = kwargs["stdout"]
+        def __init__(self, _provider, output, _working_dir):
             output.write(json.dumps(started) + "\n")
             output.flush()
+
+        def release(self):
+            pass
 
         def wait(self, timeout=None):
             if timeout is None or clock.now + timeout >= 0.22:
@@ -766,11 +958,11 @@ def test_bounded_worker_snapshot_rechecks_current_authorization(
     monkeypatch.setattr(_launch_child, "_head", lambda _working_dir: None)
     monkeypatch.setattr(_launch_child, "_worktree_snapshot", snapshot)
     monkeypatch.setattr(_launch_child, "time", SimpleNamespace(monotonic=clock))
-    monkeypatch.setattr(_launch_child.subprocess, "Popen", Provider)
+    monkeypatch.setattr(_launch_child, "_spawn_provider", Provider)
     monkeypatch.chdir(tmp_path)
 
     args = [str(store_path), "attempt", "token", "5", "--build-lease", "codex",
-            "0.20", "0.50", "1.0", _launch_child._INHERITED_WORKTREE, "provider"]
+            "0.20", "0.50", "1.0", _launch_child._WORKTREE, str(tmp_path), "provider"]
     revoker = threading.Thread(target=revoke_authorization)
     revoker.start()
     with pytest.raises(ChildExit) as exited:
@@ -1295,11 +1487,17 @@ def _run_clocked_supervisor(
         def child_start(self, identity, token, family):
             return True
 
+        def child_provider_group(self, identity, token, supervisor_pid, provider_pgid):
+            return True
+
         def close(self):
             pass
 
     class Provider:
         pid = 123
+
+        def release(self):
+            pass
 
         def wait(self, timeout=None):
             assert timeout is not None
@@ -1330,14 +1528,15 @@ def _run_clocked_supervisor(
     monkeypatch.setattr(_launch_child, "_clear_active", lambda _marker: None)
     monkeypatch.setattr(_launch_child, "_head", head)
     monkeypatch.setattr(_launch_child, "time", SimpleNamespace(monotonic=clock))
-    monkeypatch.setattr(_launch_child.subprocess, "Popen", lambda *args, **kwargs: Provider())
+    monkeypatch.setattr(_launch_child, "_spawn_provider",
+                        lambda _provider, _output, _working_dir: Provider())
     monkeypatch.chdir(tmp_path)
 
     silent, test_grace, absolute = build_lease
     store_path = tmp_path / "records.db"
     args = [str(store_path), "attempt", "token", "5", "--build-lease", "claude",
-            str(silent), str(test_grace), str(absolute), _launch_child._INHERITED_WORKTREE,
-            "provider"]
+            str(silent), str(test_grace), str(absolute), _launch_child._WORKTREE,
+            str(tmp_path), "provider"]
     with pytest.raises(ChildExit) as exited:
         _launch_child.main(args)
 
@@ -1839,18 +2038,18 @@ def _delay_supervisor_wait(
     wait_marker = ""
     if wait_returned_marker is not None:
         wait_marker = (
-            "  pathlib.Path(os.environ['AGENTFLOW_TEST_WAIT_RETURNED_MARKER']).write_text(str(timeout))\n")
+            "  pathlib.Path(os.environ['AGENTFLOW_TEST_WAIT_RETURNED_MARKER']).write_text('waited')\n")
     sitecustomize = (
-        "import os,subprocess,time\n"
+        "import os,time\n"
         + instrumentation
-        + "_wait=subprocess.Popen.wait\n"
-        "def wait(self,timeout=None):\n"
-        " result=_wait(self,timeout=timeout)\n"
-        " if timeout is not None:\n"
+        + "_waitpid=os.waitpid\n"
+        "def waitpid(pid,options):\n"
+        " result=_waitpid(pid,options)\n"
+        " if result[0] and options & os.WNOHANG:\n"
         + wait_marker
         + "  time.sleep(float(os.environ['AGENTFLOW_TEST_WAIT_DELAY']))\n"
         " return result\n"
-        "subprocess.Popen.wait=wait\n")
+        "os.waitpid=waitpid\n")
     (custom / "sitecustomize.py").write_text(sitecustomize)
     monkeypatch.setenv("AGENTFLOW_TEST_WAIT_DELAY", str(delay))
     if decoded_marker is not None:
@@ -2001,7 +2200,7 @@ def test_real_supervisor_forwards_reconciler_sigterm_to_its_provider_group(coord
 
     record = Store(default_store_path()).load()[identity]
     assert pid_family_alive(record.family)
-    os.kill(int(record.family), signal.SIGTERM)
+    os.kill(int(record.family.split(":", 1)[0]), signal.SIGTERM)
 
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
@@ -2015,6 +2214,58 @@ def test_real_supervisor_forwards_reconciler_sigterm_to_its_provider_group(coord
     observation = ClaudeProviderAdapter().observe(record)
     assert observation.signal in {15, 9}
     assert observation.timed_out is False
+
+
+def test_recovery_keeps_a_provider_after_its_supervisor_is_killed(coord_state, tmp_path):
+    """Killing the detached supervisor cannot make its still-running provider re-launch."""
+    from agentflow.coordinator.store import Store, default_store_path
+
+    provider_pid = tmp_path / "provider-pid"
+    script = (
+        "import os,pathlib,sys,time\n"
+        "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))\n"
+        "time.sleep(30)\n"
+    )
+    launched = []
+
+    class RecoveryLauncher:
+        @staticmethod
+        def is_alive(family):
+            return LocalLauncher.is_alive(family)
+
+        def start(self, *_args):
+            launched.append(True)
+            return pytest.fail("recovery launched a second provider")
+
+    coord = Coordinator(
+        launcher=LocalLauncher(
+            lambda _record: [sys.executable, "-c", script, str(provider_pid)],
+            timeout=5, session_timeout=30),
+        daemon_generation="daemon-before-kill")
+    identity = coord.submit_stage(review(subject="supervisor-killed", pool="claude"))
+    coord.cycle("claude")
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not provider_pid.exists():
+        time.sleep(0.02)
+    assert provider_pid.exists(), "provider never started"
+    record = Store(default_store_path()).load()[identity]
+    supervisor_pid, provider_group = map(int, record.family.split(":"))
+    assert supervisor_pid != provider_group
+    assert os.getpgid(int(provider_pid.read_text())) == provider_group
+    try:
+        os.kill(supervisor_pid, signal.SIGKILL)
+        assert pid_family_alive(record.family), "provider group vanished with its supervisor"
+        recovered = Coordinator(launcher=RecoveryLauncher(), daemon_generation="daemon-after-kill")
+        assert recovered.cycle("claude") == []
+        assert launched == []
+        durable = Store(default_store_path()).load()[identity]
+        assert durable.state == "running" and durable.process_alive
+    finally:
+        try:
+            os.killpg(provider_group, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
 
 
 def test_real_supervisor_remembers_sigterm_from_provider_spawn(coord_state):
@@ -2068,11 +2319,17 @@ def test_child_stop_permission_denial_records_a_durable_reason(tmp_path, monkeyp
         def child_start(self, identity, token, family):
             return True
 
+        def child_provider_group(self, identity, token, supervisor_pid, provider_pgid):
+            return True
+
         def close(self):
             pass
 
     class Provider:
         pid = 123
+
+        def release(self):
+            pass
 
         def wait(self, timeout=None):
             return 0
@@ -2092,14 +2349,14 @@ def test_child_stop_permission_denial_records_a_durable_reason(tmp_path, monkeyp
         handlers[signal.SIGTERM](signal.SIGTERM, None)
         return Provider()
 
-    monkeypatch.setattr(_launch_child.subprocess, "Popen", start_provider)
+    monkeypatch.setattr(_launch_child, "_spawn_provider", start_provider)
     monkeypatch.setattr(_launch_child.os, "killpg",
                         lambda _pid, _signum: (_ for _ in ()).throw(PermissionError()))
     monkeypatch.chdir(tmp_path)
 
     with pytest.raises(ChildExit) as exited:
         _launch_child.main([str(tmp_path / "records.db"), "attempt", "token", "30",
-                            _launch_child._INHERITED_WORKTREE, "provider"])
+                            _launch_child._WORKTREE, str(tmp_path), "provider"])
 
     assert exited.value.args == (0,)
     session = read_session(tmp_path / "records.db", "token")
@@ -2108,14 +2365,31 @@ def test_child_stop_permission_denial_records_a_durable_reason(tmp_path, monkeyp
     assert "permission denied stopping provider process group" in session.partial_output
 
 
-def test_real_supervisor_starts_provider_in_the_submitted_source(coord_state, tmp_path):
-    """The path named in the boundary is also the provider process's real working directory,
-    which is what the Claude project settings and OS workspace sandbox confine."""
+def test_bootstrap_uses_daemon_code_while_provider_uses_submitted_source(
+        coord_state, tmp_path, monkeypatch):
+    """The bootstrap module comes from the daemon, while the provider stays in its worktree."""
     from agentflow.coordinator.providers import ClaudeProviderAdapter
     from agentflow.coordinator.store import Store, default_store_path
 
     source = tmp_path / "owned-worktree"
-    source.mkdir()
+    shadow_init = source / "agentflow" / "__init__.py"
+    shadow_init.parent.mkdir(parents=True)
+    shadow_init.write_text("# Must never bootstrap the daemon.\n")
+    instrumentation = tmp_path / "bootstrap-import-tracer"
+    instrumentation.mkdir()
+    resolved_module = tmp_path / "bootstrap-agentflow-module"
+    (instrumentation / "sitecustomize.py").write_text(
+        "import importlib.machinery, os, pathlib, sys\n"
+        "class TraceAgentflow:\n"
+        " def find_spec(self, name, path=None, target=None):\n"
+        "  if name == 'agentflow':\n"
+        "   spec = importlib.machinery.PathFinder.find_spec(name, path)\n"
+        "   pathlib.Path(os.environ['AGENTFLOW_TEST_BOOTSTRAP_MODULE']).write_text(spec.origin)\n"
+        "  return None\n"
+        "sys.meta_path.insert(0, TraceAgentflow())\n")
+    monkeypatch.setenv("AGENTFLOW_TEST_BOOTSTRAP_MODULE", str(resolved_module))
+    monkeypatch.setenv("PYTHONPATH", f"{instrumentation}{os.pathsep}"
+                       f"{os.environ.get('PYTHONPATH', '')}")
     provider = lambda record: [sys.executable, "-c", "import os; print(os.getcwd())"]
     coord = Coordinator(launcher=LocalLauncher(provider, timeout=5))
     identity = coord.submit_stage(Submission(
@@ -2132,11 +2406,13 @@ def test_real_supervisor_starts_provider_in_the_submitted_source(coord_state, tm
         pytest.fail("provider supervisor did not finish")
 
     observation = ClaudeProviderAdapter().observe(record)
+    daemon_module = (Path(launcher_mod.__file__).parent.parent / "__init__.py").resolve()
+    assert Path(resolved_module.read_text()).resolve() == daemon_module
     assert observation.partial_output == str(source)
 
 
-def test_local_launcher_passes_only_the_inherited_worktree_sentinel(tmp_path, monkeypatch):
-    """The public launcher carries source authority in cwd, never in child argv."""
+def test_local_launcher_passes_worktree_data_from_daemon_code_root(tmp_path, monkeypatch):
+    """The public launcher starts daemon code and passes provider cwd as explicit data."""
     from agentflow.coordinator import _launch_child
     from agentflow.coordinator import launcher as launcher_mod
     from agentflow.coordinator.launcher import STARTED
@@ -2153,7 +2429,7 @@ def test_local_launcher_passes_only_the_inherited_worktree_sentinel(tmp_path, mo
         path = tmp_path / "records.db"
 
         def record_of(self, _identity):
-            return SimpleNamespace(start_fact=STARTED, launch_token="token", family="123")
+            return SimpleNamespace(start_fact=STARTED, launch_token="token", family="123:456")
 
     record = SimpleNamespace(identity="attempt", launch_token="token", stage="review",
                              source=str(source))
@@ -2167,15 +2443,15 @@ def test_local_launcher_passes_only_the_inherited_worktree_sentinel(tmp_path, mo
     result = launcher_mod.LocalLauncher(lambda _record: ["provider"], timeout=1,
                                         session_timeout=5).start(record, Store())
 
-    assert result.family == "123"
-    assert observed["cwd"] == str(source)
-    assert _launch_child._INHERITED_WORKTREE in observed["argv"]
-    assert str(source) not in observed["argv"]
+    assert result.family == "123:456"
+    assert observed["cwd"] == Path(launcher_mod.__file__).parents[2]
+    assert _launch_child._WORKTREE in observed["argv"]
+    assert observed["argv"].count(str(source)) == 1
 
 
 def test_public_launcher_ignores_forged_provider_root_for_snapshot_authority(
         coord_state, tmp_path, monkeypatch):
-    """A provider path cannot redirect the snapshot away from LocalLauncher's inherited cwd."""
+    """A provider path cannot redirect the snapshot away from LocalLauncher's worktree data."""
     from agentflow.coordinator import _launch_child
 
     source, target = _tracked_build(tmp_path)
@@ -2226,9 +2502,10 @@ def test_public_launcher_ignores_forged_provider_root_for_snapshot_authority(
 
     record = _wait_for_real_child(identity, "forged root redirected the worktree snapshot")
     starts = [json.loads(line) for line in bootstrap.read_text().splitlines()]
-    cwd, argv = next(start for start in starts if _launch_child._INHERITED_WORKTREE in start[1])
-    assert cwd == str(source)
-    assert _launch_child._INHERITED_WORKTREE in argv
+    cwd, argv = next(start for start in starts if _launch_child._WORKTREE in start[1])
+    assert cwd == str(Path(launcher_mod.__file__).parents[2])
+    assert _launch_child._WORKTREE in argv
+    assert str(source) in argv
     assert not external_read.exists()
     assert marker.exists()
     assert _build_observation(record).timed_out is False

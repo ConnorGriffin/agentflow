@@ -23,9 +23,9 @@ temptation to re-litigate them slice by slice:
 ## Decision
 
 1. **Unknown is distinguishable from zero, everywhere.** Until worker capture lands for an
-   attempt, a lead-run build/revise attempt is marked *delegate spend not counted* in the spend
-   report — in the rendered text and in the structured report, so no aggregate reading it can
-   silently treat it as fully measured.
+   attempt, or a daemon restart leaves the lead's own bill unrecoverable, a lead-run build/revise
+   attempt is marked *spend not fully counted* in the spend report — in the rendered text and in
+   the structured report, so no aggregate reading it can silently treat it as fully measured.
 2. **Worker spend is observed, never self-reported.** A session lead's Codex workers are priced
    from usage the daemon reads off the worker's own rollout files, and that usage rolls up into
    the ONE Build/Revise stage identity that spawned it — never a second telemetry record. The
@@ -49,11 +49,12 @@ temptation to re-litigate them slice by slice:
   renders both, and a cell with no dollar fact at all still renders `—`, never `0.000000`.
 - Worker capture is read-side only: `ClaudeProviderAdapter.observe` scans the Codex sessions
   root (`~/.codex/sessions`; the root is fixed at the user's home directory with no override of
-  any kind, so no untrusted path ever reaches the scan) for rollouts whose `cwd` realpath-matches
-  the lead's workspace and whose mtime is at/after the attempt's own `started_at`, and merges
-  their last cumulative `token_count` totals into the observation's `usage.model_costs` before the
-  coordinator ever persists it. A scan failure of any kind degrades to no worker entries rather
-  than failing the observation it rides on.
+  any kind, so no untrusted path ever reaches the scan) for rollouts whose `cwd` realpath-resolves
+  to the lead's workspace or a descendant of it and whose mtime is at/after the attempt's own
+  `started_at`, and merges their last cumulative `token_count` totals into the observation's
+  `usage.model_costs` before the coordinator ever persists it. A scan failure of any kind degrades
+  to no worker entries rather than failing the observation it rides on.
 - Once a lead-run attempt's usage carries a Codex-priced model-cost entry (worker capture
-  merged it in), the *delegate spend not counted* mark disappears for that attempt on its own —
-  there is no separate flag to flip.
+  merged it in), the *spend not fully counted* mark disappears for that attempt on its own — unless
+  it was interrupted by a daemon restart, in which case the captured helper spend remains measured
+  but the lead's own terminal provider bill is unrecoverable.

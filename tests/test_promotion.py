@@ -7,6 +7,7 @@ from dataclasses import replace
 from hashlib import sha256
 import inspect
 from pathlib import Path
+import sqlite3
 import subprocess
 import threading
 
@@ -14,7 +15,8 @@ import pytest
 
 from agentflow import github
 from agentflow.evidence import (AuthorityPointer, EvidenceError, EvidenceStore, FakeAuthorityVerifier,
-                                LessonCandidate, Observation, SubjectRevision)
+                                LessonCandidate, Observation, PromotionReceiptReader,
+                                SubjectRevision)
 from agentflow.promotion import (GitHubAuthorityFacts, GitHubAuthoritySourceAdapter,
                                  GitHubAuthorityVerifier,
                                  PromotionAuthorityError, PromotionScopeRegistry,
@@ -317,7 +319,39 @@ def test_promotion_binds_digest_version_prior_and_is_idempotent(tmp_path, monkey
     successor = _pointer(scope="fleet-policy/1-to-2", digest="d" * 64)
     _candidate(store, successor, candidate_id="successor", version=2)
     store.verifier = GitHubAuthorityVerifier(Source(_facts(successor)), registry)
-    assert store.promote("successor", successor, promoted_at=4).policy_version == 2
+    successor_receipt = store.promote("successor", successor, promoted_at=4)
+    assert successor_receipt.policy_version == 2
+    assert PromotionReceiptReader(path=store.path).fleet_policy_successors(
+        first.receipt_id) == (successor_receipt,)
+
+    skipped = _pointer(scope="fleet-policy/2-to-4", digest="e" * 64)
+    _candidate(store, skipped, candidate_id="skipped", version=4)
+    store.verifier = GitHubAuthorityVerifier(Source(_facts(skipped)), registry)
+    with pytest.raises(EvidenceError, match="next policy version"):
+        store.promote("skipped", skipped, promoted_at=5)
+
+
+def test_promotion_reader_rejects_a_persisted_fleet_policy_gap(tmp_path, monkeypatch):
+    registry = _registry(tmp_path, monkeypatch)
+    first_pointer = _pointer()
+    store = EvidenceStore(
+        path=tmp_path / "evidence.db",
+        verifier=GitHubAuthorityVerifier(Source(_facts(first_pointer)), registry))
+    _candidate(store, first_pointer)
+    first = store.promote("candidate-1", first_pointer, promoted_at=2)
+    successor_pointer = _pointer(scope="fleet-policy/1-to-2", digest="d" * 64)
+    _candidate(store, successor_pointer, candidate_id="successor", version=2)
+    store.verifier = GitHubAuthorityVerifier(Source(_facts(successor_pointer)), registry)
+    successor = store.promote("successor", successor_pointer, promoted_at=3)
+
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            "UPDATE receipts SET policy_version=3, authority_scope='fleet-policy/1-to-3', "
+            "approved_scope='fleet-policy/1-to-3' WHERE receipt_id=?",
+            (successor.receipt_id,))
+
+    with pytest.raises(EvidenceError, match="receipt chain"):
+        PromotionReceiptReader(path=store.path).fleet_policy_successors(first.receipt_id)
 
 
 def test_two_candidates_cannot_both_commit_the_same_fleet_transition(tmp_path, monkeypatch):

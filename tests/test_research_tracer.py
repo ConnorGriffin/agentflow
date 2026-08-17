@@ -16,6 +16,7 @@ through the same public seam and real stage router that runs the live stages.
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -895,6 +896,10 @@ def test_a_research_run_provisions_a_detached_worktree_and_reuses_it_on_resume(t
     it is, keeping partial findings a resumed run already wrote."""
     cfg = RepoConfig(REPO, _repo_with_origin_main(tmp_path))
     sub = coordinated_research.research_submission(cfg, _ticket(), "claude")
+    revision = subprocess.run(
+        ["git", "-C", cfg.workdir, "rev-parse", "HEAD"], check=True, text=True,
+        stdout=subprocess.PIPE).stdout.strip()
+    assert sub.subject_revision == revision
     adapter = ResearchStageAdapter(
         findings_ready=coordinated_research._findings_ready,
         worktree_ready=coordinated_research._research_worktree_ready)

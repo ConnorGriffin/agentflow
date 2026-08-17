@@ -22,11 +22,16 @@ spend is genuinely unknown, not free.
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import asdict, dataclass, field, fields
 from datetime import date, datetime, time as datetime_time, timezone
 from pathlib import Path
 from uuid import uuid4
+
+from agentflow.codex_transcripts import (
+    codex_sessions_root, rollout_paths, session_identifier, what_did_session_spend,
+    where_did_session_run)
 
 # The usage sub-object keys each provider models. Everything else in a provider's usage
 # object is preserved verbatim under ``AttemptUsage.unrecognized`` so a new provider field is
@@ -226,52 +231,6 @@ def codex_usage(events) -> AttemptUsage:
         unrecognized=tuple(sorted(extra)))
 
 
-def _codex_sessions_root() -> Path:
-    """Where Codex rollout ``.jsonl`` files live (issue #516 slice 2). The root is fixed at the
-    user's own home directory with no override of any kind, so no untrusted path ever reaches
-    the ``rglob`` below."""
-    return Path.home() / ".codex" / "sessions"
-
-
-def _rollout_records(path: Path) -> list[dict]:
-    try:
-        lines = path.read_text(errors="replace").splitlines()
-    except OSError:
-        return []
-    records = []
-    for line in lines:
-        try:
-            record = json.loads(line)
-        except (ValueError, TypeError):
-            continue
-        if isinstance(record, dict):
-            records.append(record)
-    return records
-
-
-def _rollout_cwd(records: list[dict]) -> str | None:
-    for record in records:
-        if record.get("type") == "session_meta":
-            payload = record.get("payload")
-            if isinstance(payload, dict) and isinstance(payload.get("cwd"), str):
-                return payload["cwd"]
-    return None
-
-
-def _rollout_id(records: list[dict]) -> str | None:
-    """The durable Codex rollout identifier, if this rollout supplies one."""
-    for record in records:
-        if record.get("type") != "session_meta":
-            continue
-        payload = record.get("payload")
-        if not isinstance(payload, dict):
-            continue
-        for key in ("id", "session_id", "thread_id"):
-            if isinstance(payload.get(key), str):
-                return payload[key]
-    return None
-
-
 def _parent_thread_id(record) -> str | None:
     """Read this attempt's parent thread id from its own durable event stream."""
     from agentflow.coordinator.session import read_session
@@ -283,58 +242,35 @@ def _parent_thread_id(record) -> str | None:
     return None
 
 
-def _rollout_worker_usage(records: list[dict]) -> tuple[str, dict] | None:
-    """The last ``token_count`` event's cumulative totals and the model that ran, from one
-    Codex rollout. ``None`` when the rollout carries no token fact at all."""
-    last_totals: dict | None = None
-    model: str | None = None
-    session_meta_model: str | None = None
-    for record in records:
-        rtype = record.get("type")
-        payload = record.get("payload")
-        if rtype == "event_msg" and isinstance(payload, dict) and payload.get("type") == "token_count":
-            info = payload.get("info")
-            totals = info.get("total_token_usage") if isinstance(info, dict) else None
-            if isinstance(totals, dict):
-                last_totals = totals
-        elif rtype == "turn_context" and isinstance(payload, dict) \
-                and isinstance(payload.get("model"), str):
-            model = payload["model"]              # the latest one wins
-        elif rtype == "session_meta" and isinstance(payload, dict) \
-                and isinstance(payload.get("model"), str) and session_meta_model is None:
-            session_meta_model = payload["model"]
-    if last_totals is None:
-        return None
-    return (model or session_meta_model or "codex"), last_totals
-
-
 def lead_codex_worker_usage(record) -> tuple:
     """Codex worker spend a lead (Claude ``fable`` or Codex ``sol``) build/revise attempt delegated to
     ``codex exec --cd <worktree>``, observed from the workers' own rollout files rather than
     self-reported by the lead (frozen decision 2, issue #516 slice 2).
 
-    Every rollout under the sessions root whose ``session_meta.cwd`` realpath-matches the
-    record's workspace, and whose mtime is at/after the attempt's own ``started_at``, contributes
-    its last cumulative ``token_count`` totals, summed per attributed model (falling back to the
-    literal ``"codex"`` identity when no model fact is found). The floor is the attempt's own
-    admission time, not a backdated slack: a worker cannot start before the attempt that spawned
-    it, so a rollout last written before this attempt was admitted belongs to some earlier
-    attempt that reused the same workspace (a retry, or a prior build before a revise), never to
-    this one — a slack that reached backward past admission would double-book that earlier
-    attempt's spend onto this attempt too. A record with no ``started_at`` (falsy) applies no
-    mtime floor. Failure anywhere — an unreadable sessions root, a malformed rollout, a bad path —
-    degrades to no worker entries; this must never fail the caller's observation.
+    Every rollout whose recorded directory resolves to the record's workspace or a descendant of
+    it, and whose mtime is at/after the attempt's own ``started_at``, contributes its last
+    cumulative spend, summed per attributed model (falling back to the literal ``"codex"``
+    identity when no model fact is found). Both paths are realpath-resolved before containment is
+    decided, so symlinks and relative paths cannot escape the workspace or match a lexical prefix.
+    The floor is the attempt's own admission time, not a backdated slack: a worker cannot start
+    before the attempt that spawned it, so a rollout last written before this attempt was admitted
+    belongs to some earlier attempt that reused the same workspace (a retry, or a prior build
+    before a revise), never to this one — a slack that reached backward past admission would
+    double-book that earlier attempt's spend onto this attempt too. A record with no
+    ``started_at`` (falsy) applies no mtime floor. Failure anywhere — an unreadable sessions root,
+    a malformed rollout, a bad path — degrades to no worker entries; this must never fail the
+    caller's observation.
     """
     try:
         if record.stage not in {"build", "revise"} or record.model not in {"fable", "sol"} \
                 or not record.source:
             return ()
-        root = _codex_sessions_root()
+        root = codex_sessions_root()
         workspace = os.path.realpath(record.source)
         parent_thread = _parent_thread_id(record) if record.model == "sol" else None
         cutoff = record.started_at if record.started_at else None
         try:
-            paths = list(root.rglob("*.jsonl"))
+            paths = list(rollout_paths(root))
         except OSError:
             return ()
         totals_by_model: dict[str, dict[str, int]] = {}
@@ -344,30 +280,28 @@ def lead_codex_worker_usage(record) -> tuple:
                     continue
             except OSError:
                 continue
-            records = _rollout_records(path)
-            if parent_thread is not None and _rollout_id(records) == parent_thread:
+            if parent_thread is not None and session_identifier(path) == parent_thread:
                 continue
-            cwd = _rollout_cwd(records)
+            cwd = where_did_session_run(path)
             if cwd is None:
                 continue
             try:
-                if os.path.realpath(cwd) != workspace:
+                if os.path.commonpath((workspace, os.path.realpath(cwd))) != workspace:
                     continue
             except OSError:
                 continue
-            found = _rollout_worker_usage(records)
-            if found is None:
+            spend = what_did_session_spend(path)
+            if spend is None:
                 continue
-            model, usage = found
-            acc = totals_by_model.setdefault(model, {
+            acc = totals_by_model.setdefault(spend.model, {
                 "input_tokens": 0, "cached_input_tokens": 0,
                 "output_tokens": 0, "reasoning_output_tokens": 0})
-            gross_input = _int(usage.get("input_tokens")) or 0
-            cached = _int(usage.get("cached_input_tokens")) or 0
+            gross_input = spend.input_tokens or 0
+            cached = spend.cached_input_tokens or 0
             acc["input_tokens"] += max(0, gross_input - cached)   # net cached out, like codex_usage
             acc["cached_input_tokens"] += cached
-            acc["output_tokens"] += _int(usage.get("output_tokens")) or 0
-            acc["reasoning_output_tokens"] += _int(usage.get("reasoning_output_tokens")) or 0
+            acc["output_tokens"] += spend.output_tokens or 0
+            acc["reasoning_output_tokens"] += spend.reasoning_output_tokens or 0
         return tuple(
             ModelCost(model=name, cost_usd=None,
                       input_tokens=totals["input_tokens"] or None,
@@ -386,8 +320,10 @@ class AttemptTelemetry:
 
     It carries the stage identity and routing dials the attempt ran under, the terminal
     provider cause and whether the stage outcome was verified, the wall-clock span the
-    coordinator owns, and the normalized :class:`AttemptUsage`. Restart replays and retries
-    each run under their own launch token, so each is a separate entry.
+    coordinator owns, and the normalized :class:`AttemptUsage`. An entry interrupted by a
+    daemon restart is booked before its replacement run is admitted, so its unrecoverable lead
+    spend remains explicit. Restart replays and retries each run under their own launch token,
+    so each is a separate entry.
     """
 
     token: str                       # launch token — the per-attempt identity and idempotency key
@@ -410,7 +346,8 @@ class AttemptTelemetry:
     cause: str                       # terminal provider cause (none/capacity/permanent/…)
     classification: str              # coordinator label (recoverable/permanent/incomplete/unknown)
     started_at: int                  # epoch the attempt was admitted
-    finalized_at: int                # epoch the coordinator finalized the ended family
+    finalized_at: int                # epoch the coordinator finalized or booked the attempt
+    interrupted_by_restart: bool = False  # no terminal provider bill; the resumed run is separate
     verify_miss: str = ""            # the first failed verification conjunct ("check: detail")
                                      # when unverified and the verifier is typed, else ""
     usage: AttemptUsage = field(default_factory=AttemptUsage)
@@ -424,6 +361,14 @@ class AttemptTelemetry:
 
 
 _ENTRY_FIELDS = {f.name for f in fields(AttemptTelemetry)}
+
+
+@dataclass(frozen=True)
+class AttemptTelemetryRead:
+    """Valid attempt telemetry plus bounded health information for observational readers."""
+
+    entries: list[AttemptTelemetry]
+    skipped: int | None
 
 
 def telemetry_dir(store_path: Path | str) -> Path:
@@ -466,26 +411,77 @@ def read_attempts(store_path: Path | str) -> list[AttemptTelemetry]:
     """Every persisted attempt entry. An unreadable or malformed file is skipped, never
     fatal — a corrupt tail must not blind the whole projection."""
     entries: list[AttemptTelemetry] = []
-    directory = telemetry_dir(store_path)
     try:
-        names = sorted(p for p in directory.iterdir() if p.suffix == ".json")
+        names = sorted(p for p in telemetry_dir(store_path).iterdir() if p.suffix == ".json")
     except OSError:
         return entries
     for path in names:
-        try:
-            data = json.loads(path.read_text())
-        except (OSError, ValueError):
-            continue
-        if not isinstance(data, dict):
-            continue
-        usage_data = data.get("usage")
-        usage = _decode_usage(usage_data) if isinstance(usage_data, dict) else AttemptUsage()
-        fields_in = {k: v for k, v in data.items() if k in _ENTRY_FIELDS and k != "usage"}
-        try:
-            entries.append(AttemptTelemetry(usage=usage, **fields_in))
-        except TypeError:
-            continue  # an entry from an incompatible shape — skipped, not fatal
+        entry = _read_attempt(path, strict=False)
+        if entry is not None:
+            entries.append(entry)
     return entries
+
+
+def read_attempts_with_health(store_path: Path | str) -> AttemptTelemetryRead:
+    """Read valid attempts and report skipped files without exposing their contents."""
+    entries: list[AttemptTelemetry] = []
+    skipped = 0
+    directory = telemetry_dir(store_path)
+    try:
+        directory.stat()
+    except FileNotFoundError:
+        return AttemptTelemetryRead(entries, skipped)
+    except OSError:
+        return AttemptTelemetryRead(entries, None)
+    try:
+        names = sorted(p for p in directory.iterdir() if p.suffix == ".json")
+    except OSError:
+        return AttemptTelemetryRead(entries, None)
+    tokens: set[str] = set()
+    for path in names:
+        entry = _read_attempt(path, strict=True)
+        if entry is None or path.stem != entry.token or entry.token in tokens:
+            skipped += 1
+            continue
+        entries.append(entry)
+        tokens.add(entry.token)
+    return AttemptTelemetryRead(entries, skipped)
+
+
+def _read_attempt(path: Path, *, strict: bool) -> AttemptTelemetry | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    usage_data = data.get("usage")
+    if strict and "usage" in data and not isinstance(usage_data, dict):
+        return None
+    usage = _decode_usage(usage_data) if isinstance(usage_data, dict) else AttemptUsage()
+    fields_in = {k: v for k, v in data.items() if k in _ENTRY_FIELDS and k != "usage"}
+    try:
+        entry = AttemptTelemetry(usage=usage, **fields_in)
+    except TypeError:
+        return None
+    return entry if not strict or _learning_safe(entry) else None
+
+
+def _learning_safe(entry: AttemptTelemetry) -> bool:
+    if (type(entry.token) is not str or not entry.token or type(entry.identity) is not str
+            or type(entry.started_at) is not int or type(entry.finalized_at) is not int
+            or type(entry.interrupted_by_restart) is not bool
+            or entry.started_at < 0 or entry.finalized_at < 0
+            or (entry.started_at and entry.finalized_at
+                and entry.finalized_at < entry.started_at)):
+        return False
+    for name in _TOKEN_FIELDS:
+        value = getattr(entry.usage, name)
+        if value is not None and (type(value) is not int or value < 0):
+            return False
+    cost = entry.usage.cost_usd
+    return cost is None or (type(cost) in {int, float}
+                            and (type(cost) is int or math.isfinite(cost)))
 
 
 def _decode_usage(data: dict) -> AttemptUsage:
@@ -510,18 +506,25 @@ def _decode_usage(data: dict) -> AttemptUsage:
 
 @dataclass(frozen=True)
 class TelemetryTotals:
-    """Summed spend and explicit missing-data counts for one cell (or the fleet)."""
+    """Summed spend and explicit missing-data counts for one cell (or the fleet).
+
+    ``cost_usd`` is provider-billed only; ``estimated_cost_usd`` is separately priced from the
+    routing rate card. Attributed worker estimates can contribute dollars without contributing
+    attempt-level tokens, which remain diagnostic facts of the parent attempt.
+    """
 
     attempts: int = 0
     verified: int = 0
     missing_usage: int = 0            # attempts the provider reported no usage for
-    cost_missing: int = 0             # attempts with no provider dollar cost (all Codex, some Claude)
+    cost_missing: int = 0             # attempts with no billed or estimable dollar fact
     input_tokens: int = 0
     cached_input_tokens: int = 0
     cache_creation_tokens: int = 0
     output_tokens: int = 0
     reasoning_output_tokens: int = 0
-    cost_usd: float = 0.0
+    cost_usd: float = 0.0             # provider-billed dollars only
+    estimated_cost_usd: float = 0.0
+    delegate_uncaptured_attempts: int = 0
 
 
 @dataclass(frozen=True)
@@ -555,8 +558,9 @@ class ModelSpendRow:
     routing rate card rather than provider-billed — a total mixing billed and estimated
     dollars is itself estimated (issue #516). ``delegate_uncaptured_attempts`` counts, among
     the attempts aggregated into this row, how many are lead-run build/revise attempts whose
-    delegated Codex worker spend has not been captured into their usage — the row is real but
-    known-incomplete, so an aggregate reading it never silently treats it as fully measured.
+    spend is not fully counted: either no delegated Codex worker usage was captured, or a daemon
+    restart made the lead's own spend unrecoverable. The row is real but known-incomplete, so an
+    aggregate reading it never silently treats it as fully measured.
     """
 
     stage: str
@@ -566,6 +570,8 @@ class ModelSpendRow:
     cost_usd: float | None
     estimated: bool = False
     delegate_uncaptured_attempts: int = 0
+    unpriced_cached_input_tokens: int = 0
+    dollar_covered_attempts: int = 0
 
 
 @dataclass(frozen=True)
@@ -580,8 +586,8 @@ def format_spend_report(report: SpendReport) -> str:
 
     An estimated dollar figure renders flagged (``~1.234567 est``) rather than indistinguishably
     from a provider-billed one; a row with no dollar fact at all renders ``—``, never
-    ``0.000000`` — unknown is never zero. A row aggregating lead-run attempts whose delegate
-    spend was not captured carries a trailing note so the gap is visible, not silent.
+    ``0.000000`` — unknown is never zero. A row aggregating lead-run attempts whose spend is not
+    fully counted carries a trailing note so the gap is visible, not silent.
     """
     lines = ["stage\tmodel\tattempts\ttokens\tdollars\tnote"]
     for row in report.rows:
@@ -592,8 +598,14 @@ def format_spend_report(report: SpendReport) -> str:
             dollars = f"~{row.cost_usd:.6f} est"
         else:
             dollars = f"{row.cost_usd:.6f}"
-        note = (f"delegate spend not counted ({row.delegate_uncaptured_attempts})"
-               if row.delegate_uncaptured_attempts else "")
+        notes = []
+        if row.delegate_uncaptured_attempts:
+            notes.append(f"spend not fully counted ({row.delegate_uncaptured_attempts})")
+        if row.unpriced_cached_input_tokens:
+            notes.append(f"cached input not priced ({row.unpriced_cached_input_tokens} tokens)")
+        if 0 < row.dollar_covered_attempts < row.attempts:
+            notes.append(f"dollar total covers {row.dollar_covered_attempts} of {row.attempts} attempts")
+        note = "; ".join(notes)
         lines.append(f"{row.stage}\t{row.model}\t{row.attempts}\t{tokens}\t{dollars}\t{note}")
     return "\n".join(lines)
 
@@ -649,7 +661,7 @@ def _codex_priced(model: str) -> bool:
 
 
 def _delegate_spend_uncaptured(entry: AttemptTelemetry) -> bool:
-    """Whether a Fable or Sol lead has no attributed delegated-helper usage.
+    """Whether a Fable or Sol lead has spend the report cannot fully count.
 
     A Fable parent needs a reported Codex child. A Sol parent accepts any routing-known helper
     model other than its own internal or CLI identity: Terra, Luna, generic Codex, and Claude
@@ -657,6 +669,8 @@ def _delegate_spend_uncaptured(entry: AttemptTelemetry) -> bool:
     """
     if entry.stage not in _LEAD_LED_STAGES or entry.model not in {"fable", "sol"}:
         return False
+    if entry.interrupted_by_restart:
+        return True
     from agentflow.routing import routing
     parent = routing.provider_for(entry.model)
     def delegated_helper(cost: ModelCost) -> bool:
@@ -670,17 +684,28 @@ def _delegate_spend_uncaptured(entry: AttemptTelemetry) -> bool:
     return not any(delegated_helper(cost) for cost in entry.usage.model_costs)
 
 
-def _priced_dollars(model: str, tokens_in, tokens_out, tokens_reasoning, billed):
+@dataclass(frozen=True)
+class PricedDollars:
+    """One attempt's known dollar fact, including the known cached-input omission."""
+
+    cost_usd: float | None
+    estimated: bool
+    unpriced_cached_input_tokens: int = 0
+
+
+def _priced_dollars(model: str, tokens_in, tokens_out, tokens_reasoning, billed,
+                    cached_input_tokens=None) -> PricedDollars:
     """The dollar figure and whether it is provider-billed, estimated from the rate card, or
     unknown. Billed always wins; an estimate is only produced when a real token fact exists and
     the model prices from the routing table's rate card — never a guess past that."""
     if billed is not None:
-        return billed, False
+        return PricedDollars(billed, False)
     from agentflow.routing import routing
     estimate = routing.estimate_cost_usd(
         model, input_tokens=tokens_in, output_tokens=tokens_out,
         reasoning_output_tokens=tokens_reasoning)
-    return (estimate, True) if estimate is not None else (None, False)
+    return (PricedDollars(estimate, True, cached_input_tokens or 0)
+            if estimate is not None else PricedDollars(None, False))
 
 
 def spend_report(store_path: Path | str, *, start: int | float | date | datetime,
@@ -699,7 +724,8 @@ def spend_report(store_path: Path | str, *, start: int | float | date | datetime
     start_epoch, end_epoch = _window_epoch(start), _window_epoch(end)
     if end_epoch <= start_epoch:
         raise ValueError("spend report end must be after start")
-    # value = [attempts, tokens, token_seen, dollars, dollar_seen, estimated_seen, uncounted]
+    # value = [attempts, tokens, token_seen, dollars, dollar_seen, estimated_seen, uncounted,
+    #          unpriced_cached_input_tokens, dollar_covered_attempts]
     cells: dict[tuple[str, str], list[int | float | bool]] = {}
     for entry in read_attempts(store_path):
         if not start_epoch <= entry.started_at < end_epoch:
@@ -710,24 +736,29 @@ def spend_report(store_path: Path | str, *, start: int | float | date | datetime
             rows = tuple(
                 (cost.model, cost.tokens,
                  _priced_dollars(cost.model, cost.input_tokens, cost.output_tokens,
-                                 cost.reasoning_output_tokens, cost.cost_usd))
+                                 cost.reasoning_output_tokens, cost.cost_usd,
+                                 cost.cached_input_tokens))
                 for cost in attributed)
         else:
             model = entry.usage.model or entry.model
             rows = ((model, _usage_token_total(entry.usage),
                      _priced_dollars(model, entry.usage.input_tokens, entry.usage.output_tokens,
-                                     entry.usage.reasoning_output_tokens, entry.usage.cost_usd)),)
-        for model, tokens, (dollars, estimated) in rows:
-            cell = cells.setdefault((entry.stage, model), [0, 0, False, 0.0, False, False, 0])
+                                     entry.usage.reasoning_output_tokens, entry.usage.cost_usd,
+                                     entry.usage.cached_input_tokens)),)
+        for model, tokens, priced in rows:
+            cell = cells.setdefault(
+                (entry.stage, model), [0, 0, False, 0.0, False, False, 0, 0, 0])
             cell[0] += 1
             if tokens is not None:
                 cell[1] += tokens
                 cell[2] = True
-            if dollars is not None:
-                cell[3] += dollars
+            if priced.cost_usd is not None:
+                cell[3] += priced.cost_usd
                 cell[4] = True
-                if estimated:
+                cell[8] += 1
+                if priced.estimated:
                     cell[5] = True
+                    cell[7] += priced.unpriced_cached_input_tokens
             if uncounted:
                 cell[6] += 1
     return SpendReport(
@@ -738,7 +769,9 @@ def spend_report(store_path: Path | str, *, start: int | float | date | datetime
                           int(values[1]) if values[2] else None,
                           float(values[3]) if values[4] else None,
                           estimated=bool(values[5]),
-                          delegate_uncaptured_attempts=int(values[6]))
+                          delegate_uncaptured_attempts=int(values[6]),
+                          unpriced_cached_input_tokens=int(values[7]),
+                          dollar_covered_attempts=int(values[8]))
             for (stage, model), values in sorted(cells.items())
         ),
     )
@@ -761,10 +794,34 @@ def _accumulate(acc: list, entry: AttemptTelemetry) -> None:
     usage = entry.usage
     if not usage.present:
         acc[idx("missing_usage")] += 1
-    if usage.cost_usd is None:
-        acc[idx("cost_missing")] += 1
+    priced_any = False
+    if usage.model_costs:
+        if usage.cost_usd is not None:
+            acc[idx("cost_usd")] += usage.cost_usd
+            priced_any = True
+        for cost in usage.model_costs:
+            priced = _priced_dollars(
+                cost.model, cost.input_tokens, cost.output_tokens,
+                cost.reasoning_output_tokens, cost.cost_usd, cost.cached_input_tokens)
+            if priced.cost_usd is None:
+                continue
+            if priced.estimated:
+                acc[idx("estimated_cost_usd")] += priced.cost_usd
+                priced_any = True
+            elif usage.cost_usd is None:
+                acc[idx("cost_usd")] += priced.cost_usd
+                priced_any = True
     else:
-        acc[idx("cost_usd")] += usage.cost_usd
+        priced = _priced_dollars(
+            usage.model or entry.model, usage.input_tokens, usage.output_tokens,
+            usage.reasoning_output_tokens, usage.cost_usd, usage.cached_input_tokens)
+        if priced.cost_usd is not None:
+            acc[idx("estimated_cost_usd") if priced.estimated else idx("cost_usd")] += priced.cost_usd
+            priced_any = True
+    if not priced_any:
+        acc[idx("cost_missing")] += 1
+    if _delegate_spend_uncaptured(entry):
+        acc[idx("delegate_uncaptured_attempts")] += 1
     for name in _TOKEN_FIELDS:
         value = getattr(usage, name)
         if value is not None:

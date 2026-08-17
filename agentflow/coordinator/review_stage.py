@@ -78,13 +78,16 @@ class ReviewStageAdapter(StageAdapter):
     required_outcome = "a recorded review verdict for the exact reviewed head SHA"
 
     def __init__(self, *, verdict_ready, worktree_reset=None, observer=None, handoff=None,
-                 settle=None, prepare_settle=None, verdict_error=None) -> None:
+                 settle=None, prepare_settle=None, verdict_error=None, evidence=None,
+                 capture_state=None) -> None:
         super().__init__(
             outcome_ready=verdict_ready, observer=observer, handoff=handoff,
             worktree_ready=worktree_reset or (lambda record: bool(record.source and record.target)))
         self._verdict_error = verdict_error or _contract_error
         self._settle = settle
         self._prepare_settle = prepare_settle
+        self._evidence = evidence
+        self._capture_state = capture_state
 
     def capture(self, record, obs) -> str | None:
         """Persist the exact verdict that completed Review.
@@ -93,7 +96,15 @@ class ReviewStageAdapter(StageAdapter):
         consume this durable copy instead of reinterpreting a session that may have disappeared.
         """
         payload = (getattr(obs, "final_message", "") or "").strip()
-        return payload if payload and self.verify(record, obs) else None
+        if not payload or not self.verify(record, obs):
+            return None
+        if self._capture_state is not None and not self._capture_state(record, payload):
+            return None
+        return payload
+
+    def project_outcome(self, record, obs) -> None:
+        if self._evidence is not None:
+            self._evidence(record, obs)
 
     def verify(self, record, obs):
         """Reject a review that used the retired GitHub follow-up creation action."""

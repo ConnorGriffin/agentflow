@@ -17,10 +17,12 @@ no provider and clears no claim (ADR 0028's "unreadable store fails closed").
 from __future__ import annotations
 
 import json
+from hashlib import sha256
 import os
 import re
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
@@ -39,16 +41,21 @@ from agentflow.operational_safety import (
     SafetyRefused,
     decode_admitted_launch,
     materialize_route_cell,
+    rollback_never_started_admission_history,
     _SafetyIdentityMismatch,
     _SafetyMissing,
     _AdmissionContext,
     _SafetyAdmissionResult,
+    _SAFETY_ADMISSION_HISTORY_FINGERPRINT,
+    _digest,
 )
 
 if TYPE_CHECKING:
     from agentflow.canary_attribution import CanaryAttribution, PromotionReceiptAuthority
+    from agentflow.capability_contracts import CapabilityReadyFact
+    from agentflow.effective_policy import NotApplicableBriefing, ReadyBriefing
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 _RECORDS_SCHEMA = (
     "CREATE TABLE records ("
     " identity TEXT PRIMARY KEY,"
@@ -57,9 +64,117 @@ _RECORDS_SCHEMA = (
     " demand INTEGER NOT NULL,"
     " data TEXT NOT NULL)"
 )
+_ADMISSION_RECEIPTS_SCHEMA = (
+    "CREATE TABLE admission_receipts ("
+    " stage_identity TEXT PRIMARY KEY,"
+    " subject_revision TEXT NOT NULL,"
+    " briefing_id TEXT,"
+    " briefing_digest TEXT,"
+    " capability_id TEXT NOT NULL,"
+    " capability_digest TEXT NOT NULL,"
+    " route_id TEXT NOT NULL,"
+    " route_cell_digest TEXT NOT NULL,"
+    " launch_config_digest TEXT NOT NULL,"
+    " safety_state_id TEXT NOT NULL,"
+    " receipt_digest TEXT NOT NULL)"
+)
+_ADMISSION_RECEIPTS_NO_UPDATE = (
+    "CREATE TRIGGER admission_receipts_no_update BEFORE UPDATE ON admission_receipts "
+    "BEGIN SELECT RAISE(ABORT, 'admission_receipts is append-only'); END"
+)
+_ADMISSION_RECEIPTS_NO_DELETE = (
+    "CREATE TRIGGER admission_receipts_no_delete BEFORE DELETE ON admission_receipts "
+    "BEGIN SELECT RAISE(ABORT, 'admission_receipts is append-only'); END"
+)
+_ADMISSION_RECEIPTS_FINGERPRINT = (
+    ("table", "admission_receipts", "admission_receipts",
+     "createtableadmission_receipts(stage_identitytextprimarykey,subject_revisiontextnotnull,"
+     "briefing_idtext,briefing_digesttext,capability_idtextnotnull,capability_digesttextnotnull,"
+     "route_idtextnotnull,route_cell_digesttextnotnull,launch_config_digesttextnotnull,"
+     "safety_state_idtextnotnull,receipt_digesttextnotnull)"),
+    ("trigger", "admission_receipts_no_delete", "admission_receipts",
+     "createtriggeradmission_receipts_no_deletebeforedeleteonadmission_receiptsbeginselectraise("
+     "abort,'admission_receiptsisappend-only');end"),
+    ("trigger", "admission_receipts_no_update", "admission_receipts",
+     "createtriggeradmission_receipts_no_updatebeforeupdateonadmission_receiptsbeginselectraise("
+     "abort,'admission_receiptsisappend-only');end"),
+)
+_LESSON_USE_ATTRIBUTIONS_SCHEMA = (
+    "CREATE TABLE lesson_use_attributions ("
+    "stage_identity TEXT PRIMARY KEY,repository TEXT NOT NULL,stage TEXT NOT NULL,"
+    "subject_revision TEXT NOT NULL,briefing_id TEXT NOT NULL,briefing_digest TEXT NOT NULL,"
+    "promotion_receipt_id TEXT NOT NULL,method_revision TEXT NOT NULL,attribution_digest TEXT NOT NULL)"
+)
+_LESSON_USE_ATTRIBUTIONS_NO_UPDATE = (
+    "CREATE TRIGGER lesson_use_attributions_no_update BEFORE UPDATE ON lesson_use_attributions "
+    "BEGIN SELECT RAISE(ABORT, 'lesson_use_attributions is append-only'); END"
+)
+_LESSON_USE_ATTRIBUTIONS_NO_DELETE = (
+    "CREATE TRIGGER lesson_use_attributions_no_delete BEFORE DELETE ON lesson_use_attributions "
+    "BEGIN SELECT RAISE(ABORT, 'lesson_use_attributions is append-only'); END"
+)
+_LESSON_USE_ATTRIBUTIONS_FINGERPRINT = (
+    ("table", "lesson_use_attributions", "lesson_use_attributions",
+     "createtablelesson_use_attributions(stage_identitytextprimarykey,repositorytextnotnull,stagetextnotnull,"
+     "subject_revisiontextnotnull,briefing_idtextnotnull,briefing_digesttextnotnull,promotion_receipt_idtextnotnull,"
+     "method_revisiontextnotnull,attribution_digesttextnotnull)"),
+    ("trigger", "lesson_use_attributions_no_delete", "lesson_use_attributions",
+     "createtriggerlesson_use_attributions_no_deletebeforedeleteonlesson_use_attributionsbeginselectraise("
+     "abort,'lesson_use_attributionsisappend-only');end"),
+    ("trigger", "lesson_use_attributions_no_update", "lesson_use_attributions",
+     "createtriggerlesson_use_attributions_no_updatebeforeupdateonlesson_use_attributionsbeginselectraise("
+     "abort,'lesson_use_attributionsisappend-only');end"),
+)
+
+
+def _rollback_never_started_store_admission_facts(
+        conn: sqlite3.Connection, stage_identity: str,
+) -> None:
+    """Remove Store-owned reservation facts after the provider launch never started.
+
+    The caller owns the transaction that also removes the record. SQLite has no statement-scoped
+    bypass for these unconditional delete triggers, so Store suspends and restores only its own
+    triggers inside that transaction. Transactional DDL restores them with the rows on rollback.
+    """
+    if not conn.in_transaction:
+        raise sqlite3.OperationalError(
+            "never-started Store admission rollback requires an active transaction")
+    conn.execute("DROP TRIGGER admission_receipts_no_delete")
+    conn.execute("DROP TRIGGER lesson_use_attributions_no_delete")
+    conn.execute(
+        "DELETE FROM admission_receipts WHERE stage_identity = ?", (stage_identity,))
+    conn.execute(
+        "DELETE FROM lesson_use_attributions WHERE stage_identity = ?", (stage_identity,))
+    conn.execute(_ADMISSION_RECEIPTS_NO_DELETE)
+    conn.execute(_LESSON_USE_ATTRIBUTIONS_NO_DELETE)
+
+
+def _store_v4_fingerprint():
+    from agentflow.canary_attribution import STORE_V3_SCHEMA_FINGERPRINT
+    return tuple(sorted(
+        STORE_V3_SCHEMA_FINGERPRINT
+        + _ADMISSION_RECEIPTS_FINGERPRINT
+        + _SAFETY_ADMISSION_HISTORY_FINGERPRINT))
+
+
+STORE_V4_SCHEMA_FINGERPRINT = _store_v4_fingerprint()
+STORE_V4_SCHEMA_FINGERPRINT_DIGEST = sha256(json.dumps(
+    STORE_V4_SCHEMA_FINGERPRINT, sort_keys=True, separators=(",", ":"),
+    ensure_ascii=True, allow_nan=False).encode()).hexdigest()
+STORE_V5_SCHEMA_FINGERPRINT = tuple(sorted(
+    STORE_V4_SCHEMA_FINGERPRINT + _LESSON_USE_ATTRIBUTIONS_FINGERPRINT))
+STORE_V5_SCHEMA_FINGERPRINT_DIGEST = (
+    "7103be329c503a9f263ba6e3d4cec882913892b82e2dd0de744b0579f3351dd1")
+if sha256(json.dumps(STORE_V5_SCHEMA_FINGERPRINT, sort_keys=True, separators=(",", ":"),
+                     ensure_ascii=True, allow_nan=False).encode()).hexdigest() != \
+        STORE_V5_SCHEMA_FINGERPRINT_DIGEST:
+    raise RuntimeError("coordinator Store schema fingerprint changed")
 # Bounded wait for a busy database. Beyond this we fail closed rather than block a whole
 # daemon cycle on a lock we cannot prove will clear.
 _BUSY_TIMEOUT_MS = int(os.environ.get("AGENTFLOW_COORD_BUSY_MS", "2000"))
+_LOWER_DIGEST = re.compile(r"^[a-f0-9]{64}$")
+_SUBJECT_REVISION = re.compile(r"^[a-f0-9]{40}$")
+_ROUTE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
 
 _SET_FIELDS = {"descendants"}
 _COLUMNS = [f.name for f in fields(Record)]
@@ -78,6 +193,30 @@ V2_TO_V3_FAULT_OBSERVATIONS = (
     "v2-to-v3:after-user-version",
     "v2-to-v3:before-commit",
     "v2-to-v3:after-commit",
+)
+V4_TO_V5_FAULT_OBSERVATIONS = (
+    "v4-to-v5:after-begin",
+    "v4-to-v5:after-table",
+    "v4-to-v5:after-triggers",
+    "v4-to-v5:after-fingerprint",
+    "v4-to-v5:after-user-version",
+    "v4-to-v5:before-commit",
+    "v4-to-v5:after-commit",
+)
+V4_ADMISSION_PRECOMMIT_CUTPOINTS = (
+    "after-begin",
+    "after-waiting-cas",
+    "after-identity-validation",
+    "after-route-validation",
+    "after-capacity",
+    "after-safety",
+    "after-attribution-before-successor",
+    "after-receipt-before-successor",
+    "after-successor-before-commit",
+)
+V3_TO_V4_FAULT_OBSERVATIONS = (
+    "v3-to-v4:after-begin",
+    "v3-to-v4:after-commit",
 )
 
 
@@ -107,6 +246,33 @@ class RouteAdmissionRefused(RuntimeError):
     def __init__(self, code: RouteAdmissionCode) -> None:
         if type(code) is not str or code not in ROUTE_ADMISSION_REFUSAL_CODES:
             raise TypeError("unknown route admission refusal code")
+        self.code = code
+        super().__init__(code)
+
+
+ADMISSION_REFUSAL_CODES = frozenset({
+    "admission_identity_migration_required",
+    "briefing_mismatch",
+    "capability_mismatch",
+    "safety_refused",
+    "route_cell:missing", "route_cell:stale", "route_cell:mismatched",
+    "route_cell:unreadable", "route_cell:quarantined",
+    "capability_environment_failure:missing",
+    "capability_environment_failure:drifted",
+    "capability_environment_failure:incompatible",
+    "briefing_overflow", "incompatible_policy", "invalid_briefing", "invalid_overlay",
+    "invalid_overlay_authority", "invalid_receipt", "missing_policy", "missing_receipt",
+})
+
+
+class AdmissionRefused(RuntimeError):
+    """One content-free refusal vocabulary crossing Store's admission boundary."""
+
+    __slots__ = ("code",)
+
+    def __init__(self, code: str) -> None:
+        if type(code) is not str or code not in ADMISSION_REFUSAL_CODES:
+            raise TypeError("unknown admission refusal code")
         self.code = code
         super().__init__(code)
 
@@ -142,14 +308,69 @@ class ReservationIntent:
     daemon_generation: str
     budget: int
     limits: ReservationLimits | None
+    briefing: "ReadyBriefing | NotApplicableBriefing | None"
+    capability: "CapabilityReadyFact"
+    route_cell_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class LegacyReservationIntent:
+    """Compatibility-only reservation input outside composed production admission."""
+
+    identity: str
+    expected_launch_token: str | None
+    expected_revision: int
+    now: int
+    daemon_generation: str
+    budget: int
+    limits: ReservationLimits | None
     route_cell_digest: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class AdmissionReceipt:
+    """The immutable authority tuple committed with one logical-stage admission."""
+
+    subject_revision: str
+    briefing_id: str | None
+    briefing_digest: str | None
+    capability_id: str
+    capability_digest: str
+    route_id: str
+    route_cell_digest: str
+    launch_config_digest: str
+    safety_state_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class LessonUseAttribution:
+    """Immutable pre-launch use of one promoted advisory receipt."""
+
+    stage_identity: str
+    repository: str
+    stage: str
+    subject_revision: str
+    briefing_id: str
+    briefing_digest: str
+    promotion_receipt_id: str
+    method_revision: str
+    attribution_digest: str
 
 
 @dataclass(frozen=True, slots=True)
 class AdmissionResult:
     successor: Record
-    safety_state_id: str | None
+    admission_receipt: AdmissionReceipt
+    safety_state_id: str
     canary_attribution: CanaryAttribution | None
+
+
+@dataclass(frozen=True, slots=True)
+class LegacyReservationResult:
+    """Compatibility result for stores that do not own the composed v4 contract."""
+
+    successor: Record
+    safety_state_id: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,7 +414,7 @@ class Store:
         # connection is shared across threads and serialized by this lock — the reservation
         # critical section is one place, matching the one-ledger design (ADR 0030).
         self._lock = threading.RLock()
-        self._promotion_receipt_callback_active = threading.Event()
+        self._admission_callback_active = threading.Event()
         self._conn = self._connect()
         self._operational_safety: OperationalSafety | None = None
         self._canary_attribution = None
@@ -217,6 +438,70 @@ class Store:
         except BaseException:
             self._conn.close()
             raise
+
+    @staticmethod
+    def load_records_read_only(path: Path | str) -> dict[str, Record]:
+        """Load current records without creating, migrating, or modifying a Store."""
+        store_path = Path(path)
+        try:
+            conn = sqlite3.connect(
+                f"{store_path.resolve().as_uri()}?mode=ro", uri=True,
+                timeout=_BUSY_TIMEOUT_MS / 1000, isolation_level=None)
+            try:
+                version = conn.execute("PRAGMA user_version").fetchone()[0]
+                if version != SCHEMA_VERSION:
+                    raise StoreUnavailable(f"store schema {version} is not readable")
+                if _schema_fingerprint(conn) != _expected_schema_fingerprint(SCHEMA_VERSION):
+                    raise StoreUnavailable("store schema does not match the accepted schema")
+                rows = conn.execute("SELECT data FROM records").fetchall()
+                records = {}
+                for row in rows:
+                    try:
+                        record = Store._decode(row[0])
+                        if (any(type(getattr(record, field)) is not str for field in (
+                                "identity", "repo", "subject", "stage", "state",
+                                "subject_revision"))
+                                or type(record.round) is not int):
+                            raise ValueError("record fields are unreadable")
+                    except (AttributeError, TypeError, ValueError) as exc:
+                        raise StoreUnavailable("continuation record is unreadable") from exc
+                    records[record.identity] = record
+                return records
+            finally:
+                conn.close()
+        except StoreUnavailable:
+            raise
+        except (OSError, sqlite3.DatabaseError) as exc:
+            raise StoreUnavailable(f"cannot open continuation store: {exc}") from exc
+
+    @staticmethod
+    def load_lesson_use_attributions_read_only(path: Path | str) -> dict[str, LessonUseAttribution]:
+        """Read immutable advisory-use facts without opening the mutable coordinator owner."""
+        store_path = Path(path)
+        try:
+            conn = sqlite3.connect(f"{store_path.resolve().as_uri()}?mode=ro", uri=True)
+            try:
+                if (conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION
+                        or _schema_fingerprint(conn) != _expected_schema_fingerprint(SCHEMA_VERSION)):
+                    raise StoreUnavailable("store schema does not match the accepted schema")
+                rows = conn.execute(
+                    "SELECT r.data, a.stage_identity, a.repository, a.stage, a.subject_revision, "
+                    "a.briefing_id, a.briefing_digest, a.promotion_receipt_id, "
+                    "a.method_revision, a.attribution_digest FROM lesson_use_attributions AS a "
+                    "LEFT JOIN records AS r ON r.identity=a.stage_identity").fetchall()
+                values = {}
+                for row in rows:
+                    record = Store._decode(row[0])
+                    attribution = LessonUseAttribution(*row[1:])
+                    Store._validate_lesson_use(attribution, record)
+                    values[attribution.stage_identity] = attribution
+                return values
+            finally:
+                conn.close()
+        except StoreUnavailable:
+            raise
+        except (OSError, sqlite3.DatabaseError, TypeError, ValueError) as exc:
+            raise StoreUnavailable("lesson use attribution is unreadable") from exc
 
     def _connect(self) -> sqlite3.Connection:
         # A fully-initialized store is published atomically: it is built in a private temp
@@ -246,12 +531,24 @@ class Store:
                     raise StoreUnavailable("store schema 2 does not match the migration source")
                 self._migrate_v2_to_v3(conn)
                 version = 3
+            if version == 3:
+                if _schema_fingerprint(conn) != _expected_schema_fingerprint(3):
+                    conn.close()
+                    raise StoreUnavailable("store schema 3 does not match the migration source")
+                self._migrate_v3_to_v4(conn)
+                version = 4
+            if version == 4:
+                if _schema_fingerprint(conn) != _expected_schema_fingerprint(4):
+                    conn.close()
+                    raise StoreUnavailable("store schema 4 does not match the migration source")
+                self._migrate_v4_to_v5(conn)
+                version = 5
             if version != SCHEMA_VERSION:
                 conn.close()
                 raise StoreUnavailable(f"store schema {version} is not readable")
-            if _schema_fingerprint(conn) != _expected_schema_fingerprint(3):
+            if _schema_fingerprint(conn) != _expected_schema_fingerprint(SCHEMA_VERSION):
                 conn.close()
-                raise StoreUnavailable("store schema 3 does not match the accepted schema")
+                raise StoreUnavailable("store schema does not match the accepted schema")
         except sqlite3.DatabaseError as e:  # corrupt file, locked-beyond-wait, unreadable
             raise StoreUnavailable(f"cannot open continuation store: {e}") from e
         return conn
@@ -311,7 +608,14 @@ class Store:
             OperationalSafety.initialize_schema(conn)
             from agentflow.canary_attribution import initialize_schema
             initialize_schema(conn)
-            if _schema_fingerprint(conn) != _expected_schema_fingerprint(3):
+            OperationalSafety._initialize_admission_history_schema(conn)
+            conn.execute(_ADMISSION_RECEIPTS_SCHEMA)
+            conn.execute(_ADMISSION_RECEIPTS_NO_UPDATE)
+            conn.execute(_ADMISSION_RECEIPTS_NO_DELETE)
+            conn.execute(_LESSON_USE_ATTRIBUTIONS_SCHEMA)
+            conn.execute(_LESSON_USE_ATTRIBUTIONS_NO_UPDATE)
+            conn.execute(_LESSON_USE_ATTRIBUTIONS_NO_DELETE)
+            if _schema_fingerprint(conn) != _expected_schema_fingerprint(5):
                 raise sqlite3.DatabaseError("initialized coordinator schema was not accepted")
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             conn.execute("COMMIT")
@@ -340,7 +644,7 @@ class Store:
 
     @staticmethod
     def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
-        """Add append-only CanaryAttribution state without rewriting existing owners."""
+        """Add normally append-only CanaryAttribution state without rewriting existing owners."""
         committed = False
         try:
             Store._migration_checkpoint("v2-to-v3:before-begin")
@@ -358,6 +662,54 @@ class Store:
             conn.execute("COMMIT")
             committed = True
             Store._migration_checkpoint("v2-to-v3:after-commit")
+        except BaseException:
+            if not committed and conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+
+    @staticmethod
+    def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
+        """Add the two insert-only admission facts without rewriting historical Records."""
+        committed = False
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            Store._migration_checkpoint("v3-to-v4:after-begin")
+            OperationalSafety._initialize_admission_history_schema(conn)
+            conn.execute(_ADMISSION_RECEIPTS_SCHEMA)
+            conn.execute(_ADMISSION_RECEIPTS_NO_UPDATE)
+            conn.execute(_ADMISSION_RECEIPTS_NO_DELETE)
+            if _schema_fingerprint(conn) != _expected_schema_fingerprint(4):
+                raise sqlite3.DatabaseError("migrated coordinator schema was not accepted")
+            conn.execute("PRAGMA user_version = 4")
+            conn.execute("COMMIT")
+            committed = True
+            Store._migration_checkpoint("v3-to-v4:after-commit")
+        except BaseException:
+            if not committed and conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+
+    @staticmethod
+    def _migrate_v4_to_v5(conn: sqlite3.Connection) -> None:
+        """Add immutable promoted-briefing use facts without rewriting admissions."""
+        committed = False
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            Store._migration_checkpoint("v4-to-v5:after-begin")
+            conn.execute(_LESSON_USE_ATTRIBUTIONS_SCHEMA)
+            Store._migration_checkpoint("v4-to-v5:after-table")
+            conn.execute(_LESSON_USE_ATTRIBUTIONS_NO_UPDATE)
+            conn.execute(_LESSON_USE_ATTRIBUTIONS_NO_DELETE)
+            Store._migration_checkpoint("v4-to-v5:after-triggers")
+            if _schema_fingerprint(conn) != _expected_schema_fingerprint(5):
+                raise sqlite3.DatabaseError("migrated coordinator schema was not accepted")
+            Store._migration_checkpoint("v4-to-v5:after-fingerprint")
+            conn.execute("PRAGMA user_version = 5")
+            Store._migration_checkpoint("v4-to-v5:after-user-version")
+            Store._migration_checkpoint("v4-to-v5:before-commit")
+            conn.execute("COMMIT")
+            committed = True
+            Store._migration_checkpoint("v4-to-v5:after-commit")
         except BaseException:
             if not committed and conn.in_transaction:
                 conn.execute("ROLLBACK")
@@ -396,20 +748,29 @@ class Store:
         waiting = {pool: pr_bound_waiting(records, pool, now) for pool in permits}
         return permits, waiting
 
-    def _refuse_promotion_receipt_callback_mutation(self) -> None:
-        if self._promotion_receipt_callback_active.is_set():
+    @property
+    def composed_admission(self) -> bool:
+        """Whether this Store owns the exact production admission composition."""
+        return self._canary_attribution is not None
+
+    def _refuse_admission_callback_mutation(self) -> None:
+        if self._admission_callback_active.is_set():
             raise StoreUnavailable("reentrant Store mutation during admission")
 
     @contextmanager
-    def _promotion_receipt_callback(self):
-        """Mark only the untrusted receipt-reader call as non-reentrant."""
-        if self._promotion_receipt_callback_active.is_set():
-            raise StoreUnavailable("promotion receipt callback is already active")
-        self._promotion_receipt_callback_active.set()
+    def _admission_callback(self):
+        """Mark one in-transaction authority callback as non-reentrant."""
+        if self._admission_callback_active.is_set():
+            raise StoreUnavailable("admission callback is already active")
+        self._admission_callback_active.set()
         try:
             yield
         finally:
-            self._promotion_receipt_callback_active.clear()
+            self._admission_callback_active.clear()
+
+    def _call_admission_callback(self, callback, *args):
+        with self._admission_callback():
+            return callback(*args)
 
     def upsert(self, record: Record, *, retire_descendants: bool = False) -> bool:
         """Persist one record only if its durable revision is still current.
@@ -418,27 +779,38 @@ class Store:
         ``False`` without changing durable state, so an old cycle can never replace a newer
         continuation or terminal transition.
         """
-        self._refuse_promotion_receipt_callback_mutation()
+        self._refuse_admission_callback_mutation()
         with self._lock:
-            try:
-                self._conn.execute("BEGIN IMMEDIATE")
-                row = self._conn.execute(
-                    "SELECT data FROM records WHERE identity = ?", (record.identity,)).fetchone()
-                if row is not None and self._decode(row[0]).revision != record.revision:
-                    self._conn.execute("ROLLBACK")
-                    return False
-                if row is None and record.revision != 0:
-                    self._conn.execute("ROLLBACK")
-                    return False
-                record.revision += 1
-                self._write(record)
-                if retire_descendants:
-                    self._retire_descendants(record)
-                self._conn.execute("COMMIT")
-                return True
-            except sqlite3.DatabaseError as e:
-                self._rollback_quietly()
-                raise StoreUnavailable(f"cannot write continuation store: {e}") from e
+            revision = record.revision
+            for delay in (0.1, 0.3, None):
+                try:
+                    self._conn.execute("BEGIN IMMEDIATE")
+                    row = self._conn.execute(
+                        "SELECT data FROM records WHERE identity = ?", (record.identity,)).fetchone()
+                    if row is not None and self._decode(row[0]).revision != record.revision:
+                        self._conn.execute("ROLLBACK")
+                        return False
+                    if row is None and record.revision != 0:
+                        self._conn.execute("ROLLBACK")
+                        return False
+                    record.revision += 1
+                    self._write(record)
+                    if retire_descendants:
+                        self._retire_descendants(record)
+                    self._conn.execute("COMMIT")
+                    return True
+                except sqlite3.OperationalError as e:
+                    self._rollback_quietly()
+                    record.revision = revision
+                    message = str(e).lower()
+                    if delay is not None and "database is locked" in message:
+                        time.sleep(delay)
+                        continue
+                    raise StoreUnavailable(f"cannot write continuation store: {e}") from e
+                except sqlite3.DatabaseError as e:
+                    self._rollback_quietly()
+                    record.revision = revision
+                    raise StoreUnavailable(f"cannot write continuation store: {e}") from e
 
     def transition(self, expected: Record,
                    operation: Callable[[Record], bool], *,
@@ -450,7 +822,7 @@ class Store:
         A process crash releases SQLite's transaction; the stage adapter's idempotent durable
         proof can then be retried by a fresh coordinator. Returning false rolls back cleanly.
         """
-        self._refuse_promotion_receipt_callback_mutation()
+        self._refuse_admission_callback_mutation()
         with self._lock:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
@@ -497,7 +869,7 @@ class Store:
         head. The superseded predecessor is left completed-and-retired, exactly as a normal
         claim-transfer leaves its completed predecessor, so it leaves the running ledger and is
         never re-admitted or re-reconciled."""
-        self._refuse_promotion_receipt_callback_mutation()
+        self._refuse_admission_callback_mutation()
         with self._lock:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
@@ -516,7 +888,26 @@ class Store:
                     already_transferred = (
                         prior.state == COMPLETED and prior.retired and not prior.claim
                         and successor_row is not None and successor.claim)
+                    if (already_transferred and supersede
+                            and prior.refusal == "capability_environment_failure:incompatible"
+                            and prior.stage in {"intake", "build"}):
+                        immutable_recovery_fields = (
+                            "identity", "stage", "pool", "demand", "repo", "subject", "target",
+                            "subject_revision", "route_id", "route_cell_digest",
+                            "launch_config_digest", "continuation", "model", "complexity",
+                            "effort", "lineage", "source", "input_ptr", "capability_root",
+                            "capability_context", "session_lead", "builder_lineage",
+                            "branch_lineage", "builder_complexity", "builder_effort", "round",
+                            "conflict_round", "resume", "auto_merge_allowed", "root",
+                            "interactive", "floodgates",
+                        )
+                        already_transferred = all(
+                            getattr(successor, name) == getattr(record, name)
+                            for name in immutable_recovery_fields)
                     if not already_transferred:
+                        if supersede and successor_row is not None:
+                            raise StoreUnavailable(
+                                "cannot transfer claim: successor is already occupied")
                         eligible = (prior.claim and not prior.retired if supersede
                                     else prior.state == COMPLETED and not prior.retired
                                     and prior.claim)
@@ -571,9 +962,28 @@ class Store:
         successor, and publishes a result only after commit.  Ordinary ineligibility returns
         ``None`` without calling either admission owner or writing any row.
         """
-        self._refuse_promotion_receipt_callback_mutation()
+        self._refuse_admission_callback_mutation()
         if type(intent) is not ReservationIntent:
             raise TypeError("reserve requires the exact ReservationIntent")
+        if not self.composed_admission:
+            raise StoreUnavailable("composed admission is not configured")
+        result = self._reserve(intent, composed=True)
+        return result  # type: ignore[return-value]
+
+    def reserve_legacy(
+            self, intent: LegacyReservationIntent) -> LegacyReservationResult | None:
+        """Reserve through the compatibility seam used outside composed production."""
+        self._refuse_admission_callback_mutation()
+        if type(intent) is not LegacyReservationIntent:
+            raise TypeError("reserve_legacy requires the exact LegacyReservationIntent")
+        if self.composed_admission:
+            raise StoreUnavailable("legacy reservation is unavailable in composed admission")
+        result = self._reserve(intent, composed=False)
+        return result  # type: ignore[return-value]
+
+    def _reserve(
+            self, intent: ReservationIntent | LegacyReservationIntent, *, composed: bool,
+    ) -> AdmissionResult | LegacyReservationResult | None:
         if (not isinstance(intent.identity, str) or not intent.identity
                 or (intent.expected_launch_token is not None
                     and not isinstance(intent.expected_launch_token, str))
@@ -590,6 +1000,7 @@ class Store:
         with self._lock:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
+                self._call_admission_callback(self._admission_checkpoint, "after-begin")
                 existing_row = self._conn.execute(
                     "SELECT data FROM records WHERE identity = ?", (intent.identity,)).fetchone()
                 if existing_row is None:
@@ -603,6 +1014,34 @@ class Store:
                         or intent.budget < 0):
                     self._conn.execute("ROLLBACK")
                     return None
+                self._call_admission_callback(self._admission_checkpoint, "after-waiting-cas")
+                admitted_launch = None
+                if composed:
+                    if (not existing.subject_revision or not existing.route_id
+                            or not existing.route_cell_digest
+                            or not existing.launch_config_digest):
+                        raise AdmissionRefused("admission_identity_migration_required")
+                    if intent.route_cell_digest != existing.route_cell_digest:
+                        raise AdmissionRefused("route_cell:mismatched")
+                    briefing_id, briefing_digest = self._validate_briefing(existing, intent.briefing)
+                    capability = self._validate_capability(existing, intent.capability)
+                    self._call_admission_callback(
+                        self._admission_checkpoint, "after-identity-validation")
+                    try:
+                        admitted_launch = self._resolve_active_admitted(
+                            existing.identity, existing.revision, existing.route_id,
+                            conn=self._conn)
+                    except RouteAdmissionRefused as error:
+                        raise AdmissionRefused(f"route_cell:{error.code}") from error
+                    except SafetyRefused as error:
+                        raise AdmissionRefused("route_cell:unreadable") from error
+                    if (admitted_launch.route_cell.digest != existing.route_cell_digest
+                            or admitted_launch.route_cell.launch_config_digest
+                            != existing.launch_config_digest
+                            or admitted_launch.route_cell.route_id != existing.route_id):
+                        raise AdmissionRefused("route_cell:mismatched")
+                    self._call_admission_callback(
+                        self._admission_checkpoint, "after-route-validation")
                 if intent.limits is not None:
                     limits = intent.limits
                     rows = self._conn.execute(
@@ -629,6 +1068,7 @@ class Store:
                 if int(row[0]) + existing.demand > intent.budget:
                     self._conn.execute("ROLLBACK")
                     return None
+                self._call_admission_callback(self._admission_checkpoint, "after-capacity")
                 if (self._operational_safety is not None
                         and (not isinstance(intent.route_cell_digest, str)
                              or not intent.route_cell_digest)):
@@ -644,19 +1084,46 @@ class Store:
                         provider=existing.pool,
                         model=existing.model,
                         route_cell_digest=intent.route_cell_digest)  # type: ignore[arg-type]
-                    safety = self._operational_safety._participate_in_admission(context)
+                    try:
+                        safety = self._call_admission_callback(
+                            self._operational_safety._participate_in_admission, context)
+                    except SafetyRefused as error:
+                        if composed:
+                            raise AdmissionRefused("safety_refused") from error
+                        raise
                     if (type(safety) is not _SafetyAdmissionResult
                             or not isinstance(safety.safety_state_id, str)
                             or not safety.safety_state_id):
+                        if composed:
+                            raise AdmissionRefused("safety_refused")
                         raise SafetyRefused("OperationalSafety returned an invalid admission result")
                     safety_state_id = safety.safety_state_id
+                    self._call_admission_callback(self._admission_checkpoint, "after-safety")
                     if self._canary_attribution is not None:
-                        from agentflow.canary_attribution import _CanaryAdmissionResult
-                        canary = self._canary_attribution._participate_in_admission(context)
+                        from agentflow.canary_attribution import (
+                            CanaryAttributionRefused, _CanaryAdmissionResult,
+                        )
+                        try:
+                            canary = self._call_admission_callback(
+                                self._canary_attribution._participate_in_admission, context)
+                        except CanaryAttributionRefused as error:
+                            raise AdmissionRefused("safety_refused") from error
                         if type(canary) is not _CanaryAdmissionResult:
-                            raise SafetyRefused("CanaryAttribution returned an invalid admission result")
+                            raise AdmissionRefused("safety_refused")
                         attribution = canary.attribution
-                self._admission_checkpoint("after-attribution-before-successor")
+                self._call_admission_callback(
+                    self._admission_checkpoint, "after-attribution-before-successor")
+                receipt = None
+                if composed:
+                    receipt = AdmissionReceipt(
+                        existing.subject_revision, briefing_id, briefing_digest,
+                        capability.capability_id, capability.capability_digest,
+                        existing.route_id, existing.route_cell_digest,
+                        existing.launch_config_digest, safety_state_id)  # type: ignore[arg-type]
+                    self._insert_or_validate_admission_receipt(existing.identity, receipt)
+                    self._insert_or_validate_lesson_use(existing, intent.briefing)
+                    self._call_admission_callback(
+                        self._admission_checkpoint, "after-receipt-before-successor")
                 successor = replace(
                     existing,
                     state=RUNNING,
@@ -671,16 +1138,241 @@ class Store:
                     deadline=intent.now + SUPERVISOR_WINDOW,
                 )
                 self._write(successor)
-                self._admission_checkpoint("after-successor-before-commit")
+                self._call_admission_callback(
+                    self._admission_checkpoint, "after-successor-before-commit")
                 self._conn.execute("COMMIT")
-                self._admission_checkpoint("after-commit")
-                return AdmissionResult(successor, safety_state_id, attribution)
+                self._call_admission_callback(self._admission_checkpoint, "after-commit")
+                if composed:
+                    return AdmissionResult(
+                        successor, receipt, safety_state_id, attribution)  # type: ignore[arg-type]
+                return LegacyReservationResult(successor, safety_state_id)
             except sqlite3.DatabaseError as e:
                 self._rollback_quietly()
                 raise StoreUnavailable(f"cannot reserve on continuation store: {e}") from e
             except BaseException:
                 self._rollback_quietly()
                 raise
+
+    @staticmethod
+    def _validate_briefing(existing: Record, briefing) -> tuple[str | None, str | None]:
+        from agentflow.effective_policy import (
+            NotApplicableBriefing, ReadyBriefing, validate_briefing,
+        )
+        if existing.stage == "converse":
+            if briefing is not None:
+                raise AdmissionRefused("briefing_mismatch")
+            return None, None
+        if type(briefing) not in {ReadyBriefing, NotApplicableBriefing}:
+            raise AdmissionRefused("briefing_mismatch")
+        if (briefing.repository != existing.repo or briefing.stage != existing.stage
+                or briefing.subject_revision != existing.subject_revision):
+            raise AdmissionRefused("briefing_mismatch")
+        if not validate_briefing(briefing):
+            raise AdmissionRefused("briefing_mismatch")
+        return briefing.briefing_id, briefing.briefing_digest
+
+    @staticmethod
+    def _validate_capability(existing: Record, capability):
+        from agentflow.capability_contracts import validate_capability_ready_fact
+        if (not validate_capability_ready_fact(capability)
+                or capability.stage != existing.stage
+                or capability.provider != existing.pool):
+            raise AdmissionRefused("capability_mismatch")
+        return capability
+
+    def _insert_or_validate_admission_receipt(
+            self, stage_identity: str, receipt: AdmissionReceipt) -> None:
+        row = self._conn.execute(
+            "SELECT subject_revision, briefing_id, briefing_digest, capability_id, "
+            "capability_digest, route_id, route_cell_digest, launch_config_digest, "
+            "safety_state_id, receipt_digest FROM admission_receipts "
+            "WHERE stage_identity = ?",
+            (stage_identity,),
+        ).fetchone()
+        values = tuple(getattr(receipt, item.name) for item in fields(AdmissionReceipt))
+        digest = self._admission_receipt_digest(stage_identity, receipt)
+        if row is not None:
+            prior = AdmissionReceipt(*row[:-1])
+            if row[-1] != self._admission_receipt_digest(stage_identity, prior):
+                raise AdmissionRefused("invalid_receipt")
+            if (prior.subject_revision, prior.briefing_id, prior.briefing_digest) != (
+                    receipt.subject_revision, receipt.briefing_id, receipt.briefing_digest):
+                raise AdmissionRefused("briefing_mismatch")
+            if (prior.capability_id, prior.capability_digest) != (
+                    receipt.capability_id, receipt.capability_digest):
+                raise AdmissionRefused("capability_mismatch")
+            if (prior.route_id, prior.route_cell_digest, prior.launch_config_digest) != (
+                    receipt.route_id, receipt.route_cell_digest, receipt.launch_config_digest):
+                raise AdmissionRefused("route_cell:mismatched")
+            if prior.safety_state_id != receipt.safety_state_id:
+                raise AdmissionRefused("safety_refused")
+            return
+        self._conn.execute(
+            "INSERT INTO admission_receipts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (stage_identity, *values, digest),
+        )
+
+    @staticmethod
+    def _admission_receipt_digest(
+            stage_identity: str, receipt: AdmissionReceipt) -> str:
+        facts = {"stage_identity": stage_identity}
+        facts.update((item.name, getattr(receipt, item.name))
+                     for item in fields(AdmissionReceipt))
+        return _digest(facts)
+
+    def _insert_or_validate_lesson_use(self, record: Record, briefing) -> LessonUseAttribution | None:
+        """Commit receipt-backed advisory use in the same transaction as the launch reservation."""
+        from agentflow.effective_policy import ReadyBriefing, advisory_stage
+
+        if type(briefing) is not ReadyBriefing:
+            return None
+        lessons = tuple(item for item in briefing.receipts
+                        if advisory_stage(item) == record.stage)
+        if not lessons:
+            return None
+        if len(lessons) != 1:
+            raise AdmissionRefused("invalid_receipt")
+        receipt = lessons[0]
+        values = {
+            "stage_identity": record.identity,
+            "repository": record.repo,
+            "stage": record.stage,
+            "subject_revision": record.subject_revision,
+            "briefing_id": briefing.briefing_id,
+            "briefing_digest": briefing.briefing_digest,
+            "promotion_receipt_id": receipt.receipt_id,
+            "method_revision": receipt.authority.revision,
+        }
+        attribution = LessonUseAttribution(
+            **values, attribution_digest=_digest({"domain": "lesson-use-attribution-v1", **values}))
+        row = self._conn.execute(
+            "SELECT repository, stage, subject_revision, briefing_id, briefing_digest, "
+            "promotion_receipt_id, method_revision, attribution_digest "
+            "FROM lesson_use_attributions WHERE stage_identity=?", (record.identity,)).fetchone()
+        if row is not None:
+            prior = LessonUseAttribution(record.identity, *row)
+            if prior != attribution:
+                raise AdmissionRefused("briefing_mismatch")
+            return prior
+        self._conn.execute(
+            "INSERT INTO lesson_use_attributions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            tuple(getattr(attribution, item.name) for item in fields(LessonUseAttribution)))
+        return attribution
+
+    def read_lesson_use_attribution(self, stage_identity: str) -> LessonUseAttribution | None:
+        """Read one immutable promoted-briefing use without exposing coordinator internals."""
+        if type(stage_identity) is not str or not stage_identity:
+            raise StoreUnavailable("lesson use attribution is unreadable")
+        with self._lock:
+            try:
+                row = self._conn.execute(
+                    "SELECT r.data, a.repository, a.stage, a.subject_revision, a.briefing_id, "
+                    "a.briefing_digest, a.promotion_receipt_id, a.method_revision, "
+                    "a.attribution_digest FROM lesson_use_attributions AS a JOIN records AS r "
+                    "ON r.identity=a.stage_identity WHERE a.stage_identity=?",
+                    (stage_identity,)).fetchone()
+                if row is None:
+                    if self._conn.execute(
+                            "SELECT 1 FROM lesson_use_attributions WHERE stage_identity=?",
+                            (stage_identity,)).fetchone() is not None:
+                        raise ValueError("orphan lesson use attribution")
+                    return None
+                record = self._decode(row[0])
+                value = LessonUseAttribution(stage_identity, *row[1:])
+                self._validate_lesson_use(value, record)
+                return value
+            except (sqlite3.DatabaseError, TypeError, ValueError) as error:
+                raise StoreUnavailable("lesson use attribution is unreadable") from error
+
+    @staticmethod
+    def _validate_lesson_use(value: LessonUseAttribution, record: Record) -> None:
+        source = {item.name: getattr(value, item.name) for item in fields(LessonUseAttribution)
+                  if item.name != "attribution_digest"}
+        if (type(record) is not Record or value.stage_identity != record.identity
+                or (value.repository, value.stage, value.subject_revision) != (
+                    record.repo, record.stage, record.subject_revision)
+                or not _SUBJECT_REVISION.fullmatch(value.subject_revision)
+                or not _LOWER_DIGEST.fullmatch(value.briefing_digest)
+                or value.briefing_id != f"briefing-v1:{value.briefing_digest}"
+                or not value.promotion_receipt_id
+                or not _SUBJECT_REVISION.fullmatch(value.method_revision)
+                or value.attribution_digest != _digest(
+                    {"domain": "lesson-use-attribution-v1", **source})):
+            raise ValueError("invalid lesson use attribution")
+
+    def read_admission_receipt(self, stage_identity: str) -> AdmissionReceipt | None:
+        """Read one immutable admission authority tuple through Store's public interface."""
+        if type(stage_identity) is not str or not stage_identity:
+            raise StoreUnavailable("admission receipt is unreadable")
+        with self._lock:
+            try:
+                row = self._conn.execute(
+                    "SELECT r.data, a.subject_revision, a.briefing_id, a.briefing_digest, "
+                    "a.capability_id, a.capability_digest, a.route_id, "
+                    "a.route_cell_digest, a.launch_config_digest, a.safety_state_id, "
+                    "a.receipt_digest "
+                    "FROM admission_receipts AS a JOIN records AS r "
+                    "ON r.identity = a.stage_identity WHERE a.stage_identity = ?",
+                    (stage_identity,),
+                ).fetchone()
+                if row is None:
+                    orphan = self._conn.execute(
+                        "SELECT 1 FROM admission_receipts WHERE stage_identity = ?",
+                        (stage_identity,),).fetchone()
+                    if orphan is not None:
+                        raise ValueError("orphan admission receipt")
+                    return None
+                record = self._decode(row[0])
+                receipt = AdmissionReceipt(*row[1:-1])
+                self._validate_admission_receipt(stage_identity, record, receipt)
+                if row[-1] != self._admission_receipt_digest(stage_identity, receipt):
+                    raise ValueError("admission receipt digest mismatch")
+                safety = self._operational_safety
+                if safety is None:
+                    safety = OperationalSafety(self)
+                safety._validate_admission_history(
+                    stage_identity, receipt.route_cell_digest, receipt.safety_state_id)
+                return receipt
+            except (sqlite3.DatabaseError, json.JSONDecodeError, UnicodeError, TypeError,
+                    ValueError, AttributeError, KeyError, SafetyRefused) as error:
+                raise StoreUnavailable("admission receipt is unreadable") from error
+
+    @staticmethod
+    def _validate_admission_receipt(
+            stage_identity: str, record: Record, receipt: AdmissionReceipt) -> None:
+        if (type(record) is not Record or record.identity != stage_identity
+                or type(receipt) is not AdmissionReceipt):
+            raise ValueError("admission receipt owner mismatch")
+        if (type(receipt.subject_revision) is not str
+                or not _SUBJECT_REVISION.fullmatch(receipt.subject_revision)):
+            raise ValueError("invalid admission subject revision")
+        if ((receipt.briefing_id is None) != (receipt.briefing_digest is None)):
+            raise ValueError("invalid admission briefing pair")
+        if receipt.briefing_id is not None and (
+                type(receipt.briefing_id) is not str
+                or type(receipt.briefing_digest) is not str
+                or not _LOWER_DIGEST.fullmatch(receipt.briefing_digest)
+                or receipt.briefing_id != f"briefing-v1:{receipt.briefing_digest}"):
+            raise ValueError("invalid admission briefing identity")
+        if (record.stage == "converse") != (receipt.briefing_id is None):
+            raise ValueError("invalid admission briefing applicability")
+        if (type(receipt.capability_digest) is not str
+                or not _LOWER_DIGEST.fullmatch(receipt.capability_digest)
+                or type(receipt.capability_id) is not str
+                or receipt.capability_id
+                != f"capability-ready-v1:{receipt.capability_digest}"):
+            raise ValueError("invalid admission capability identity")
+        if (type(receipt.route_id) is not str or not _ROUTE_ID.fullmatch(receipt.route_id)
+                or any(type(value) is not str or not _LOWER_DIGEST.fullmatch(value)
+                       for value in (receipt.route_cell_digest,
+                                     receipt.launch_config_digest,
+                                     receipt.safety_state_id))):
+            raise ValueError("invalid admission route identity")
+        if (receipt.subject_revision, receipt.route_id, receipt.route_cell_digest,
+                receipt.launch_config_digest) != (
+                record.subject_revision, record.route_id, record.route_cell_digest,
+                record.launch_config_digest):
+            raise ValueError("admission receipt differs from durable record")
 
     def resolve_admitted_launch(self, stage_identity: str, expected_revision: int,
                                 route_id: str) -> AdmittedLaunch:
@@ -710,19 +1402,26 @@ class Store:
         if logical_route_id_for_record(record) != route_id:
             raise RouteAdmissionRefused("mismatched")
         route = conn.execute(
-            "SELECT 1 FROM safety_route_cells WHERE repository = ? AND stage = ?"
-            " AND provider = ? AND route_id = ?",
+            "SELECT s.active_digest FROM safety_route_cells AS c "
+            "JOIN safety_canary_state AS s ON s.cell_key = c.cell_key "
+            "WHERE c.repository = ? AND c.stage = ? AND c.provider = ? AND c.route_id = ?",
             (record.repo, record.stage, record.pool, route_id)).fetchone()
         if route is None:
             raise RouteAdmissionRefused("missing")
+        if record.route_cell_digest and route[0] != record.route_cell_digest:
+            raise RouteAdmissionRefused("stale")
         try:
             resolved = self._operational_safety.resolve(  # type: ignore[union-attr]
                 *identity, route_id, conn=conn)
         except _SafetyIdentityMismatch:
             raise RouteAdmissionRefused("mismatched") from None
+        except _SafetyMissing:
+            raise RouteAdmissionRefused("missing") from None
         except SafetyRefused:
             raise
         cell = resolved.route_cell
+        if record.route_cell_digest and cell.digest != record.route_cell_digest:
+            raise RouteAdmissionRefused("stale")
         if (cell.repository, cell.stage, cell.provider, cell.model, cell.route_id) != (
                 *identity, route_id):
             raise RouteAdmissionRefused("mismatched")
@@ -752,6 +1451,7 @@ class Store:
     def consume_admitted_launch(self, stage_identity: str, expected_revision: int,
                                 route_id: str, *, reserve, before_reserve=None):
         """Reserve only after the selected active pointer is verified under SQLite write lock."""
+        self._refuse_admission_callback_mutation()
         admitted = self.resolve_admitted_launch(
             stage_identity, expected_revision, route_id)
         if before_reserve is not None:
@@ -789,6 +1489,33 @@ class Store:
         return RouteSelectionIdentity(
             cell.route_id, cell.digest, cell.launch_config_digest)
 
+    def active_route_selection_identity(self, record: Record) -> RouteSelectionIdentity:
+        """Return the verified active RouteCell for one durable record's routing identity."""
+        if type(record) is not Record:
+            raise TypeError("active route lookup requires the exact durable record")
+        if self._operational_safety is None:
+            raise RouteAdmissionRefused("unreadable")
+        from agentflow.routing import logical_route_id_for_record
+        route_id = logical_route_id_for_record(record)
+        if route_id != record.route_id:
+            raise RouteAdmissionRefused("mismatched")
+        with self._lock:
+            try:
+                resolved = self._operational_safety.resolve(
+                    record.repo, record.stage, record.pool, record.model, route_id,
+                    conn=self._conn)
+                self._operational_safety.route_state(resolved.route_cell.digest)
+                admitted = decode_admitted_launch(resolved)
+            except _SafetyIdentityMismatch:
+                raise RouteAdmissionRefused("mismatched") from None
+            except _SafetyMissing:
+                raise RouteAdmissionRefused("missing") from None
+            except (SafetyRefused, sqlite3.DatabaseError, ValueError, TypeError):
+                raise RouteAdmissionRefused("unreadable") from None
+        cell = admitted.route_cell
+        return RouteSelectionIdentity(
+            cell.route_id, cell.digest, cell.launch_config_digest)
+
     @staticmethod
     def _rematerialize_route_selection(selection):
         from agentflow.routing import (
@@ -806,6 +1533,7 @@ class Store:
 
     def register_route_selection(self, selection):
         """Register one exact routing-owned selection through this Store's sealed owner."""
+        self._refuse_admission_callback_mutation()
         if self._operational_safety is None:
             raise StoreUnavailable("route registration is not configured")
         current = self._rematerialize_route_selection(selection)
@@ -839,7 +1567,7 @@ class Store:
         compare-and-set, so genuine in-flight or completed work is never freed. Returns whether the
         row was removed.
         """
-        self._refuse_promotion_receipt_callback_mutation()
+        self._refuse_admission_callback_mutation()
         with self._lock:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
@@ -854,6 +1582,16 @@ class Store:
                         or current.process_alive):
                     self._conn.execute("ROLLBACK")
                     return False
+                # Composed admission may have committed immutable facts before a launcher proves
+                # ``not_started``. This is their one rollback boundary; each owner encapsulates
+                # its own append-only-trigger suspension inside this IMMEDIATE transaction.
+                from agentflow.canary_attribution import (
+                    rollback_never_started_canary_attribution,
+                )
+                _rollback_never_started_store_admission_facts(
+                    self._conn, expected.identity)
+                rollback_never_started_admission_history(self._conn, expected.identity)
+                rollback_never_started_canary_attribution(self._conn, expected.identity)
                 self._conn.execute(
                     "DELETE FROM records WHERE identity = ?", (expected.identity,))
                 self._conn.execute("COMMIT")
@@ -877,11 +1615,12 @@ class Store:
     def child_start(self, identity: str, token: str, pid: int) -> bool:
         """The launched child's guarded ``started`` write (ADR 0030). Atomically records
         ``started`` with ``pid`` as the family *only if* the record is still the ``running``
-        reservation that stamped ``token``. If the coordinator already disowned this launch on
-        a handshake timeout (rotating the token) or returned the record to ``waiting``, the
-        write is refused and the caller must not become a provider — this is what stops an
-        uncancelled bootstrap from starting an unreserved, uncounted provider."""
-        self._refuse_promotion_receipt_callback_mutation()
+        reservation that stamped ``token`` and has not already recorded a start. If the
+        coordinator already disowned this launch on a handshake timeout (rotating the token),
+        returned the record to ``waiting``, or another bootstrap won, the write is refused and
+        the caller must not become a provider — this is what stops an uncancelled bootstrap from
+        starting an unreserved, uncounted provider."""
+        self._refuse_admission_callback_mutation()
         with self._lock:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
@@ -891,7 +1630,8 @@ class Store:
                     self._conn.execute("ROLLBACK")
                     return False
                 record = self._decode(row[0])
-                if record.state != RUNNING or record.launch_token != token:
+                if (record.state != RUNNING or record.launch_token != token
+                        or record.start_fact == STARTED):
                     self._conn.execute("ROLLBACK")
                     return False
                 record.start_fact = STARTED
@@ -905,13 +1645,46 @@ class Store:
                 self._rollback_quietly()
                 raise StoreUnavailable(f"cannot record child start: {e}") from e
 
+    def child_provider_group(
+            self, identity: str, token: str, supervisor_pid: int, provider_pgid: int) -> bool:
+        """Attach the provider's process group to a guarded child start.
+
+        The detached supervisor claims the launch token before it spawns anything. The provider
+        remains behind its bootstrap gate until this compare-and-set expands the durable family
+        from the supervisor pid to ``supervisor:provider-group``; a stale or losing child cannot
+        publish or release a provider under another launch's reservation.
+        """
+        self._refuse_admission_callback_mutation()
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                row = self._conn.execute(
+                    "SELECT data FROM records WHERE identity = ?", (identity,)).fetchone()
+                if row is None:
+                    self._conn.execute("ROLLBACK")
+                    return False
+                record = self._decode(row[0])
+                if (record.state != RUNNING or record.launch_token != token
+                        or record.start_fact != STARTED
+                        or record.family != str(supervisor_pid)):
+                    self._conn.execute("ROLLBACK")
+                    return False
+                record.family = f"{supervisor_pid}:{provider_pgid}"
+                record.revision += 1
+                self._write(record)
+                self._conn.execute("COMMIT")
+                return True
+            except sqlite3.DatabaseError as e:
+                self._rollback_quietly()
+                raise StoreUnavailable(f"cannot record provider process group: {e}") from e
+
     def disown_launch(self, identity: str, token: str) -> tuple[str, str | None]:
         """The coordinator's atomic timeout finalize (ADR 0030). If the child already won —
         durably recorded ``started`` under ``token`` — return ``(started, family)`` and leave
         it. Otherwise rotate the reservation's launch token so any still-running child's late
         guarded write is refused, and return ``(not_started, None)``. Exactly one of this and
         :meth:`child_start` can win, so a launch never both times out and starts a provider."""
-        self._refuse_promotion_receipt_callback_mutation()
+        self._refuse_admission_callback_mutation()
         with self._lock:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
@@ -954,9 +1727,9 @@ class Store:
         return int(row[0])
 
     def close(self) -> None:
-        self._refuse_promotion_receipt_callback_mutation()
+        self._refuse_admission_callback_mutation()
         with self._lock:
-            self._refuse_promotion_receipt_callback_mutation()
+            self._refuse_admission_callback_mutation()
             self._conn.close()
 
     def _write(self, record: Record) -> None:
@@ -1046,13 +1819,16 @@ def _schema_fingerprint(conn: sqlite3.Connection) -> tuple[tuple[str, str, str, 
 
 
 def _expected_schema_fingerprint(version: int) -> tuple[tuple[str, str, str, str], ...]:
-    if version in (2, 3):
+    if version in (2, 3, 4, 5):
         from agentflow.canary_attribution import (
             STORE_V2_SCHEMA_FINGERPRINT,
             STORE_V3_SCHEMA_FINGERPRINT,
         )
-        return (STORE_V2_SCHEMA_FINGERPRINT if version == 2
-                else STORE_V3_SCHEMA_FINGERPRINT)
+        if version == 2:
+            return STORE_V2_SCHEMA_FINGERPRINT
+        if version == 3:
+            return STORE_V3_SCHEMA_FINGERPRINT
+        return STORE_V4_SCHEMA_FINGERPRINT if version == 4 else STORE_V5_SCHEMA_FINGERPRINT
     conn = sqlite3.connect(":memory:", isolation_level=None)
     try:
         conn.execute(_RECORDS_SCHEMA)

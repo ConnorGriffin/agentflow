@@ -271,17 +271,19 @@ def test_the_mockup_claim_proof_names_each_of_its_four_refusals(monkeypatch):
     (coordinated_research._research_worktree_ready, "research"),
 ])
 def test_the_detached_read_worktrees_name_each_of_their_four_refusals(tmp_path, ready, lane):
-    """An Ask turn and a research run each provision a detached checkout of ``origin/main`` and
+    """An Ask turn and a research run each provision a detached exact-revision checkout and
     reuse it exactly as it is on resume. Four ways to refuse, each a different git step."""
     repo = _repo(tmp_path)
+    revision = _git(repo, "rev-parse", "HEAD")
     empty = tmp_path / "empty.git"
     subprocess.run(["git", "init", "--bare", str(empty)], check=True, capture_output=True)
     ref = (WorktreeRef.for_converse(str(repo), "claude", "abc") if lane == "converse"
            else WorktreeRef.for_research(str(repo), "claude", 5))
     wt = Path(ref.path)
 
-    def record(*, source=ref.path):
-        return SimpleNamespace(repo="o/r", subject="5", pool="claude", stage=lane, source=source)
+    def record(*, source=ref.path, subject_revision=revision):
+        return SimpleNamespace(repo="o/r", subject="5", pool="claude", stage=lane,
+                               source=source, subject_revision=subject_revision)
 
     seen = {_check(ready(record(source="/nope")))}
     wt.mkdir(parents=True)
@@ -298,7 +300,7 @@ def test_the_detached_read_worktrees_name_each_of_their_four_refusals(tmp_path, 
     # A reachable origin with nothing to check out: the fetch succeeds and the add cannot.
     _git(repo, "remote", "set-url", "origin", str(empty))
     _git(repo, "update-ref", "-d", "refs/remotes/origin/main")
-    seen.add(_check(ready(record())))
+    seen.add(_check(ready(record(subject_revision="f" * 40))))
 
     assert seen == {"source-unreadable", "worktree-unregistered", "fetch-failed",
                     "worktree-add-failed"}
@@ -656,7 +658,7 @@ def test_the_refusal_fields_default_so_records_written_before_this_change_still_
     finally:
         store.close()
 
-    assert SCHEMA_VERSION == 3
+    assert SCHEMA_VERSION == 5
     assert restored.refusal == "" and restored.refusal_expected is False
 
 

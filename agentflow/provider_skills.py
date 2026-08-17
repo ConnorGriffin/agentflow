@@ -8,12 +8,24 @@ and capability manifest.  Every launch-root preflight rechecks both halves and f
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import json
 import os
 from importlib.resources import files
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import shutil
+import stat
+import tempfile
 import tomllib
+
+from agentflow.filesystem_contracts import (
+    _contained,
+    _regular_directory,
+    _safe_manifest_path,
+    runtime_tree_status,
+    skill_destination_status,
+)
+from agentflow.runtime_contracts import playwright_runtime_status
 
 
 RECEIPT_SCHEMA = 1
@@ -30,87 +42,6 @@ When invoked, reply with this exact line and nothing else:
 
 {NATIVE_DISCOVERY_MARKER}
 """
-
-
-def _regular_directory(path: Path) -> bool:
-    return path.is_dir() and not path.is_symlink()
-
-
-def _contained(path: Path, root: Path) -> bool:
-    try:
-        path.resolve(strict=True).relative_to(root.resolve(strict=True))
-    except (FileNotFoundError, OSError, ValueError):
-        return False
-    return True
-
-
-def _safe_manifest_path(value: object) -> PurePosixPath | None:
-    if not isinstance(value, str):
-        return None
-    relative = PurePosixPath(value)
-    if (
-        relative.is_absolute()
-        or not relative.parts
-        or any(part in {"", ".", ".."} for part in relative.parts)
-    ):
-        return None
-    return relative
-
-
-def skill_destination_status(directory: Path, files_manifest: list[dict]) -> str:
-    """Compare one non-symlinked project-local skill directory with its pinned manifest."""
-    root = directory.parent.parent
-    skill_root = directory.parent
-    if not root.exists() and not root.is_symlink():
-        return "absent"
-    if not _regular_directory(root):
-        return "incompatible"
-    if not skill_root.exists() and not skill_root.is_symlink():
-        return "absent"
-    if not _regular_directory(skill_root):
-        return "incompatible"
-    if not directory.exists() and not directory.is_symlink():
-        return "absent"
-    if (
-        not _contained(skill_root, root)
-        or not _regular_directory(directory)
-        or not _contained(directory, root)
-    ):
-        return "incompatible"
-    expected: dict[str, str] = {}
-    for item in files_manifest:
-        relative = _safe_manifest_path(item.get("path")) if isinstance(item, dict) else None
-        digest = item.get("sha256") if isinstance(item, dict) else None
-        if relative is None or not isinstance(digest, str):
-            return "incompatible"
-        target = directory.joinpath(*relative.parts)
-        if target.is_symlink() or (target.exists() and not _contained(target, directory)):
-            return "incompatible"
-        if not target.is_file():
-            # Once the skill directory exists, a missing tracked file is drift, not
-            # absence.  In particular, an occupied empty directory must never look like
-            # a safe destination for enrollment.
-            return "drifted"
-        expected[relative.as_posix()] = digest
-    actual: set[str] = set()
-    for path in directory.rglob("*"):
-        relative = path.relative_to(directory)
-        if "node_modules" in relative.parts:
-            continue
-        if path.is_symlink():
-            return "incompatible"
-        if path.is_file():
-            if not _contained(path, directory):
-                return "incompatible"
-            actual.add(relative.as_posix())
-    if actual != set(expected):
-        return "drifted"
-    if any(
-        hashlib.sha256((directory / relative).read_bytes()).hexdigest() != digest
-        for relative, digest in expected.items()
-    ):
-        return "drifted"
-    return "ok"
 
 
 def _manifest_fingerprint() -> str:
@@ -341,36 +272,22 @@ def prove_native_discovery(root: str | Path, provider: str) -> tuple[bool, str]:
     skill_root = checkout / location / "skills"
     if (not _regular_directory(skill_root) or not _contained(skill_root, checkout)):
         return False, f"{provider} project-local skill root is missing or incompatible"
-    fixture = skill_root / NATIVE_DISCOVERY_SKILL
-    created = False
     try:
-        if fixture.exists() or fixture.is_symlink():
-            skill_file = fixture / "SKILL.md"
-            if (not _regular_directory(fixture) or not _contained(fixture, checkout)
-                    or skill_file.is_symlink() or not skill_file.is_file()
-                    or skill_file.read_text() != _NATIVE_DISCOVERY_FIXTURE):
-                return False, "native-discovery fixture destination is occupied or incompatible"
-        else:
-            fixture.mkdir()
+        with tempfile.TemporaryDirectory(prefix="agentflow-provider-probe-") as temporary:
+            probe_root = Path(temporary)
+            fixture = probe_root / location / "skills" / NATIVE_DISCOVERY_SKILL
+            fixture.mkdir(parents=True)
             (fixture / "SKILL.md").write_text(_NATIVE_DISCOVERY_FIXTURE)
-            created = True
-        clear_native_discovery_receipt(checkout, provider)
-        result = _run_native_discovery_probe(checkout, provider)
-        output = (result.stdout or "") + (result.stderr or "")
-        proven = result.returncode == 0 and native_discovery_output_is_proof(provider, output)
-        if not proven:
-            return False, f"{provider} did not prove native project skill discovery"
-        receipt = record_native_discovery_receipt(checkout, provider)
-        return True, f"recorded {provider} native-discovery receipt at {receipt}"
+            clear_native_discovery_receipt(checkout, provider)
+            result = _run_native_discovery_probe(probe_root, provider)
+            output = (result.stdout or "") + (result.stderr or "")
+            proven = result.returncode == 0 and native_discovery_output_is_proof(provider, output)
+            if not proven:
+                return False, f"{provider} did not prove native project skill discovery"
+            receipt = record_native_discovery_receipt(checkout, provider)
+            return True, f"recorded {provider} native-discovery receipt at {receipt}"
     except OSError as exc:
         return False, f"native-discovery probe failed: {exc}"
-    finally:
-        if created:
-            try:
-                (fixture / "SKILL.md").unlink()
-                fixture.rmdir()
-            except OSError:
-                pass
 
 
 def provider_skill_status(root: Path, provider: str, spec: dict) -> tuple[str, str]:
@@ -390,7 +307,8 @@ def provider_skill_status(root: Path, provider: str, spec: dict) -> tuple[str, s
 
 
 def materialize_launch_capabilities(
-    source: Path, destination: Path, provider: str
+    source: Path, destination: Path, provider: str, materialize_runtime: bool = False,
+    *, requirement_ids: set[str] | None = None, _log=None,
 ) -> tuple[bool, str]:
     """Copy missing pinned provider skills into a prepared launch root without overwriting.
 
@@ -418,34 +336,319 @@ def materialize_launch_capabilities(
         or not _contained(source_skills, source_provider_root)
     ):
         return False, f"{provider} capability source root is missing or incompatible"
+    provider_root_existed = destination_provider_root.exists()
     if destination_provider_root.is_symlink() or (
-        destination_provider_root.exists() and not destination_provider_root.is_dir()
+        provider_root_existed and not destination_provider_root.is_dir()
     ):
         return False, f"{provider} launch provider root is incompatible"
-    if destination_provider_root.exists() and not _contained(destination_provider_root, destination):
+    if provider_root_existed and not _contained(destination_provider_root, destination):
         return False, f"{provider} launch provider root escapes the launch root"
+    skills_existed = destination_skills.exists()
     if destination_skills.is_symlink() or (
-        destination_skills.exists() and not destination_skills.is_dir()
+        skills_existed and not destination_skills.is_dir()
     ):
         return False, f"{provider} launch skill root is incompatible"
-    destination_skills.mkdir(parents=True, exist_ok=True)
+    manifest = tomllib.loads(files("agentflow").joinpath("capabilities.toml").read_text())
+    specs = [
+        spec for spec in manifest["capabilities"]
+        if spec.get("skill") and "version" in spec
+    ]
+    if requirement_ids is not None:
+        specs = [
+            spec for spec in specs
+            if spec["id"] in requirement_ids or spec["skill"] in requirement_ids
+        ]
+    source_runtime = source_skills / "drive-local-webapp" / "node_modules"
+    destination_drive = destination_skills / "drive-local-webapp"
+    destination_runtime = destination_drive / "node_modules"
+    missing_skills = [
+        (spec, source_skills / spec["skill"], destination_skills / spec["skill"])
+        for spec in specs
+        if not (destination_skills / spec["skill"]).exists()
+        and not (destination_skills / spec["skill"]).is_symlink()
+    ]
+    for spec, source_skill, _target_skill in missing_skills:
+        if skill_destination_status(source_skill, spec["files"]) != "ok":
+            return False, f"{provider} source skill {spec['skill']} is not intact"
+    _log = _log or (lambda _line: None)
+    created: list[tuple[Path, bool]] = []
+    created_snapshots: dict[Path, tuple | None] = {}
+    replaced_files: list[tuple[Path, bytes, tuple[int, int, int, str]]] = []
+    attempted_requirements: list[str] = []
+    audit_emitted = False
+
+    def attempted(requirement: str) -> None:
+        if requirement not in attempted_requirements:
+            attempted_requirements.append(requirement)
+
+    def audit(outcome: str, detail: str) -> None:
+        nonlocal audit_emitted
+        if audit_emitted or not attempted_requirements:
+            return
+        audit_emitted = True
+        _log(
+            f"capability repair root={destination} "
+            f"requirements={','.join(attempted_requirements)}; "
+            f"outcome={outcome} — {detail}"
+        )
+
+    def path_snapshot(path: Path) -> tuple | None:
+        """Fingerprint identity and bytes without following links; unreadable means preserve."""
+        try:
+            root_stat = path.lstat()
+            if path.is_symlink():
+                return ((".", "link", root_stat.st_dev, root_stat.st_ino, root_stat.st_mode,
+                         str(path.readlink())),)
+            if path.is_file():
+                return ((".", "file", root_stat.st_dev, root_stat.st_ino, root_stat.st_mode,
+                         hashlib.sha256(path.read_bytes()).hexdigest()),)
+            if not path.is_dir():
+                return ((".", "other", root_stat.st_dev, root_stat.st_ino,
+                         root_stat.st_mode, ""),)
+            entries = [(
+                ".", "dir", root_stat.st_dev, root_stat.st_ino, root_stat.st_mode, "",
+            )]
+            for current, directories, filenames in os.walk(path, followlinks=False):
+                directories.sort()
+                filenames.sort()
+                base = Path(current)
+                for name in directories + filenames:
+                    item = base / name
+                    relative = str(item.relative_to(path))
+                    item_stat = item.lstat()
+                    if item.is_symlink():
+                        kind, content = "link", str(item.readlink())
+                    elif item.is_dir():
+                        kind, content = "dir", ""
+                    elif item.is_file():
+                        kind = "file"
+                        content = hashlib.sha256(item.read_bytes()).hexdigest()
+                    else:
+                        kind, content = "other", ""
+                    entries.append((
+                        relative, kind, item_stat.st_dev, item_stat.st_ino,
+                        item_stat.st_mode, content,
+                    ))
+            return tuple(entries)
+        except OSError:
+            return None
+
+    def rollback() -> list[str]:
+        errors = []
+        for path, content, installed in reversed(replaced_files):
+            descriptor = None
+            try:
+                flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+                descriptor = os.open(path, flags)
+                with os.fdopen(descriptor, "r+b") as stream:
+                    descriptor = None
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+                    observed = os.fstat(stream.fileno())
+                    identity = (
+                        observed.st_dev, observed.st_ino, observed.st_mode,
+                        hashlib.sha256(stream.read()).hexdigest(),
+                    )
+                    if not stat.S_ISREG(observed.st_mode) or identity != installed:
+                        errors.append(f"{path} changed concurrently; replacement preserved")
+                        continue
+                    stream.seek(0)
+                    stream.truncate()
+                    stream.write(content)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            except OSError as exc:
+                errors.append(f"{path} changed concurrently; replacement preserved: {exc}")
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
+        for path, recursive in reversed(created):
+            try:
+                if not path.exists() and not path.is_symlink():
+                    continue
+                installed = created_snapshots.get(path)
+                if installed is None or path_snapshot(path) != installed:
+                    errors.append(f"{path} changed concurrently; created content preserved")
+                    continue
+                if not recursive:
+                    path.rmdir()
+                elif path.is_symlink():
+                    path.unlink()
+                elif path.is_file():
+                    path.unlink()
+                elif path.exists():
+                    if not _contained(path, destination):
+                        errors.append(f"{path} escapes the launch root")
+                        continue
+                    shutil.rmtree(path)
+            except OSError as exc:
+                errors.append(f"{path}: {exc}")
+        return errors
+
+    def failed(message: str) -> tuple[bool, str]:
+        cleanup_errors = rollback()
+        if cleanup_errors:
+            message = f"{provider} rollback failed after {message}: {'; '.join(cleanup_errors)}"
+        audit("failed", message)
+        return False, message
+
+    def claim_directory(path: Path, *, recursive: bool = True) -> tuple[bool, str] | None:
+        try:
+            path.mkdir()
+        except FileExistsError:
+            return failed(f"{provider} launch destination appeared concurrently: {path}")
+        except OSError as exc:
+            return failed(f"{provider} launch destination creation failed: {path}: {exc}")
+        created.append((path, recursive))
+        created_snapshots[path] = path_snapshot(path)
+        return None
+
+    def materialize_harness() -> tuple[bool, str] | None:
+        harness = next(
+            item for item in manifest["capabilities"] if item["id"] == "screenshot-harness"
+        )
+        source_harness = source / "scripts" / "screenshots.mjs"
+        destination_scripts = destination / "scripts"
+        destination_harness = destination_scripts / "screenshots.mjs"
+        source_bytes = source_harness.read_bytes() if source_harness.is_file() else b""
+        pinned_digest = harness["sha256"]
+        if (
+            source_harness.is_symlink()
+            or hashlib.sha256(source_bytes).hexdigest() != pinned_digest
+        ):
+            return failed(f"{provider} source screenshot harness is not intact")
+        scripts_existed = destination_scripts.exists()
+        if destination_scripts.is_symlink() or (
+            scripts_existed and not destination_scripts.is_dir()
+        ):
+            return failed(f"{provider} launch screenshot harness directory is incompatible")
+        if not destination_harness.exists() and not destination_harness.is_symlink():
+            attempted("screenshot-harness")
+        if not scripts_existed:
+            if error := claim_directory(destination_scripts, recursive=False):
+                return error
+        if destination_harness.is_symlink() or (
+            destination_harness.exists() and not destination_harness.is_file()
+        ):
+            return failed(f"{provider} launch screenshot harness is occupied or incompatible")
+        if not destination_harness.exists():
+            try:
+                with destination_harness.open("xb") as stream:
+                    stream.write(source_bytes)
+            except (FileExistsError, OSError) as exc:
+                return failed(
+                    f"{provider} launch screenshot harness creation failed: {exc}"
+                )
+            created.append((destination_harness, True))
+            created_snapshots[destination_harness] = path_snapshot(destination_harness)
+            return None
+        try:
+            with destination_harness.open("r+b") as stream:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+                prior = stream.read()
+                prior_digest = hashlib.sha256(prior).hexdigest()
+                if prior_digest == pinned_digest:
+                    return None
+                if prior_digest not in frozenset(harness.get("known_old_sha256", ())):
+                    return failed(
+                        f"{provider} launch screenshot harness is occupied or drifted"
+                    )
+                attempted("screenshot-harness")
+                stream.seek(0)
+                stream.truncate()
+                stream.write(source_bytes)
+                stream.flush()
+                os.fsync(stream.fileno())
+                installed_stat = os.fstat(stream.fileno())
+                replaced_files.append((
+                    destination_harness, prior,
+                    (
+                        installed_stat.st_dev, installed_stat.st_ino,
+                        installed_stat.st_mode, pinned_digest,
+                    ),
+                ))
+        except OSError as exc:
+            return failed(f"{provider} launch screenshot harness refresh failed: {exc}")
+        return None
+
+    runtime_existed = False
+    if materialize_runtime:
+        runtime = manifest["playwright"]
+        status, detail = playwright_runtime_status(
+            source, version=runtime["version"], node_minimum=runtime["node_minimum"],
+            manifest=manifest, provider=provider,
+        )
+        if status != "ok":
+            return False, f"{provider} source Playwright runtime is not intact: {detail}"
+        if error := materialize_harness():
+            return error
+        drive = next(
+            (spec for spec in specs if spec["skill"] == "drive-local-webapp"), None
+        )
+        if drive is None:
+            return failed(f"{provider} launch runtime requires drive-local-webapp")
+        if destination_drive.is_symlink():
+            return failed(f"{provider} launch runtime destination is symlinked")
+        if destination_drive.exists() and skill_destination_status(
+            destination_drive, drive["files"]
+        ) != "ok":
+            return failed(
+                f"{provider} launch runtime destination skill is occupied or incompatible"
+            )
+        runtime_existed = destination_runtime.exists() or destination_runtime.is_symlink()
+        if runtime_existed:
+            status, detail = playwright_runtime_status(
+                destination, version=runtime["version"], node_minimum=runtime["node_minimum"],
+                manifest=manifest, provider=provider,
+            )
+            if status != "ok":
+                return failed(
+                    f"{provider} launch runtime destination is occupied or {status}: {detail}"
+                )
+
+    for spec, _source_skill, _target_skill in missing_skills:
+        attempted(spec["id"])
+    if materialize_runtime and not runtime_existed:
+        attempted("playwright")
+    if not provider_root_existed:
+        if error := claim_directory(destination_provider_root, recursive=False):
+            return error
+    if not skills_existed:
+        if error := claim_directory(destination_skills, recursive=False):
+            return error
     if (
         destination_provider_root.is_symlink()
         or destination_skills.is_symlink()
         or not _contained(destination_provider_root, destination)
         or not _contained(destination_skills, destination_provider_root)
     ):
-        return False, f"{provider} launch skill root is symlinked"
-    manifest = tomllib.loads(files("agentflow").joinpath("capabilities.toml").read_text())
-    for spec in manifest["capabilities"]:
-        name = spec.get("skill")
-        if not name or "version" not in spec:
-            continue
-        source_skill = source_skills / name
-        target_skill = destination_skills / name
-        if target_skill.exists() or target_skill.is_symlink():
-            continue
-        if skill_destination_status(source_skill, spec["files"]) != "ok":
-            return False, f"{provider} source skill {name} is not intact"
-        shutil.copytree(source_skill, target_skill)
-    return True, f"materialized missing {provider} capabilities into the launch root"
+        return failed(f"{provider} launch skill root is symlinked")
+
+    for spec, source_skill, target_skill in missing_skills:
+        if error := claim_directory(target_skill):
+            return error
+        try:
+            shutil.copytree(
+                source_skill, target_skill,
+                dirs_exist_ok=True,
+                **({"ignore": shutil.ignore_patterns("node_modules")}
+                   if spec["skill"] == "drive-local-webapp" else {}),
+            )
+        except (OSError, shutil.Error) as exc:
+            return failed(f"{provider} skill copy failed: {exc}")
+        created_snapshots[target_skill] = path_snapshot(target_skill)
+    if materialize_runtime and not runtime_existed:
+        if error := claim_directory(destination_runtime):
+            return error
+        try:
+            shutil.copytree(
+                source_runtime, destination_runtime, symlinks=True, dirs_exist_ok=True
+            )
+        except (OSError, shutil.Error) as exc:
+            return failed(f"{provider} Playwright runtime copy failed: {exc}")
+        created_snapshots[destination_runtime] = path_snapshot(destination_runtime)
+        tree_status, detail = runtime_tree_status(destination_runtime)
+        if tree_status != "ok":
+            return failed(f"{provider} copied Playwright runtime is incompatible: {detail}")
+    detail = f"materialized missing {provider} capabilities into the launch root"
+    audit("ready", detail)
+    return True, detail

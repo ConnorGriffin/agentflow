@@ -10,6 +10,7 @@ push a pool past its budget.
 
 from __future__ import annotations
 
+from copy import deepcopy
 import sqlite3
 import threading
 
@@ -18,13 +19,13 @@ import pytest
 from agentflow.coordinator import Coordinator
 from agentflow.coordinator.record import RUNNING, WAITING, Record
 from agentflow.coordinator.store import (
-    ReservationIntent, ReservationLimits, SCHEMA_VERSION, Store, StoreUnavailable,
+    LegacyReservationIntent, ReservationLimits, SCHEMA_VERSION, Store, StoreUnavailable,
     default_store_path)
 
 
 def intent(identity, *, token=None, revision=1, limits=None, budget=5):
-    return ReservationIntent(identity, token, revision, 100, "daemon-test", budget,
-                             limits, None)
+    return LegacyReservationIntent(identity, token, revision, 100, "daemon-test", budget,
+                                   limits, None)
 
 
 def test_default_store_lives_under_the_state_directory(coord_state):
@@ -51,21 +52,21 @@ def test_coordinator_begin_start_persists_waiting_then_uses_only_no_admission_in
     record.stall_refusal_id = ""
     record.stall_started_at = 0
     record.stall_last_observed_at = 0
-    reserve = coordinator._store.reserve
+    reserve = coordinator._store.reserve_legacy
     captured = []
 
     def observe(intent):
         captured.append(intent)
-        assert type(intent) is ReservationIntent
+        assert type(intent) is LegacyReservationIntent
         prepared = coordinator._store.record_of(record.identity)
         assert prepared == record
         assert prepared is not None and prepared.state == WAITING
         assert prepared.revision == 2 and prepared.launch_token == "prior-token"
         return reserve(intent)
 
-    monkeypatch.setattr(coordinator._store, "reserve", observe)
+    monkeypatch.setattr(coordinator._store, "reserve_legacy", observe)
     assert coordinator._begin_start(record, 100)
-    assert captured == [ReservationIntent(
+    assert captured == [LegacyReservationIntent(
         "compat", "prior-token", 2, 100, "daemon-compat", 5, None, None)]
     durable = coordinator._store.record_of("compat")
     assert durable == record and record.state == RUNNING
@@ -125,12 +126,12 @@ def test_hostile_gate_and_limits_mutations_cannot_change_waiting_authority_or_su
         descendants={"owned-child"})
     assert coordinator._store.upsert(record)
     coordinator._records[record.identity] = record
-    reserve = coordinator._store.reserve
+    reserve = coordinator._store.reserve_legacy
     captured = []
 
     def observe(intent):
         captured.append(intent)
-        assert type(intent) is ReservationIntent
+        assert type(intent) is LegacyReservationIntent
         durable = coordinator._store.record_of("authority")
         assert durable is not None
         assert _authoritative_gate_facts(durable) == (
@@ -142,11 +143,11 @@ def test_hostile_gate_and_limits_mutations_cannot_change_waiting_authority_or_su
             "authority", "owner/repo", "review", "codex", "prepared-model")
         return reserve(intent)
 
-    monkeypatch.setattr(coordinator._store, "reserve", observe)
+    monkeypatch.setattr(coordinator._store, "reserve_legacy", observe)
     assert coordinator._begin_start(record, 100)
 
     assert callback_inputs == [("gate", authoritative_facts), ("limits", authoritative_facts)]
-    assert captured == [ReservationIntent(
+    assert captured == [LegacyReservationIntent(
         "authority", "prepared-token", 2, 100, "daemon-authority", 5, limits, None)]
     successor = coordinator._store.record_of("authority")
     assert successor == record and successor is not None
@@ -224,6 +225,217 @@ def test_absent_store_is_created_versioned_and_round_trips(tmp_path):
     assert reopened.permits_used("claude") == 1
 
 
+def test_upsert_retries_a_transient_database_lock(tmp_path, monkeypatch):
+    monkeypatch.setattr("agentflow.coordinator.store._BUSY_TIMEOUT_MS", 5)
+    path = tmp_path / "coord.db"
+    store = Store(path)
+    competing_writer = sqlite3.connect(path, isolation_level=None)
+    attempts = []
+    competing_writer.execute("BEGIN IMMEDIATE")
+    backoffs = []
+
+    def observe_attempt(statement):
+        if statement == "BEGIN IMMEDIATE":
+            attempts.append(statement)
+
+    def release_for_retry(delay):
+        backoffs.append(delay)
+        competing_writer.execute("ROLLBACK")
+
+    store._conn.set_trace_callback(observe_attempt)
+    monkeypatch.setattr("agentflow.coordinator.store.time.sleep", release_for_retry)
+    try:
+        record = Record("retry", "review", "codex", 1)
+        assert store.upsert(record)
+        assert attempts == ["BEGIN IMMEDIATE", "BEGIN IMMEDIATE"]
+        assert backoffs == [0.1]
+        assert store.record_of(record.identity) == record
+    finally:
+        if competing_writer.in_transaction:
+            competing_writer.execute("ROLLBACK")
+        competing_writer.close()
+        store.close()
+
+
+def test_upsert_fails_closed_after_persistent_database_lock(tmp_path, monkeypatch):
+    monkeypatch.setattr("agentflow.coordinator.store._BUSY_TIMEOUT_MS", 5)
+    path = tmp_path / "coord.db"
+    store = Store(path)
+    competing_writer = sqlite3.connect(path, isolation_level=None)
+    attempts = []
+    store._conn.set_trace_callback(
+        lambda statement: attempts.append(statement) if statement == "BEGIN IMMEDIATE" else None)
+    competing_writer.execute("BEGIN IMMEDIATE")
+
+    try:
+        record = Record("locked", "review", "codex", 1)
+        with pytest.raises(StoreUnavailable, match="database is locked"):
+            store.upsert(record)
+        assert attempts == ["BEGIN IMMEDIATE", "BEGIN IMMEDIATE", "BEGIN IMMEDIATE"]
+        assert record.revision == 0
+        assert store.record_of(record.identity) is None
+    finally:
+        competing_writer.execute("ROLLBACK")
+        competing_writer.close()
+        store.close()
+
+
+def _hold_commit_lock(path):
+    reader = sqlite3.connect(path, isolation_level=None)
+    reader.execute("BEGIN")
+    reader.execute("SELECT data FROM records").fetchall()
+    return reader
+
+
+def test_upsert_restores_revision_before_retry_after_commit_lock(tmp_path, monkeypatch):
+    monkeypatch.setattr("agentflow.coordinator.store._BUSY_TIMEOUT_MS", 5)
+    path = tmp_path / "coord.db"
+    store = Store(path)
+    reader = _hold_commit_lock(path)
+    statements = []
+    backoffs = []
+    store._conn.set_trace_callback(statements.append)
+
+    def release_for_retry(delay):
+        backoffs.append(delay)
+        reader.execute("ROLLBACK")
+
+    monkeypatch.setattr("agentflow.coordinator.store.time.sleep", release_for_retry)
+    try:
+        record = Record("commit-retry", "review", "codex", 1)
+        assert store.upsert(record)
+        assert statements.count("BEGIN IMMEDIATE") == 2
+        assert statements.count("COMMIT") == 2
+        assert backoffs == [0.1]
+        assert record.revision == 1
+        assert store.record_of(record.identity) == record
+    finally:
+        if reader.in_transaction:
+            reader.execute("ROLLBACK")
+        reader.close()
+        store.close()
+
+
+def test_upsert_restores_revision_after_persistent_commit_lock(tmp_path, monkeypatch):
+    monkeypatch.setattr("agentflow.coordinator.store._BUSY_TIMEOUT_MS", 5)
+    path = tmp_path / "coord.db"
+    store = Store(path)
+    reader = _hold_commit_lock(path)
+    statements = []
+    backoffs = []
+    store._conn.set_trace_callback(statements.append)
+    monkeypatch.setattr("agentflow.coordinator.store.time.sleep", backoffs.append)
+
+    try:
+        record = Record("commit-locked", "review", "codex", 1)
+        with pytest.raises(StoreUnavailable, match="database is locked"):
+            store.upsert(record)
+        assert statements.count("BEGIN IMMEDIATE") == 3
+        assert statements.count("COMMIT") == 3
+        assert backoffs == [0.1, 0.3]
+        assert record.revision == 0
+        assert store.record_of(record.identity) is None
+    finally:
+        reader.execute("ROLLBACK")
+        reader.close()
+        store.close()
+
+
+def test_supersede_refuses_an_independently_occupied_successor_without_mutation(tmp_path):
+    store = Store(tmp_path / "coord.db")
+    predecessor = Record(
+        "owner/repo|7|build|-", "build", "codex", 5,
+        repo="owner/repo", subject="7", state=WAITING, claim=True,
+    )
+    occupied = Record(
+        "owner/repo|7|build|-|s1", "build", "codex", 5,
+        repo="owner/repo", subject="7", state=WAITING, claim=True,
+        source="independent-owner",
+    )
+    assert store.upsert(predecessor)
+    assert store.upsert(occupied)
+    before = deepcopy(store.load())
+
+    with pytest.raises(StoreUnavailable, match="successor is already occupied"):
+        store.submit(
+            Record(
+                occupied.identity, "build", "codex", 5,
+                repo="owner/repo", subject="7", state=WAITING, claim=True,
+                source="recovery-candidate",
+            ),
+            predecessor.identity,
+            supersede=True,
+        )
+
+    assert store.load() == before
+    store.close()
+
+
+def test_recovery_rerun_checks_immutable_successor_facts_inside_store_transaction(tmp_path):
+    store = Store(tmp_path / "coord.db")
+    predecessor = Record(
+        "owner/repo|7|build|-", "build", "codex", 5,
+        repo="owner/repo", subject="7", state="completed", claim=False, retired=True,
+        refusal="capability_environment_failure:incompatible",
+    )
+    successor = Record(
+        "owner/repo|7|build|-|s1", "build", "codex", 5,
+        repo="owner/repo", subject="7", state=WAITING, claim=True,
+        source="expected-source", resume=1,
+    )
+    assert store.upsert(predecessor)
+    assert store.upsert(successor)
+    before = deepcopy(store.load())
+
+    with pytest.raises(StoreUnavailable, match="successor is already occupied"):
+        store.submit(
+            Record(
+                successor.identity, "build", "codex", 5,
+                repo="owner/repo", subject="7", state=WAITING, claim=True,
+                source="conflicting-source", resume=1,
+            ),
+            predecessor.identity,
+            supersede=True,
+        )
+
+    assert store.load() == before
+    store.close()
+
+
+def test_recovery_rerun_accepts_an_exact_claim_owner_that_has_already_progressed(tmp_path):
+    store = Store(tmp_path / "coord.db")
+    predecessor = Record(
+        "owner/repo|7|build|-", "build", "codex", 5,
+        repo="owner/repo", subject="7", state="completed", claim=False, retired=True,
+        refusal="capability_environment_failure:incompatible",
+    )
+    successor = Record(
+        "owner/repo|7|build|-|s1", "build", "codex", 5,
+        repo="owner/repo", subject="7", state=RUNNING, claim=True,
+        source="expected-source", resume=1, attempts=2, attempt_committed=True,
+        launch_token="active-attempt", family="1234", process_alive=True,
+    )
+    assert store.upsert(predecessor)
+    assert store.upsert(successor)
+    before = deepcopy(store.load())
+
+    durable_successor, durable_predecessor, transferred, root = store.submit(
+        Record(
+            successor.identity, "build", "codex", 5,
+            repo="owner/repo", subject="7", state=WAITING, claim=True,
+            source="expected-source", resume=1,
+        ),
+        predecessor.identity,
+        supersede=True,
+    )
+
+    assert durable_successor == successor
+    assert durable_predecessor == predecessor
+    assert transferred is False and root is None
+    assert store.load() == before
+    store.close()
+
+
 def test_reserve_is_atomic_across_instances(tmp_path):
     """Many instances racing to reserve demand-2 reviews on one pool reserve at most two
     (four permits) between them — availability and the running write share one critical
@@ -242,7 +454,7 @@ def test_reserve_is_atomic_across_instances(tmp_path):
     def race(identity):
         store = Store(path)  # a distinct instance/connection per racer
         barrier.wait()
-        if store.reserve(intent(identity)) is not None:
+        if store.reserve_legacy(intent(identity)) is not None:
             with lock:
                 reserved.append(identity)
         store.close()
@@ -257,7 +469,7 @@ def test_reserve_is_atomic_across_instances(tmp_path):
     assert Store(path).permits_used("codex") == 4  # never over the five-permit budget
 
 
-def test_no_admission_same_store_mutations_serialize_outside_receipt_callback(
+def test_checkpoint_callback_blocks_concurrent_store_mutation(
         tmp_path, monkeypatch):
     path = tmp_path / "same-store.db"
     store = Store(path)
@@ -278,7 +490,7 @@ def test_no_admission_same_store_mutations_serialize_outside_receipt_callback(
 
     def first_reservation():
         try:
-            results["first"] = store.reserve(intent("A"))
+            results["first"] = store.reserve_legacy(intent("A"))
         except BaseException as error:
             errors.append(error)
 
@@ -287,28 +499,28 @@ def test_no_admission_same_store_mutations_serialize_outside_receipt_callback(
             attempting.set()
             results["upsert"] = store.upsert(
                 Record("C", "review", "codex", 1, state=WAITING))
-            results["second"] = store.reserve(intent("B"))
+            results["second"] = store.reserve_legacy(intent("B"))
         except BaseException as error:
             errors.append(error)
 
     first = threading.Thread(target=first_reservation)
     first.start()
     assert entered.wait(1)
-    assert not store._promotion_receipt_callback_active.is_set()
+    assert store._admission_callback_active.is_set()
     second = threading.Thread(target=serialized_operations)
     second.start()
     assert attempting.wait(1)
-    second.join(0.05)
-    assert second.is_alive()  # blocked on Store._lock, not immediately refused
+    second.join(1)
+    assert not second.is_alive()
     release.set()
     first.join(2)
     second.join(2)
     assert not first.is_alive() and not second.is_alive()
-    assert errors == []
-    assert results["upsert"] is True
-    assert results["first"] is not None and results["second"] is not None
-    assert store.record_of("C").state == WAITING
-    assert store.permits_used("codex") == 2
+    assert len(errors) == 1 and type(errors[0]) is StoreUnavailable
+    assert str(errors[0]) == "reentrant Store mutation during admission"
+    assert results["first"] is not None
+    assert store.record_of("C") is None
+    assert store.permits_used("codex") == 1
     store.close()
 
 
@@ -320,10 +532,10 @@ def test_reserve_refuses_a_foreign_running_reservation(tmp_path):
     store = Store(path)
     store.upsert(Record("R", "build", "claude", 1, state="waiting"))
 
-    winner = store.reserve(intent("R"))
+    winner = store.reserve_legacy(intent("R"))
     assert winner is not None
     # A racer that loaded the record while it was still waiting now tries its own reservation.
-    assert store.reserve(intent("R")) is None
+    assert store.reserve_legacy(intent("R")) is None
     assert store.record_of("R").launch_token == winner.successor.launch_token
     assert store.permits_used("claude") == 1           # exactly one running reservation
     store.close()
@@ -335,7 +547,7 @@ def test_reserve_never_overwrites_a_terminal_same_identity(tmp_path):
     store.upsert(Record("R", "intake", "claude", 1, state="completed",
                         launch_token="winner", outcome="route"))
 
-    assert store.reserve(intent("R")) is None
+    assert store.reserve_legacy(intent("R")) is None
     durable = store.record_of("R")
     assert durable.state == "completed" and durable.launch_token == "winner"
     assert durable.outcome == "route"
@@ -348,7 +560,7 @@ def test_reserve_requires_the_loaded_waiting_token_generation(tmp_path):
     store.upsert(Record("R", "review", "claude", 1, state="waiting",
                         launch_token="newer", attempts=1, eligible_at=100))
 
-    assert store.reserve(intent("R")) is None
+    assert store.reserve_legacy(intent("R")) is None
     durable = store.record_of("R")
     assert durable.attempts == 1 and durable.launch_token == "newer"
     assert durable.eligible_at == 100
@@ -371,7 +583,7 @@ def test_two_processes_racing_one_waiting_record_yield_one_reservation(tmp_path)
     def race(token):
         store = Store(path)  # a distinct instance/connection per process
         barrier.wait()
-        result = store.reserve(intent("R"))
+        result = store.reserve_legacy(intent("R"))
         with lock:
             results[token] = result
         store.close()
@@ -416,7 +628,7 @@ def test_global_stage_cap_is_atomic_across_pools(tmp_path):
     def race(record):
         store = Store(path)
         barrier.wait()
-        if store.reserve(intent(record.identity, limits=limits)) is not None:
+        if store.reserve_legacy(intent(record.identity, limits=limits)) is not None:
             with lock:
                 reserved.append(record.identity)
         store.close()
@@ -454,7 +666,7 @@ def test_machine_ceiling_is_atomic_across_stage_lanes_and_pools(tmp_path):
             lane_by_stage={"intake": "triage"},
         )
         barrier.wait()
-        if store.reserve(intent(record.identity, limits=limits)) is not None:
+        if store.reserve_legacy(intent(record.identity, limits=limits)) is not None:
             with lock:
                 reserved.append(record.identity)
         store.close()
@@ -519,13 +731,17 @@ def test_child_start_and_disown_are_mutually_exclusive(tmp_path):
     # The child wins the race: it records started before the coordinator gives up.
     store.upsert(Record("R-win", "review", "codex", 2, state="running", launch_token="T1"))
     assert store.child_start("R-win", "T1", 4242) is True
-    assert store.disown_launch("R-win", "T1") == (STARTED, "4242")
+    assert store.child_start("R-win", "T1", 4343) is False
+    assert store.child_provider_group("R-win", "T1", 4343, 4444) is False
+    assert store.child_provider_group("R-win", "T1", 4242, 4444) is True
+    assert store.disown_launch("R-win", "T1") == (STARTED, "4242:4444")
 
     # The timeout wins the race: disown rotates the token first, so an uncancelled child's
     # late guarded write is refused and no unreserved, uncounted provider can start.
     store.upsert(Record("R-lose", "review", "codex", 2, state="running", launch_token="T2"))
     assert store.disown_launch("R-lose", "T2") == (NOT_STARTED, None)
     assert store.child_start("R-lose", "T2", 5252) is False
+    assert store.child_provider_group("R-lose", "T2", 5252, 5353) is False
     reread = store.record_of("R-lose")
     assert reread.start_fact != STARTED and reread.family is None
 

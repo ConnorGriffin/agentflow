@@ -1,6 +1,9 @@
 """Explicit enrollment protects agentflow's working area from Git status."""
 
+from contextlib import contextmanager
+from hashlib import sha256
 import os
+import shutil
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +17,8 @@ from agentflow.enroll import (_audit_command, _converge_and_ship, _install_file,
                               main, newly_gated_prs, propose_surfaces, sync_fleet,
                               write_declaration)
 from agentflow.repo_facts import surface_declaration
+from agentflow.filesystem_contracts import skill_destination_status
+from agentflow.skill_ownership import mark_skill_owned, skill_ownership
 
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "enroll-standards.sh"
@@ -39,6 +44,468 @@ def _git_commit_all(repo: Path, message: str = "commit") -> None:
     subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
     subprocess.run(["git", "commit", "-q", "-m", message], cwd=repo, check=True,
                     capture_output=True)
+
+
+def test_connor_skill_materialization_records_only_agentflow_owned_destination(
+    tmp_path, monkeypatch
+):
+    """An identical hand-written skill directory has no AgentFlow provenance."""
+    from agentflow import enroll
+
+    managed = tmp_path / ".agents" / "skills" / "drive-local-webapp"
+    handwritten = tmp_path / ".agents" / "skills" / "handwritten"
+    skill = "---\nname: drive-local-webapp\n---\n"
+    manifest = [{"path": "SKILL.md", "sha256": sha256(skill.encode()).hexdigest()}]
+
+    def run(command, **_kwargs):
+        if command[0] == "npx":
+            managed.mkdir(parents=True)
+            (managed / "SKILL.md").write_text(skill)
+        stdout = "a" * 40 if command[-1] == "HEAD" else ""
+        return subprocess.CompletedProcess(command, 0, stdout, "")
+
+    monkeypatch.setattr(enroll, "_run_command", run)
+    monkeypatch.setattr(enroll, "_resolved_skill_release", lambda _manifest: ("a" * 40, None))
+    monkeypatch.setattr(enroll, "_normalize_skill_lock", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(enroll, "_skill_status", lambda *_args: "ok")
+    monkeypatch.setattr(enroll, "_wire_claude_skill", lambda *_args: "ok")
+    monkeypatch.setattr(
+        enroll,
+        "_manifest",
+        lambda: {
+            "connor_skills": {
+                "skills": ["drive-local-webapp"], "commit": "a" * 40,
+                "source": "https://example.test/skills.git", "tag": "v1",
+            },
+            "capabilities": [{"skill": "drive-local-webapp", "files": manifest}],
+            "skill_installer": {"package": "skills", "version": "1"},
+        },
+    )
+
+    assert enroll._install_connor_skills(tmp_path).startswith("DO:")
+    handwritten.mkdir(parents=True)
+    (handwritten / "SKILL.md").write_text(skill)
+
+    ownership = skill_ownership(managed)
+    assert ownership is not None
+    assert ownership["destination"] == ".agents/skills/drive-local-webapp"
+    assert skill_ownership(handwritten) is None
+    assert skill_destination_status(managed, manifest) == "ok"
+
+
+def test_connor_skill_wiring_records_the_same_pin_as_the_agents_destination(
+    tmp_path, monkeypatch
+):
+    """One skill, one enrollment run, one pin.
+
+    `_wire_claude_skill` used to default to the capability's `version` field when no pin
+    was passed, while `_install_connor_skills` recorded the resolved `connor_skills`
+    commit for the same skill's `.agents` destination — two different pins for one skill
+    in one run. The manifest here deliberately gives the capability a `version` that
+    differs from the resolved commit, so a pass would be impossible by accident.
+    """
+    from agentflow import enroll
+
+    pinned = "---\nname: drive-local-webapp\n---\n"
+    manifest = [{"path": "SKILL.md", "sha256": sha256(pinned.encode()).hexdigest()}]
+
+    def run(command, **kwargs):
+        if command[0] == "npx":
+            skill = Path(kwargs["cwd"]) / ".agents" / "skills" / "drive-local-webapp"
+            skill.mkdir(parents=True, exist_ok=True)
+            (skill / "SKILL.md").write_text(pinned)
+        stdout = "a" * 40 if command[-1] == "HEAD" else ""
+        return subprocess.CompletedProcess(command, 0, stdout, "")
+
+    monkeypatch.setattr(enroll, "_run_command", run)
+    monkeypatch.setattr(enroll, "_resolved_skill_release", lambda _manifest: ("a" * 40, None))
+    monkeypatch.setattr(enroll, "_normalize_skill_lock", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(enroll, "_skill_status", lambda *_args: "ok")
+    monkeypatch.setattr(
+        enroll,
+        "_manifest",
+        lambda: {
+            "connor_skills": {
+                "skills": ["drive-local-webapp"], "commit": "a" * 40,
+                "source": "https://example.test/skills.git", "tag": "v1",
+            },
+            "capabilities": [
+                {"skill": "drive-local-webapp", "files": manifest, "version": "v9.9.9"}
+            ],
+            "skill_installer": {"package": "skills", "version": "1"},
+        },
+    )
+
+    assert enroll._install_connor_skills(tmp_path).startswith("DO:")
+
+    agents_ownership = skill_ownership(tmp_path / ".agents" / "skills" / "drive-local-webapp")
+    claude_ownership = skill_ownership(tmp_path / ".claude" / "skills" / "drive-local-webapp")
+    assert agents_ownership is not None and claude_ownership is not None
+    assert agents_ownership["pin"] == claude_ownership["pin"] == "a" * 40
+
+
+def test_skill_ownership_survives_content_drift_but_not_a_symlink_swap(tmp_path):
+    """Provenance binds destination identity, not tree content.
+
+    Later drift of the tree (a human rewrite, or a stale checkout) does not strip
+    ownership; that's exactly the state repair exists to fix. Only a destination that
+    stops being a regular directory (e.g. an operator swaps in a symlink) invalidates
+    the marker.
+    """
+    destination = tmp_path / ".agents" / "skills" / "drive-local-webapp"
+    destination.mkdir(parents=True)
+    (destination / "SKILL.md").write_text("pinned\n")
+    mark_skill_owned(destination, "230e71a55ab07f0cd9beaa61649b583cb9d1bde1")
+
+    (destination / "SKILL.md").write_text("human rewrite\n")
+    ownership = skill_ownership(destination)
+    assert ownership is not None
+    assert ownership["pin"] == "230e71a55ab07f0cd9beaa61649b583cb9d1bde1"
+
+    shutil.rmtree(destination)
+    destination.symlink_to("elsewhere")
+    assert skill_ownership(destination) is None
+
+
+def test_enrollment_journal_preserves_unrelated_agentflow_state(tmp_path):
+    from agentflow.enroll import _enrollment_journal
+
+    state = tmp_path / ".agentflow"
+    lock = state / "enrollment.lock"
+    live = state / "worktrees" / "live"
+    live.mkdir(parents=True)
+    lock.write_text("lock\n")
+    inode = lock.stat().st_ino
+    (live / "state").write_text("running\n")
+    journal = _enrollment_journal(tmp_path)
+    marker = state / "skill-ownership" / "agents" / "drive-local-webapp.json"
+    marker.parent.mkdir(parents=True)
+    marker.write_text("marker\n")
+
+    journal.restore()
+
+    assert lock.read_text() == "lock\n"
+    assert lock.stat().st_ino == inode
+    assert (live / "state").read_text() == "running\n"
+    assert not marker.exists()
+    journal.close()
+
+
+def test_enrollment_journal_never_removes_a_preexisting_empty_agentflow_dir(tmp_path):
+    """A pre-existing `.agentflow` might be a concurrent repair's lock directory.
+
+    Rollback must never rmdir it out from under that repair, even once it looks empty
+    after the skill-ownership subtree is restored/removed.
+    """
+    from agentflow.enroll import _enrollment_journal
+
+    state = tmp_path / ".agentflow"
+    state.mkdir()
+    journal = _enrollment_journal(tmp_path)
+    marker = state / "skill-ownership" / "agents" / "drive-local-webapp.json"
+    marker.parent.mkdir(parents=True)
+    marker.write_text("marker\n")
+
+    journal.restore()
+
+    assert state.is_dir()
+    journal.close()
+
+
+def test_enrollment_journal_removes_an_agentflow_dir_it_created_once_empty(tmp_path):
+    from agentflow.enroll import _enrollment_journal
+
+    journal = _enrollment_journal(tmp_path)  # .agentflow is absent at start
+    marker = tmp_path / ".agentflow" / "skill-ownership" / "agents" / "drive-local-webapp.json"
+    marker.parent.mkdir(parents=True)
+    marker.write_text("marker\n")
+
+    journal.restore()
+
+    assert not (tmp_path / ".agentflow").exists()
+    journal.close()
+
+
+def test_skill_repair_refuses_a_destination_changed_to_symlink(tmp_path):
+    from agentflow.enroll import _replace_skill_tree
+
+    destination = tmp_path / ".agents" / "skills" / "drive-local-webapp"
+    destination.mkdir(parents=True)
+    (destination / "SKILL.md").write_text("drifted\n")
+    manifest = [{"path": "SKILL.md", "sha256": sha256(b"pinned\n").hexdigest()}]
+    mark_skill_owned(destination, "230e71a55ab07f0cd9beaa61649b583cb9d1bde1")
+    (destination / "SKILL.md").unlink()
+    destination.rmdir()
+    destination.symlink_to("operator-content")
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "SKILL.md").write_text("pinned\n")
+
+    assert _replace_skill_tree(destination, source, manifest).startswith("WARN:")
+    assert destination.is_symlink()
+
+
+def test_skill_repair_serializes_under_the_capability_repair_lock(tmp_path, monkeypatch):
+    """The stale-leftover sweep and the swap run under the repair lock.
+
+    It's the same lock `repair_capability_refusal` uses to serialize concurrent
+    coordinators sharing a root — otherwise the `.<name>-*` sweep can rmtree a
+    concurrent converge's in-flight temp dir.
+    """
+    from agentflow import enroll
+    from agentflow.enroll import _replace_skill_tree
+
+    destination = tmp_path / ".agents" / "skills" / "drive-local-webapp"
+    destination.mkdir(parents=True)
+    pinned = "---\nname: drive-local-webapp\n---\n"
+    (destination / "SKILL.md").write_text("drifted\n")
+    manifest = [{"path": "SKILL.md", "sha256": sha256(pinned.encode()).hexdigest()}]
+    mark_skill_owned(destination, "230e71a55ab07f0cd9beaa61649b583cb9d1bde1")
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "SKILL.md").write_text(pinned)
+
+    calls = []
+    original_lock = enroll._capability_repair_lock
+
+    @contextmanager
+    def spy(root):
+        calls.append(root)
+        with original_lock(root):
+            yield
+
+    monkeypatch.setattr(enroll, "_capability_repair_lock", spy)
+
+    assert _replace_skill_tree(destination, source, manifest).startswith("DO:")
+    assert calls == [tmp_path]
+
+
+def test_connor_skill_converge_repairs_owned_drifted_destination(tmp_path, monkeypatch):
+    """Convergence replaces an owned drifted destination with the pinned skill tree.
+
+    The marker is reached through the real install path — a first, unmocked call to
+    `_install_connor_skills` materializes the destination and writes it via production
+    code — then the tree is mutated afterward to simulate drift a human or a stale
+    checkout could produce. That sequence is the only one production code can reach;
+    hand-writing a marker onto already-drifted content (as this test used to) cannot
+    happen from any real call path.
+    """
+    from agentflow import enroll
+
+    pinned = "---\nname: drive-local-webapp\n---\n"
+    manifest = [{"path": "SKILL.md", "sha256": sha256(pinned.encode()).hexdigest()}]
+
+    def run(command, **kwargs):
+        if command[0] == "npx":
+            skill = Path(kwargs["cwd"]) / ".agents" / "skills" / "drive-local-webapp"
+            skill.mkdir(parents=True, exist_ok=True)
+            (skill / "SKILL.md").write_text(pinned)
+        stdout = "a" * 40 if command[-1] == "HEAD" else ""
+        return subprocess.CompletedProcess(command, 0, stdout, "")
+
+    monkeypatch.setattr(enroll, "_run_command", run)
+    monkeypatch.setattr(enroll, "_resolved_skill_release", lambda _manifest: ("a" * 40, None))
+    monkeypatch.setattr(enroll, "_normalize_skill_lock", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(enroll, "_skill_status", lambda *_args: "ok")
+    monkeypatch.setattr(enroll, "_wire_claude_skill", lambda *_args: "ok")
+    monkeypatch.setattr(
+        enroll,
+        "_manifest",
+        lambda: {
+            "connor_skills": {
+                "skills": ["drive-local-webapp"], "commit": "a" * 40,
+                "source": "https://example.test/skills.git", "tag": "v1",
+            },
+            "capabilities": [{"skill": "drive-local-webapp", "files": manifest}],
+            "skill_installer": {"package": "skills", "version": "1"},
+        },
+    )
+
+    # Materialize through the real install path: production code writes the marker.
+    assert enroll._install_connor_skills(tmp_path).startswith("DO:")
+    destination = tmp_path / ".agents" / "skills" / "drive-local-webapp"
+    assert skill_ownership(destination) is not None
+    assert skill_destination_status(destination, manifest) == "ok"
+
+    # Simulate drift after the fact — content diverges, identity and ownership do not.
+    (destination / "SKILL.md").write_text("local edits\n")
+    assert skill_destination_status(destination, manifest) == "drifted"
+    assert skill_ownership(destination) is not None
+
+    monkeypatch.setattr(
+        enroll,
+        "_public_skill_destination_states",
+        lambda *_args: {
+            (".agents/skills", "drive-local-webapp"): "drifted",
+            (".claude/skills", "drive-local-webapp"): "ok",
+        },
+    )
+
+    assert enroll._install_connor_skills(tmp_path, converge=True).startswith("DO:")
+    assert skill_destination_status(destination, manifest) == "ok"
+    assert skill_ownership(destination) is not None
+
+
+def test_connor_skill_converge_repairs_after_a_pin_bump(tmp_path, monkeypatch):
+    """A marker recorded under an old pin still proves ownership after a pin bump.
+
+    Repair fires for the fleet-wide scenario it exists for — every repo's marker
+    outliving the next pin bump — not just a byte-identical pin.
+    """
+    from agentflow import enroll
+
+    state = {
+        "commit": "a" * 40,
+        "pinned": "---\nname: drive-local-webapp\nrelease: old\n---\n",
+        "manifest": None,
+    }
+    state["manifest"] = [
+        {"path": "SKILL.md", "sha256": sha256(state["pinned"].encode()).hexdigest()}
+    ]
+
+    def run(command, **kwargs):
+        if command[0] == "npx":
+            skill = Path(kwargs["cwd"]) / ".agents" / "skills" / "drive-local-webapp"
+            skill.mkdir(parents=True, exist_ok=True)
+            (skill / "SKILL.md").write_text(state["pinned"])
+        stdout = state["commit"] if command[-1] == "HEAD" else ""
+        return subprocess.CompletedProcess(command, 0, stdout, "")
+
+    monkeypatch.setattr(enroll, "_run_command", run)
+    monkeypatch.setattr(enroll, "_resolved_skill_release", lambda _manifest: (state["commit"], None))
+    monkeypatch.setattr(enroll, "_normalize_skill_lock", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(enroll, "_skill_status", lambda *_args: "ok")
+    monkeypatch.setattr(enroll, "_wire_claude_skill", lambda *_args: "ok")
+    monkeypatch.setattr(
+        enroll,
+        "_manifest",
+        lambda: {
+            "connor_skills": {
+                "skills": ["drive-local-webapp"], "commit": state["commit"],
+                "source": "https://example.test/skills.git", "tag": "v1",
+            },
+            "capabilities": [{"skill": "drive-local-webapp", "files": state["manifest"]}],
+            "skill_installer": {"package": "skills", "version": "1"},
+        },
+    )
+
+    assert enroll._install_connor_skills(tmp_path).startswith("DO:")
+    destination = tmp_path / ".agents" / "skills" / "drive-local-webapp"
+    before = skill_ownership(destination)
+    assert before is not None and before["pin"] == "a" * 40
+
+    # Bump the pin: a new commit and new pinned content, exactly what a fleet-wide skill
+    # release would do to every enrolled repo's marker.
+    state["commit"] = "b" * 40
+    state["pinned"] = "---\nname: drive-local-webapp\nrelease: new\n---\n"
+    state["manifest"] = [
+        {"path": "SKILL.md", "sha256": sha256(state["pinned"].encode()).hexdigest()}
+    ]
+    (destination / "SKILL.md").write_text("stale content from the old pin\n")
+    assert skill_destination_status(destination, state["manifest"]) == "drifted"
+    assert skill_ownership(destination) is not None  # still owned across the pin bump
+
+    monkeypatch.setattr(
+        enroll,
+        "_public_skill_destination_states",
+        lambda *_args: {
+            (".agents/skills", "drive-local-webapp"): "drifted",
+            (".claude/skills", "drive-local-webapp"): "ok",
+        },
+    )
+
+    assert enroll._install_connor_skills(tmp_path, converge=True).startswith("DO:")
+    assert skill_destination_status(destination, state["manifest"]) == "ok"
+    after = skill_ownership(destination)
+    assert after is not None and after["pin"] == "b" * 40
+
+
+def test_connor_skill_converge_leaves_unowned_drifted_destination_unchanged(
+    tmp_path, monkeypatch
+):
+    from agentflow import enroll
+
+    destination = tmp_path / ".agents" / "skills" / "drive-local-webapp"
+    destination.mkdir(parents=True)
+    (destination / "SKILL.md").write_text("local edits\n")
+    monkeypatch.setattr(enroll, "_normalize_skill_lock", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        enroll,
+        "_public_skill_destination_states",
+        lambda *_args: {
+            (".agents/skills", "drive-local-webapp"): "drifted",
+            (".claude/skills", "drive-local-webapp"): "ok",
+        },
+    )
+    monkeypatch.setattr(
+        enroll,
+        "_manifest",
+        lambda: {
+            "connor_skills": {
+                "skills": ["drive-local-webapp"], "commit": "a" * 40,
+                "source": "https://example.test/skills.git", "tag": "v1",
+            },
+            "capabilities": [{"skill": "drive-local-webapp", "files": []}],
+        },
+    )
+    monkeypatch.setattr(enroll, "_run_command", lambda *_args, **_kwargs: pytest.fail("ran"))
+
+    assert "partial or conflicting" in enroll._install_connor_skills(tmp_path, converge=True)
+    assert (destination / "SKILL.md").read_text() == "local edits\n"
+
+
+@pytest.mark.parametrize("owned", [False, True])
+def test_connor_skill_converge_leaves_incompatible_destination_unchanged(
+    tmp_path, monkeypatch, owned
+):
+    from agentflow import enroll
+
+    destination = tmp_path / ".agents" / "skills" / "drive-local-webapp"
+    destination.mkdir(parents=True)
+    manifest = []
+    if owned:
+        mark_skill_owned(destination, "230e71a55ab07f0cd9beaa61649b583cb9d1bde1")
+    destination.rmdir()
+    destination.symlink_to("elsewhere")
+    monkeypatch.setattr(enroll, "_normalize_skill_lock", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        enroll,
+        "_public_skill_destination_states",
+        lambda *_args: {
+            (".agents/skills", "drive-local-webapp"): "incompatible",
+            (".claude/skills", "drive-local-webapp"): "ok",
+        },
+    )
+    monkeypatch.setattr(
+        enroll,
+        "_manifest",
+        lambda: {
+            "connor_skills": {
+                "skills": ["drive-local-webapp"], "commit": "a" * 40,
+                "source": "https://example.test/skills.git", "tag": "v1",
+            },
+            "capabilities": [{"skill": "drive-local-webapp", "files": manifest}],
+        },
+    )
+    monkeypatch.setattr(enroll, "_run_command", lambda *_args, **_kwargs: pytest.fail("ran"))
+
+    assert "partial or conflicting" in enroll._install_connor_skills(tmp_path, converge=True)
+    assert destination.is_symlink()
+
+
+def test_claude_skill_materialization_records_its_own_destination_marker(tmp_path):
+    from agentflow import enroll
+
+    source = tmp_path / ".agents" / "skills" / "ui-craft"
+    source.mkdir(parents=True)
+    (source / "SKILL.md").write_text("pinned\n")
+
+    assert enroll._wire_claude_skill(tmp_path, "ui-craft").startswith("DO:")
+    assert skill_ownership(source) is None
+    ownership = skill_ownership(tmp_path / ".claude" / "skills" / "ui-craft")
+    assert ownership is not None
+    assert ownership["pin"]
+    assert ownership["destination"] == ".claude/skills/ui-craft"
 
 
 def _enroll(repo: Path, *, apply: bool) -> subprocess.CompletedProcess:
@@ -104,7 +571,18 @@ def test_enrollment_preserves_existing_ignore_content(tmp_path):
     _enroll(tmp_path, apply=True)
 
     assert ignore.read_text() == ".venv/\n*.log\n.agentflow/\n"
-    assert ignore.with_name(".gitignore.pre-agentflow").read_text() == ".venv/\n*.log\n"
+    assert not ignore.with_name(".gitignore.pre-agentflow").exists()
+
+
+def test_enrollment_preserves_a_preexisting_gitignore_backup(tmp_path):
+    ignore = tmp_path / ".gitignore"
+    backup = tmp_path / ".gitignore.pre-agentflow"
+    ignore.write_text(".venv/\n")
+    backup.write_text("user backup\n")
+
+    _enroll(tmp_path, apply=True)
+
+    assert backup.read_text() == "user backup\n"
 
 
 def test_repeated_enrollment_adds_agentflow_rule_exactly_once(tmp_path):
@@ -292,6 +770,80 @@ def test_audit_names_a_repo_whose_headless_answer_its_checkout_contradicts(tmp_p
 
     assert report[-1].endswith("o/seeded")
     assert "o/genuine" not in report[-1]
+
+
+class TestWorkflowPolicyAudit:
+    """The fleet census reports CI drift without taking ownership of its workflows."""
+
+    @staticmethod
+    def _audit(repo: Path) -> list[str]:
+        return audit_lines([SimpleNamespace(repo="o/project", workdir=str(repo))])
+
+    @staticmethod
+    def _workflow(repo: Path, name: str, contents: str) -> None:
+        path = repo / ".github" / "workflows" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(contents)
+
+    def test_a_valid_pull_request_only_cancellation_policy_passes(self, tmp_path):
+        self._workflow(
+            tmp_path,
+            "check.yml",
+            """on:\n  pull_request:\n\nconcurrency:\n  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}\n  cancel-in-progress: ${{ github.event_name == 'pull_request' }}\n""",
+        )
+
+        assert not [line for line in self._audit(tmp_path) if "WARN:" in line]
+
+    def test_missing_concurrency_on_a_pull_request_workflow_is_reported(self, tmp_path):
+        self._workflow(tmp_path, "check.yml", "on:\n  pull_request:\n")
+
+        report = self._audit(tmp_path)
+
+        assert any("check.yml: pull-request workflow has no top-level concurrency" in line
+                   for line in report)
+        assert "0 declared / 1 undeclared" in report
+
+    def test_blanket_cancellation_on_a_main_publish_workflow_is_reported(self, tmp_path):
+        self._workflow(
+            tmp_path,
+            "release.yml",
+            """on:\n  pull_request:\n  push:\n    branches: [main]\n\nconcurrency:\n  group: release-${{ github.ref }}\n  cancel-in-progress: true\n\njobs:\n  publish:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm publish\n""",
+        )
+
+        report = self._audit(tmp_path)
+
+        assert any("release.yml: main publish can be cancelled" in line for line in report)
+        assert any("npm publish" in line for line in report)
+
+    def test_multiple_pull_request_workflows_are_evaluated_independently(self, tmp_path):
+        self._workflow(
+            tmp_path,
+            "check.yml",
+            """on: pull_request\n\nconcurrency:\n  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}\n  cancel-in-progress: ${{ github.event_name == 'pull_request' }}\n""",
+        )
+        self._workflow(tmp_path, "lint.yml", "on: pull_request\n")
+
+        report = self._audit(tmp_path)
+
+        assert not any("check.yml:" in line and "WARN:" in line for line in report)
+        assert any("lint.yml: pull-request workflow has no top-level concurrency" in line
+                   for line in report)
+
+    def test_a_push_only_workflow_is_exempt_from_the_pull_request_requirement(self, tmp_path):
+        self._workflow(tmp_path, "release.yml", "on:\n  push:\n    branches: [main]\n")
+
+        assert not [line for line in self._audit(tmp_path) if "WARN:" in line]
+
+    def test_the_workflow_audit_performs_no_writes(self, tmp_path):
+        self._workflow(tmp_path, "check.yml", "on:\n  pull_request:\n")
+        before = {path.relative_to(tmp_path): path.read_bytes() for path in tmp_path.rglob("*")
+                  if path.is_file()}
+
+        self._audit(tmp_path)
+
+        after = {path.relative_to(tmp_path): path.read_bytes() for path in tmp_path.rglob("*")
+                 if path.is_file()}
+        assert after == before
 
 
 class TestTheImpactPreviewNamesThisCheckoutsOwnRepo:
@@ -634,6 +1186,118 @@ class TestEnrollSync:
         assert "1 converged / 0 already current / 0 failed / 0 skipped (dirty)" in out
         assert exit_code == 0
 
+    def test_sync_apply_commits_every_converged_enrollment_write(
+            self, tmp_path, monkeypatch, capsys):
+        repo = tmp_path / "repo"
+        _git_init(repo, origin="git@github.com:o/repo.git")
+        skill = repo / ".agents" / "skills" / "agentflow" / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text("stale content\n")
+        claude_skill = repo / ".claude" / "skills"
+        claude_skill.mkdir(parents=True)
+        (claude_skill / "agentflow").symlink_to(Path("../../.agents/skills/agentflow"))
+        _git_commit_all(repo, "drifted enrollment artifact")
+        config = tmp_path / "config.toml"
+        config.write_text(f'[[repositories]]\nrepo = "o/repo"\nworkdir = "{repo}"\n')
+        monkeypatch.setenv("AGENTFLOW_CONFIG", str(config))
+        monkeypatch.setattr("agentflow.enroll._tooling_problem", lambda _surfaces: None)
+        monkeypatch.setattr(
+            "agentflow.enroll._install_methodology_skills",
+            lambda _root: "ok:   methodology contracts supplied by focused fixture",
+        )
+        monkeypatch.setattr(
+            "agentflow.enroll.doctor",
+            lambda _root: SimpleNamespace(
+                ready=True,
+                capabilities=(SimpleNamespace(
+                    id="codebase-memory", available=True, install=None, required=False,
+                ),),
+            ),
+        )
+        monkeypatch.setattr("agentflow.enroll._repo_drift",
+                            lambda _root: (["agentflow-skill: drifted"], []))
+        cfg = SimpleNamespace(repo="o/repo", workdir=str(repo))
+        monkeypatch.setattr(
+            "agentflow.enroll._run_command",
+            lambda command, **_kwargs: (
+                subprocess.CompletedProcess(command, 0, "", "")
+                if "push" in command else subprocess.run(command, capture_output=True, text=True)
+            ),
+        )
+        monkeypatch.setattr(
+            "agentflow.github.create_pr",
+            lambda _repo, **_kwargs: github.IssueCreation(url="https://example.test/pr/1"),
+        )
+
+        assert sync_fleet([cfg], apply=True) == 0
+
+        assert "DO:   converged o/repo" in capsys.readouterr().out
+        committed = subprocess.run(
+            ["git", "-C", str(repo), "show", "--format=", "--name-only", _SYNC_BRANCH],
+            check=True, capture_output=True, text=True,
+        ).stdout.splitlines()
+        assert set(committed) == {
+            ".agents/skills/agentflow/SKILL.md",
+            ".claude/skills/agentflow",
+            ".claude/skills/agentflow/SKILL.md",
+            ".gitignore",
+            "AGENTS.md",
+            "CLAUDE.md",
+        }
+
+    def test_sync_apply_reports_uncommitted_enrollment_writes(
+            self, tmp_path, monkeypatch, capsys):
+        repo = tmp_path / "repo"
+        _git_init(repo, origin="git@github.com:o/repo.git")
+        skill = repo / ".agents" / "skills" / "agentflow" / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text("stale content\n")
+        claude_skill = repo / ".claude" / "skills"
+        claude_skill.mkdir(parents=True)
+        (claude_skill / "agentflow").symlink_to(Path("../../.agents/skills/agentflow"))
+        _git_commit_all(repo, "drifted enrollment artifact")
+        config = tmp_path / "config.toml"
+        config.write_text(f'[[repositories]]\nrepo = "o/repo"\nworkdir = "{repo}"\n')
+        monkeypatch.setenv("AGENTFLOW_CONFIG", str(config))
+        monkeypatch.setattr("agentflow.enroll._tooling_problem", lambda _surfaces: None)
+        monkeypatch.setattr(
+            "agentflow.enroll._install_methodology_skills",
+            lambda _root: "ok:   methodology contracts supplied by focused fixture",
+        )
+        monkeypatch.setattr(
+            "agentflow.enroll.doctor",
+            lambda _root: SimpleNamespace(
+                ready=True,
+                capabilities=(SimpleNamespace(
+                    id="codebase-memory", available=True, install=None, required=False,
+                ),),
+            ),
+        )
+        monkeypatch.setattr("agentflow.enroll._repo_drift",
+                            lambda _root: (["agentflow-skill: drifted"], []))
+        cfg = SimpleNamespace(repo="o/repo", workdir=str(repo))
+        staged = False
+
+        def fake_run(command, **_kwargs):
+            nonlocal staged
+            if command[-2:] == ["add", "-A"]:
+                staged = True
+            if staged and command[-2:] == ["status", "--porcelain"]:
+                branch = subprocess.run(
+                    ["git", "-C", str(repo), "branch", "--show-current"],
+                    check=True, capture_output=True, text=True,
+                ).stdout.strip()
+                if branch == _SYNC_BRANCH:
+                    return subprocess.CompletedProcess(command, 0, "?? AGENTS.md\n", "")
+            return subprocess.run(command, capture_output=True, text=True)
+
+        monkeypatch.setattr("agentflow.enroll._run_command", fake_run)
+
+        assert sync_fleet([cfg], apply=True) == 1
+
+        assert "WARN: o/repo failed to converge — enrollment did not converge — " \
+               "uncommitted paths: AGENTS.md" in capsys.readouterr().out
+
 
 class TestConvergeAndShip:
     """The per-repo apply/commit/push/PR sequence 4.3 point 4 describes."""
@@ -662,6 +1326,70 @@ class TestConvergeAndShip:
             ["git", "-C", str(repo), "log", "-1", "--format=%B", _SYNC_BRANCH],
             check=True, capture_output=True, text=True).stdout
         assert "Signed-off-by: Tester <tester@example.com>" in log
+
+    def test_converge_commits_every_enrollment_write(self, tmp_path, monkeypatch):
+        repo = tmp_path / "repo"
+        _git_init(repo)
+
+        def converge_apply(*_args, **_kwargs):
+            (repo / ".agents" / "skills" / "agentflow").mkdir(parents=True)
+            (repo / ".agents" / "skills" / "agentflow" / "SKILL.md").write_text("skill\n")
+            (repo / ".claude" / "skills" / "agentflow").mkdir(parents=True)
+            (repo / ".claude" / "skills" / "agentflow" / "SKILL.md").write_text("skill\n")
+            (repo / ".gitignore").write_text(".agentflow/\n")
+            (repo / "skills-lock.json").write_text('{"skills": {}}\n')
+            return SimpleNamespace(ready=True)
+
+        monkeypatch.setattr("agentflow.enroll.enroll_repository", converge_apply)
+
+        def fake_run(command, **_kwargs):
+            if "push" in command:
+                return subprocess.CompletedProcess(command, 0, "", "")
+            return subprocess.run(command, capture_output=True, text=True)
+
+        monkeypatch.setattr("agentflow.enroll._run_command", fake_run)
+        monkeypatch.setattr(
+            "agentflow.github.create_pr",
+            lambda _repo, **_kwargs: github.IssueCreation(url="https://example.test/pr/1"),
+        )
+
+        ok, detail = _converge_and_ship(repo, "o/repo")
+
+        assert ok is True
+        assert detail == "https://example.test/pr/1"
+        committed = subprocess.run(
+            ["git", "-C", str(repo), "show", "--format=", "--name-only", _SYNC_BRANCH],
+            check=True, capture_output=True, text=True,
+        ).stdout.splitlines()
+        assert committed == [
+            ".agents/skills/agentflow/SKILL.md",
+            ".claude/skills/agentflow/SKILL.md",
+            ".gitignore",
+            "skills-lock.json",
+        ]
+
+    def test_converge_refuses_to_report_success_with_uncommitted_writes(
+            self, tmp_path, monkeypatch):
+        repo = tmp_path / "repo"
+        _git_init(repo)
+        skill = repo / ".agents" / "skills" / "agentflow" / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text("content\n")
+        monkeypatch.setattr(
+            "agentflow.enroll.enroll_repository", lambda *_args, **_kwargs: SimpleNamespace(ready=True)
+        )
+
+        def fake_run(command, **_kwargs):
+            if command[-2:] == ["status", "--porcelain"]:
+                return subprocess.CompletedProcess(command, 0, "?? AGENTS.md\n", "")
+            return subprocess.run(command, capture_output=True, text=True)
+
+        monkeypatch.setattr("agentflow.enroll._run_command", fake_run)
+
+        ok, detail = _converge_and_ship(repo, "o/repo")
+
+        assert ok is False
+        assert detail == "enrollment did not converge — uncommitted paths: AGENTS.md"
 
     def test_a_failing_gh_pr_create_is_reported_as_a_failure(self, tmp_path, monkeypatch):
         repo = tmp_path / "repo"

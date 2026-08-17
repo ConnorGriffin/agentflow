@@ -1,10 +1,10 @@
-"""The reviewed five-permit admission matrix (ADR 0029), owned once.
+"""The reviewed admission matrix (ADR 0029), owned once.
 
-This is the single source of truth for how many of a pool's five permits one provider
+This is the single source of truth for how many of a pool's permits one provider
 attempt reserves. The coordinator turns these demands, together with the independent
 gates, into an atomic reservation on the running-record ledger. The numbers are
-production configuration: a change requires a reviewed PR with updated evidence, not a
-runtime override (ADR 0029). Tests may inject alternative maps, but never weaken these.
+production configuration, except the pool budget may be set when the daemon starts.
+Tests may inject alternative maps, but never weaken these.
 
 The matrix is pure data plus one lookup, so it is exercised directly without any
 coordinator, store, or provider (see tests/test_coordinator_admission.py).
@@ -15,9 +15,9 @@ from __future__ import annotations
 import os
 from types import MappingProxyType
 
-# Each pool has an independent five-permit budget; a session reserves its whole demand
+# Each pool has an independent permit budget; a session reserves its whole demand
 # atomically. Every stage gets one initial attempt plus at most two continuations.
-PERMIT_BUDGET = 5
+PERMIT_BUDGET = int(os.environ.get("AGENTFLOW_PERMIT_BUDGET", "5"))
 ATTEMPT_BUDGET = 3
 
 # The machine ceiling and the per-stage caps the composed admission gate evaluates alongside the
@@ -50,7 +50,7 @@ PR_BOUND = frozenset({"review", "revise", "respond"})
 
 # Stages whose subject is an issue with no PR yet — they create new work. At the reservation
 # gate one of these must defer while any PR-bound stage is waiting to start on the same pool,
-# so a single high-effort build cannot seize all five permits and starve a review that needs
+# so a single high-effort build cannot seize the whole budget and starve a review that needs
 # one (#293, ADR 0039). Converse/research run in their own capped lanes and are out of scope.
 ISSUE_BOUND = frozenset({"build", "mockup", "intake", "attack"})
 
@@ -85,7 +85,7 @@ _STAGE_ALIASES = {
 }
 
 # The exact reviewed rows from ADR 0029. Any known-pool row that is missing falls back to
-# the full five permits (exclusive fallback); an unknown pool has no ledger to charge.
+# the full pool budget (exclusive fallback); an unknown pool has no ledger to charge.
 _ADMISSION_ROWS = {
     ("intake", "claude", "opus", "deep", None): 1,
     ("intake", "codex", "sol", "deep", None): 1,
@@ -178,7 +178,7 @@ def normalize_stage(stage: str) -> str:
 def admission_demand(stage, pool, model, complexity, effort=None):
     """The permits one attempt reserves on ``pool``. ``None`` means the pool itself is
     unknown, so there is no budget to charge and the attempt is inadmissible. A known pool
-    with no exact row reserves all five (exclusive fallback). Effort affects Build only;
+    with no exact row reserves the full pool budget (exclusive fallback). Effort affects Build only;
     effort-blind stages discard any supplied value before exact matching."""
     if pool not in {"claude", "codex"}:
         return None

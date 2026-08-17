@@ -49,6 +49,8 @@ REVIEW_VERDICT_SCHEMA = {
             "combined", "product", "standards", "fix", "decision"]},
         "change_author_tool": {"type": "string", "enum": ["claude", "codex"]},
         "checks": {"type": "array", "items": {"type": "string"}},
+        "ui_verification": {"type": "string", "enum": [
+            "not_required", "passed", "unavailable"]},
         "decision": {"type": "string"},
         "follow_ups": {
             "type": "array", "maxItems": 1,
@@ -74,8 +76,11 @@ REVIEW_VERDICT_SCHEMA = {
                     "line": {"type": "integer"},
                     "summary": {"type": "string"},
                     "grounding": {"type": "string"},
+                    "failure_class": {"type": "string", "enum": [
+                        "fix_introduced_defect", "original_defect", "plan_gap",
+                        "reviewer_false_claim", "slice_scope_error", "speculative_preference"]},
                 },
-                "required": ["action", "file", "line", "summary", "grounding"],
+                "required": ["action", "file", "line", "summary", "grounding", "failure_class"],
             },
         },
         "uncertainty": {
@@ -94,7 +99,7 @@ REVIEW_VERDICT_SCHEMA = {
     },
     "required": ["verdict", "depth", "depth_reason", "axis", "change_author_tool",
                  "reviewed_sha", "final_sha", "pushed_sha", "fixes", "follow_ups",
-                 "checks", "decision", "findings", "uncertainty"],
+                 "checks", "ui_verification", "decision", "findings", "uncertainty"],
 }
 
 

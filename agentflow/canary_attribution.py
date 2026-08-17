@@ -1,8 +1,9 @@
-"""Store-owned, append-only attribution for already-active canary routing.
+"""Store-owned attribution for already-active canary routing.
 
 Canary attribution observes authority selected by OperationalSafety.  It never selects a
 RouteCell, changes routing, or owns a transaction.  The coordinator Store constructs the
 single owner, supplies durable Record facts, and commits the attribution with its successor.
+Rows are append-only except at ADR 627's atomic never-started reservation retirement boundary.
 """
 
 from __future__ import annotations
@@ -72,6 +73,26 @@ CANARY_ATTRIBUTION_SCHEMA_STATEMENTS = (
     ("v2-to-v3:create:no-update-trigger", _NO_UPDATE_SCHEMA),
     ("v2-to-v3:create:no-delete-trigger", _NO_DELETE_SCHEMA),
 )
+
+
+def rollback_never_started_canary_attribution(
+        conn: sqlite3.Connection, stage_identity: str,
+) -> None:
+    """Remove one attribution after its provider launch proved never started.
+
+    The caller owns the transaction that also removes the coordinator record. SQLite has no
+    statement-scoped bypass for an unconditional delete trigger, so this owner must suspend and
+    restore its own trigger inside that transaction. SQLite's transactional DDL restores the
+    trigger with the row if any later step rolls back.
+    """
+    if not conn.in_transaction:
+        raise sqlite3.OperationalError(
+            "never-started canary attribution rollback requires an active transaction")
+    conn.execute("DROP TRIGGER canary_attributions_no_delete")
+    conn.execute(
+        "DELETE FROM canary_attributions WHERE stage_identity = ?", (stage_identity,))
+    conn.execute(_NO_DELETE_SCHEMA)
+
 
 # Exact coordinator Store schema-v2 migration source at #585 merge bd818fa.  Store compares
 # canonical sqlite_master bytes before any v3 DDL is allowed to run.
@@ -295,7 +316,6 @@ class CanaryAttributionAuthority:
         self._lock = getattr(store, "_lock")
         self._operational_safety = operational_safety
         self._promotion_receipts = promotion_receipts
-        self._promotion_receipt_callback = getattr(store, "_promotion_receipt_callback")
 
     def _participate_in_admission(self, context: _AdmissionContext) -> _CanaryAdmissionResult:
         existing = self._row(context.stage_identity)
@@ -328,7 +348,7 @@ class CanaryAttributionAuthority:
         }
         attribution = CanaryAttribution(
             **facts, attribution_digest=_digest({"domain": ROW_DIGEST_DOMAIN, **facts}))
-        _validate_attribution(attribution)
+        validate_canary_attribution(attribution)
         try:
             self._conn.execute(
                 "INSERT INTO canary_attributions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -356,15 +376,14 @@ class CanaryAttributionAuthority:
             return None
         try:
             attribution = CanaryAttribution(*row)
-            _validate_attribution(attribution)
+            validate_canary_attribution(attribution)
         except (TypeError, ValueError, CanaryAttributionRefused) as error:
             raise CanaryAttributionRefused("corrupt_attribution") from error
         return attribution
 
     def _receipt(self, receipt_id: str) -> PromotionReceipt:
         try:
-            with self._promotion_receipt_callback():
-                return self._promotion_receipts.read(receipt_id)
+            return self._promotion_receipts.read(receipt_id)
         except KeyError as error:
             raise CanaryAttributionRefused("missing_receipt") from error
         except EvidenceError as error:
@@ -446,6 +465,17 @@ def _receipt_binding_source(receipt: PromotionReceipt, state: CanaryState) -> di
             "generation": state.generation,
         },
     }
+
+
+def validate_canary_attribution(value: object) -> CanaryAttribution:
+    """Validate one content-free attribution row without reading or mutating its owner."""
+    if type(value) is not CanaryAttribution:
+        raise CanaryAttributionRefused("corrupt_attribution")
+    try:
+        _validate_attribution(value)
+    except (TypeError, ValueError) as error:
+        raise CanaryAttributionRefused("corrupt_attribution") from error
+    return value
 
 
 def _validate_attribution(value: CanaryAttribution) -> None:

@@ -10,11 +10,14 @@ from dataclasses import asdict, dataclass
 from hashlib import sha256
 import json
 import re
+import subprocess
+import time
 from types import MappingProxyType
+from pathlib import Path
 import unicodedata
-from typing import Any, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol
 
-from agentflow.evidence import PromotionReceiptReader
+from agentflow.evidence import PromotionReceiptChainError, PromotionReceiptReader
 
 
 DEPENDENCY_PINS: Mapping[str, object] = MappingProxyType({
@@ -35,7 +38,7 @@ STAGES = (
 )
 HOLD_CODES = (
     "briefing_overflow", "incompatible_policy", "invalid_briefing", "invalid_overlay",
-    "invalid_receipt", "missing_policy", "missing_receipt",
+    "invalid_overlay_authority", "invalid_receipt", "missing_policy", "missing_receipt",
 )
 _MAX_INTEGER = 9_223_372_036_854_775_807
 _MAX_OVERLAY_BYTES = 8192
@@ -53,6 +56,10 @@ _SCOPE_SEGMENT = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 class PolicyValidationError(ValueError):
     """Untrusted policy or briefing input was rejected without retaining it."""
+
+
+class OverlayUnavailableError(RuntimeError):
+    """The repository could not supply an exact overlay object during this read."""
 
 
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -306,6 +313,28 @@ class BriefingReceipt:
         }
 
 
+_ADVISORY_STAGE_BY_METHOD = MappingProxyType({
+    "agentflow/reviewer.py": "review",
+})
+
+
+def advisory_stage(receipt: BriefingReceipt) -> str | None:
+    """Return the one stage authorized to consume a known promoted method."""
+    if type(receipt) is not BriefingReceipt or receipt.candidate_id == "evaluation-contract-v1":
+        return None
+    locator = receipt.authority.locator
+    return next((stage for method, stage in _ADVISORY_STAGE_BY_METHOD.items()
+                 if locator.endswith(f"/files/{method}")), None)
+
+
+def receipt_applies_to_stage(receipt: BriefingReceipt, stage: str) -> bool:
+    """Whether a receipt contributes to one stage's effective briefing identity."""
+    if type(receipt) is not BriefingReceipt:
+        return False
+    owner = advisory_stage(receipt)
+    return owner is None or owner == stage
+
+
 @dataclass(frozen=True, slots=True)
 class FleetPolicyV1:
     policy_version: int
@@ -323,7 +352,7 @@ class FleetPolicyV1:
         _sorted_unique(self.applicable_stages, "stages", 64)
         if any(stage not in STAGES for stage in self.applicable_stages):
             raise PolicyValidationError("invalid stage")
-        if any(receipt.policy_version != self.policy_version for receipt in self.receipts):
+        if any(receipt.policy_version > self.policy_version for receipt in self.receipts):
             raise PolicyValidationError("incompatible receipt policy version")
 
 
@@ -475,6 +504,84 @@ class RepositoryOverlaySource(Protocol):
     def read(self, repository: str, subject_revision: str) -> OverlayV1 | None: ...
 
 
+class ExactRevisionRepositoryOverlaySource:
+    """Read the sole production overlay object without observing a mutable checkout.
+
+    ``git show <revision>:<path>`` addresses the object directly in the enrolled local
+    repository. It neither changes HEAD nor needs a network. Availability failures remain
+    retryable while malformed bytes from an exact object are immutable authority failures.
+    """
+
+    _PATH = ".agentflow/briefing-overlay-v1.json"
+
+    def __init__(self, repositories: Mapping[str, str | Path], *,
+                 on_diagnostic: Callable[[str], None] | None = None) -> None:
+        self._repositories = {name: Path(path) for name, path in repositories.items()}
+        self._on_diagnostic = on_diagnostic
+
+    def _run(self, command: list[str], root: Path, phase: str,
+             repository: str, revision: str) -> subprocess.CompletedProcess[bytes]:
+        for attempt in range(2):
+            started = time.monotonic()
+            try:
+                return subprocess.run(
+                    command, cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL, check=False, timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                if attempt == 0:
+                    self._diagnose(repository, revision, phase, time.monotonic() - started)
+                if attempt == 1:
+                    raise OverlayUnavailableError("overlay object is unavailable") from None
+        raise AssertionError("unreachable")
+
+    def _diagnose(self, repository: str, revision: str, phase: str, elapsed: float) -> None:
+        if self._on_diagnostic is None:
+            return
+        safe = lambda value: str(value).replace("\r", "\\r").replace("\n", "\\n")
+        line = (f"repository overlay read failed repository={safe(repository)} "
+                f"revision={safe(revision)} phase={safe(phase)} "
+                f"elapsed={elapsed:.3f}s error_class=CLOSED")
+        try:
+            self._on_diagnostic(line)
+        except Exception:
+            pass
+
+    def read(self, repository: str, subject_revision: str) -> OverlayV1 | None:
+        root = self._repositories.get(repository)
+        if root is None:
+            self._diagnose(repository, subject_revision, "lookup", 0)
+            raise OverlayUnavailableError("overlay repository or revision is unavailable")
+        if not _SUBJECT_REVISION.fullmatch(subject_revision):
+            raise OverlayUnavailableError("overlay repository or revision is unavailable")
+        result = self._run(
+            ["git", "show", f"{subject_revision}:{self._PATH}"], root, "show",
+            repository, subject_revision)
+        if result.returncode:
+            # Only an absent entry in the exact commit tree means no overlay.  A tree that names
+            # the path but whose blob cannot be read is unavailable, never inferred absence.
+            probe = self._run(
+                ["git", "ls-tree", "-z", "--full-tree", subject_revision, "--", self._PATH],
+                root, "ls-tree", repository, subject_revision)
+            if probe.returncode:
+                self._diagnose(repository, subject_revision, "ls-tree", 0)
+                raise OverlayUnavailableError("overlay revision is unavailable")
+            if not probe.stdout:
+                return None
+            self._diagnose(repository, subject_revision, "ls-tree", 0)
+            raise OverlayUnavailableError("overlay object is unavailable")
+        if len(result.stdout) > _MAX_OVERLAY_BYTES:
+            self._diagnose(repository, subject_revision, "parse", 0)
+            raise PolicyValidationError("overlay exceeds byte limit")
+        started = time.monotonic()
+        try:
+            return OverlayV1.parse(result.stdout)
+        except Exception as error:
+            self._diagnose(repository, subject_revision, "parse", time.monotonic() - started)
+            if isinstance(error, PolicyValidationError):
+                raise
+            raise PolicyValidationError("invalid overlay object") from error
+
+
 @dataclass(frozen=True, slots=True)
 class ApplicabilityFacts:
     repository_scope: str
@@ -527,7 +634,9 @@ class ReadyBriefing(BriefingV1):
             raise PolicyValidationError("briefing collections must be tuples")
         _sorted_unique(tuple(item.value() for item in self.receipts), "receipts", 64)
         _sorted_unique(tuple(item.value() for item in self.capabilities), "capabilities", 64)
-        if any(item.policy_version != self.policy_version for item in self.receipts):
+        if (any(item.policy_version > self.policy_version for item in self.receipts)
+                or (self.receipts and max(item.policy_version for item in self.receipts)
+                    != self.policy_version)):
             raise PolicyValidationError("receipt policy version mismatch")
         if (not isinstance(self.applicability, ApplicabilityFacts)
                 or self.applicability.stage != self.stage
@@ -610,6 +719,18 @@ class HoldBriefing(BriefingV1):
             "status": self.status,
             "subject_revision": self.subject_revision,
         }
+
+
+def validate_briefing(value: object) -> bool:
+    """Revalidate one closed briefing after it crosses a process/owner boundary."""
+    if type(value) not in {ReadyBriefing, NotApplicableBriefing, HoldBriefing}:
+        return False
+    try:
+        _briefing_identity(value, value.status)
+        _validate_finished(value.value())
+    except Exception:
+        return False
+    return True
 
 
 def _finish(value: dict[str, object]) -> tuple[str, str, bytes]:
@@ -716,6 +837,12 @@ EFFECTIVE_POLICY_CONTRACT: Mapping[str, object] = MappingProxyType({
         "separators": (",", ":"), "sort_keys": True,
     }),
     "dependency_pins": DEPENDENCY_PINS,
+    "fleet_policy_chain": MappingProxyType({
+        "advisory_selection": "latest-recognized-receipt-per-stage",
+        "anchor_receipt_id": "receipt-evaluation-contract-v1",
+        "briefing_version": "latest-applicable-active-receipt",
+        "successor_allocation": "consecutive",
+    }),
     "fold_order": ("fleet", "repository_overlay", "stage"),
     "hold_codes": HOLD_CODES,
     "overlay_schema": "briefing-overlay-v1",
@@ -757,8 +884,39 @@ class EffectivePolicyResolver:
 
         try:
             overlay = self._overlay_source.read(repository, safe_revision)
+        except PolicyValidationError:
+            return _hold(
+                repository, safe_stage, safe_revision, "invalid_overlay_authority")
         except Exception:
             return _hold(repository, safe_stage, safe_revision, "invalid_overlay")
+
+        successor_reader = getattr(
+            self._promotion_receipts, "fleet_policy_successors", None)
+        try:
+            successors = (() if successor_reader is None else
+                          successor_reader(policy.receipts[0].receipt_id))
+        except PromotionReceiptChainError:
+            return _hold(repository, safe_stage, safe_revision, "invalid_receipt",
+                         (policy.receipts[0].receipt_id,))
+        except Exception:
+            return _hold(repository, safe_stage, safe_revision, "missing_receipt",
+                         (policy.receipts[0].receipt_id,))
+        try:
+            latest_by_stage: dict[str, BriefingReceipt] = {}
+            for receipt in successors:
+                candidate = self._receipt_value(receipt)
+                owner = advisory_stage(candidate)
+                if owner is not None:
+                    latest_by_stage[owner] = candidate
+            receipts = tuple(sorted(
+                (*policy.receipts, *latest_by_stage.values()),
+                key=lambda item: _canonical_bytes(item.value())))
+            policy = FleetPolicyV1(
+                successors[-1].policy_version if successors else policy.policy_version,
+                receipts, policy.capabilities, policy.applicable_stages)
+        except Exception:
+            return _hold(repository, safe_stage, safe_revision, "invalid_receipt",
+                         (policy.receipts[0].receipt_id,))
         if overlay is not None:
             try:
                 if not isinstance(overlay, OverlayV1):
@@ -771,15 +929,21 @@ class EffectivePolicyResolver:
                 if folded is None:
                     raise PolicyValidationError("invalid overlay restriction")
             except Exception:
-                return _hold(repository, safe_stage, safe_revision, "invalid_overlay")
+                return _hold(
+                    repository, safe_stage, safe_revision, "invalid_overlay_authority")
             receipts, capabilities = folded
             not_applicable = safe_stage in overlay.not_applicable_stages
         else:
             receipts, capabilities = policy.receipts, policy.capabilities
             not_applicable = False
 
+        receipts = tuple(item for item in receipts
+                         if receipt_applies_to_stage(item, safe_stage))
+        expected_receipts = tuple(item for item in policy.receipts
+                                  if receipt_applies_to_stage(item, safe_stage))
+
         resolved_by_id: dict[str, BriefingReceipt] = {}
-        for expected in policy.receipts:
+        for expected in expected_receipts:
             try:
                 actual = self._promotion_receipts.read(expected.receipt_id)
             except Exception:
@@ -794,7 +958,8 @@ class EffectivePolicyResolver:
                 return _hold(repository, safe_stage, safe_revision, "invalid_receipt",
                              (expected.receipt_id,))
             scope_kind, scope_repository, _, new = _scope(candidate.authority.scope)
-            if (new != policy.policy_version or (scope_kind == "repository"
+            if (new != candidate.policy_version or candidate.policy_version > policy.policy_version
+                    or (scope_kind == "repository"
                     and scope_repository != repository)):
                 return _hold(repository, safe_stage, safe_revision, "invalid_receipt",
                              (expected.receipt_id,))
@@ -820,13 +985,16 @@ class EffectivePolicyResolver:
             except Exception:
                 return _hold(repository, safe_stage, safe_revision, "invalid_briefing")
 
-        scope = receipts[0].authority.scope if receipts else f"fleet-policy/0-to-{policy.policy_version}"
+        briefing_policy_version = max(
+            (item.policy_version for item in receipts), default=policy.policy_version)
+        scope = (max(receipts, key=lambda item: item.policy_version).authority.scope
+                 if receipts else f"fleet-policy/0-to-{briefing_policy_version}")
         applicability = ApplicabilityFacts(scope, safe_stage, safe_revision)
         resolved = tuple(resolved_by_id[item.receipt_id] for item in receipts)
         value = {
             "applicability": applicability.value(), "briefing_digest": "", "briefing_id": "",
             "capabilities": [item.value() for item in capabilities],
-            "policy_version": policy.policy_version,
+            "policy_version": briefing_policy_version,
             "receipts": [item.value() for item in resolved], "repository": repository,
             "schema": "briefing-v1", "stage": safe_stage, "status": "ready",
             "subject_revision": safe_revision,
@@ -838,7 +1006,7 @@ class EffectivePolicyResolver:
             if len(encoded) > _MAX_BRIEFING_BYTES:
                 return _hold(repository, safe_stage, safe_revision, "briefing_overflow")
             result = ReadyBriefing(repository, safe_stage, safe_revision, digest, identity,
-                                   policy.policy_version, resolved, capabilities, applicability)
+                                   briefing_policy_version, resolved, capabilities, applicability)
             if result.canonical_bytes() != encoded:
                 raise PolicyValidationError("briefing reconstruction changed bytes")
             return result

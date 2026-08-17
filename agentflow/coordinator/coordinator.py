@@ -6,7 +6,7 @@ pool to collect the completed stage outcomes and human holds that reconciliation
 the product policy leaves with no successor into the same idempotent human hold a budget
 exhaustion produces. Everything hard lives behind them: the
 continuation record and its four states, the waiting queue and ADR 0028 ordering, the
-attempt budget, the reviewed five-permit admission matrix, the atomic permit reservation on
+attempt budget, the reviewed admission matrix, the atomic permit reservation on
 the running-record ledger, the crash-safe provider start handshake, outcome-first
 classification, and reconciliation. SQLite, admission demand, attempt numbers, gates, and
 provider observations are private implementation details.
@@ -20,7 +20,10 @@ injected launcher, gate, and observer collaborators.
 from __future__ import annotations
 
 import os
+from hashlib import sha256
 import json
+import re
+import subprocess
 import threading
 import time
 from copy import deepcopy
@@ -30,8 +33,9 @@ from agentflow.coordinator.admission import (
     ATTEMPT_BUDGET, CODE_WRITING, ISSUE_BOUND, LINEAGE_PINNED, MODEL_FOR, PERMIT_BUDGET, PR_BOUND,
     STAGE_NATIVE_HANDOFF, admission_demand, normalize_stage, pr_bound_waiting)
 from agentflow.coordinator.launcher import NOT_STARTED, STARTED, LocalLauncher
+from agentflow.coordinator.errors import StoreUnavailable
 from agentflow.coordinator.providers import (EndingReason, ProviderCause, SessionLeadInputError,
-                                             validate_session_lead_input)
+                                             repair_provider_input, validate_session_lead_input)
 from agentflow.coordinator.providers import ProviderObserver as _DefaultAdapter
 from agentflow.coordinator.record import (
     COMPLETED, HELD, RUNNING, STALL_LOG_EVERY, STALL_OBSERVATION_MAX_GAP, STALL_PARK_AFTER,
@@ -39,12 +43,13 @@ from agentflow.coordinator.record import (
 from agentflow.coordinator.recovery import PROGRESS, REPAIR
 from agentflow.coordinator.stage_router import StageCalls
 from agentflow.coordinator.store import (
-    SUPERVISOR_WINDOW, ReservationIntent, Store, default_store_path)
+    SUPERVISOR_WINDOW, LegacyReservationIntent, ReservationIntent, RouteAdmissionRefused, Store,
+    default_store_path)
 from agentflow.coordinator.telemetry import AttemptTelemetry, AttemptUsage, record_attempt
 from agentflow.routing import routing
 from agentflow.coordinator.verification import (
     VERIFIED, miss_summary, refusal_expected, refusal_stalls, unprepared)
-from agentflow.review_policy import ReviewState
+from agentflow.review_policy import ReviewState, current_head_author
 
 # The observe-until window a recovered running attempt is logged against (ADR 0028's
 # supervisor deadline). Stored on the record at admission so a fresh coordinator reports a
@@ -93,6 +98,11 @@ def parse_permanent_hold_reason(hold_reason: str) -> EndingReason:
 # reasons and composed its usual copy would tell the maintainer about work nobody did. Stage
 # handoffs read this prefix to pick copy that claims nothing.
 REFUSED_BEFORE_START_HOLD_REASON = "refused before start"
+
+_PERMANENT_ADMISSION_REFUSALS = frozenset({
+    "admission_identity_migration_required",
+    "invalid_overlay_authority",
+})
 
 
 def refused_before_start_hold_reason(refusal: str) -> str:
@@ -185,6 +195,7 @@ class Submission:
     review: ReviewState | None = None
     capability_root: str | None = None
     capability_context: dict[str, bool] | str | None = None
+    subject_revision: str = ""
 
 
 @dataclass(frozen=True)
@@ -207,7 +218,9 @@ class Coordinator:
     ``cycle`` reconciles first — returning the completed outcomes and holds that reconciliation
     settled — then admits eligible continuations ahead of cold work with strict head-of-line
     blocking, starting each through the crash-safe launcher. If the store is unreadable the
-    constructor raises and the caller starts nothing and clears no claim (fail-closed).
+    constructor raises and the caller starts nothing and clears no claim (fail-closed). A
+    production composition may also declare the repositories it manages; that coordinator then
+    leaves other durable records for their owning composition to reconcile and admit.
 
     It depends on three cohesive collaborators, injected only so the crash boundaries can be
     exercised with fakes: a **launcher** that starts a provider family and reports its
@@ -218,10 +231,17 @@ class Coordinator:
     public operation — the public surface is ``submit_stage``, ``cycle``, and ``park_completed``.
     """
 
-    def __init__(self, *, launcher=None, gate=None, adapter=None, capability_preflight=None, log=None,
+    def __init__(self, *, launcher=None, gate=None, adapter=None, capability_preflight=None,
+                 capability_repair=None, log=None,
                  daemon_generation: str | None = None,
-                 disabled_cold_stages: frozenset[str] = frozenset()) -> None:
-        self._store = Store(default_store_path())
+                 disabled_cold_stages: frozenset[str] = frozenset(), store=None,
+                 route_selector=None, briefing_resolver=None,
+                 managed_repositories: frozenset[str] | None = None) -> None:
+        # Production injects its one composed Store; bare coordinators retain the historical
+        # no-admission Store for focused coordinator tests and legacy state readability.
+        self._store = store or Store(default_store_path())
+        self._route_selector = route_selector or routing.select_route
+        self._briefing_resolver = briefing_resolver
         self._launcher = launcher or LocalLauncher()
         self._gate = gate or _admit_everything
         # Every adapter hook is optional; StageCalls owns the default for each one, so the
@@ -229,6 +249,7 @@ class Coordinator:
         self._adapter = StageCalls(adapter or _DefaultAdapter())
         self._capability_preflight = capability_preflight or (
             lambda _record, _materialize: None)
+        self._capability_repair = capability_repair
         # This process's daemon-lifecycle identity, stamped on every attempt it admits. A restart
         # is a new process with a new pid, so an attempt found dead under a *different* generation
         # — and leaving no supervisor end fact — was taken down with the daemon, not by the
@@ -238,6 +259,11 @@ class Coordinator:
         # already started. The coordinator owns the distinction: only truly cold, never-started
         # records are discarded; continuations and restart-resumes remain eligible.
         self._disabled_cold_stages = disabled_cold_stages
+        # A loop helper owns one configured repository but shares the durable Store with the
+        # dispatch coordinator. Its policy resolver is intentionally only configured for that
+        # repository, so it must never mutate a record owned by another helper/composition.
+        # ``None`` retains the historical all-record behavior for bare coordinators and tests.
+        self._managed_repositories = managed_repositories
         self._log = log or (lambda _line: None)
         self._lock = threading.RLock()
         self._records: dict[str, Record] = self._store.load()
@@ -245,6 +271,7 @@ class Coordinator:
         # started, so reconciliation only logs "recovered running" for a family it did not just
         # launch — i.e. one found alive after a fresh coordinator reloaded the durable store.
         self._started_here: set[str] = set()
+        self._launched_this_cycle: set[tuple[str, str | None]] = set()
         self._recovered_logged: set[str] = set()
         # When each stalled record last printed its line. Only the *cadence* is process-local —
         # the elapsed time it reports is durable (#406) — so a restart costs one extra line, not
@@ -253,17 +280,47 @@ class Coordinator:
 
     # --- public interface ---------------------------------------------------------------
 
+    def _manages_repository(self, repo: str) -> bool:
+        """Whether this coordinator owns durable work for ``repo``.
+
+        An unscoped coordinator is the complete, by-hand composition and retains ownership of
+        every record. Production helpers are scoped to their configured repository map.
+        """
+        return self._managed_repositories is None or repo in self._managed_repositories
+
+    def _require_managed_repository(self, repo: str) -> None:
+        """Reject a submission outside this composition before it reaches any collaborator."""
+        if not self._manages_repository(repo):
+            raise ValueError("submission repository is outside this coordinator's configured "
+                             "repositories")
+
+    def _owned_record(self, record: "Record | None") -> "Record | None":
+        """Return an identity lookup only when this composition is allowed to mutate it."""
+        return record if record is not None and self._manages_repository(record.repo) else None
+
     def submit_stage(self, submission: Submission) -> str:
         """Submit one logical stage's facts; returns its stable identity. Idempotent — a
         repeated submission for the same identity never duplicates work."""
+        self._require_managed_repository(submission.repo)
         stage = normalize_stage(submission.stage)
         review = submission.review or ReviewState(
-            change_author_tool=submission.builder_lineage)
+            # Build and Revise write the next PR head. Record their accountable session lead as
+            # the head author now; branch lineage is only a retained-worktree locator.
+            change_author_tool=(submission.pool if stage in {"build", "revise"}
+                                else submission.builder_lineage))
         model = (
             routing.model_for_stage(
                 stage, submission.pool, submission.complexity, submission.builder_complexity)
             or MODEL_FOR.get((submission.pool, submission.complexity), "opus")
         )
+        subject_revision = submission.subject_revision or _subject_revision(submission)
+        route = None
+        if subject_revision:
+            selection = self._route_selector(
+                submission.repo, stage, submission.pool, model,
+                complexity=submission.complexity, effort=submission.effort,
+                builder_complexity=submission.builder_complexity)
+            route = self._store.route_selection_identity(selection)
         demand = admission_demand(
             stage, submission.pool, model, submission.complexity, submission.effort)
         identity = _identity(submission.repo, submission.subject, stage, submission.target,
@@ -277,8 +334,9 @@ class Coordinator:
         lineage = (submission.pool if stage == "review"
                    else (submission.builder_lineage or submission.pool
                          if stage in LINEAGE_PINNED else None))
-        current_author = review.change_author_tool or submission.builder_lineage
-        auto_merge = not (current_author is not None and submission.pool == current_author)
+        current_author = current_head_author(
+            review.change_author_tool, submission.builder_lineage)
+        auto_merge = current_author is not None and submission.pool != current_author
         record = Record(
             identity=identity, stage=stage, pool=submission.pool,
             repo=submission.repo, subject=str(submission.subject), target=submission.target,
@@ -294,6 +352,10 @@ class Coordinator:
             capability_context=(submission.capability_context
                                 if isinstance(submission.capability_context, str)
                                 else json.dumps(submission.capability_context or {}, sort_keys=True)),
+            subject_revision=subject_revision,
+            route_id=route.route_id if route is not None else "",
+            route_cell_digest=route.route_cell_digest if route is not None else "",
+            launch_config_digest=route.launch_config_digest if route is not None else "",
             session_lead=submission.session_lead,
             auto_merge_allowed=auto_merge, root=submission.descendant_of,
             interactive=submission.interactive, continuation=submission.continuation,
@@ -337,7 +399,7 @@ class Coordinator:
         (or a completed transfer) is never freed or revived. Idempotent and a no-op for any started
         or absent record: a repeat finds the slot already free."""
         with self._lock:
-            record = self._store.record_of(identity)
+            record = self._owned_record(self._store.record_of(identity))
             if (record is None or record.retired or record.state != WAITING
                     or record.attempts != 0 or record.start_fact not in {None, NOT_STARTED}
                     or record.process_alive):
@@ -359,7 +421,7 @@ class Coordinator:
         completed stage awaiting a transfer. Idempotent and crash-safe: a repeat re-observes the
         durable handoff and neither re-notifies nor double-releases the claim."""
         with self._lock:
-            record = self._records.get(identity)
+            record = self._owned_record(self._records.get(identity))
             if record is None or record.retired or record.state != COMPLETED:
                 return None
             if not record.hold_pending:
@@ -378,7 +440,7 @@ class Coordinator:
         its claim with no park comment and no notification. Idempotent: a repeat finds it already
         retired and does nothing."""
         with self._lock:
-            record = self._store.record_of(identity)
+            record = self._owned_record(self._store.record_of(identity))
             if (record is None or record.retired or record.stage != "review"
                     or not record.claim):
                 return False
@@ -401,7 +463,7 @@ class Coordinator:
         would leave that handoff pending and silently retrying forever. Idempotent: a repeat finds
         it already retired and does nothing."""
         with self._lock:
-            record = self._store.record_of(identity)
+            record = self._owned_record(self._store.record_of(identity))
             if (record is None or record.retired or record.stage != "revise"
                     or not record.claim):
                 return False
@@ -425,7 +487,7 @@ class Coordinator:
         too — a held triage of a closed issue asks a human for a decision nobody can act on.
         Idempotent: a repeat finds it already retired and does nothing."""
         with self._lock:
-            record = self._store.record_of(identity)
+            record = self._owned_record(self._store.record_of(identity))
             if (record is None or record.retired or record.stage not in ("intake", "attack")
                     or not record.claim):
                 return False
@@ -440,6 +502,27 @@ class Coordinator:
                               "nothing left to triage; retired silently, claim released")
             return True
 
+    def retire_stale_hold(self, identity: str) -> bool:
+        """Silently retire a claim-released human hold whose subject is already resolved.
+
+        The reconciliation caller owns the GitHub proof and, for issue-bound stages, proves every
+        visible claim and held label is gone first. A retained coordinator claim is intentionally
+        not cleared here: it means that proof was not established and the record must wait for a
+        later pass.
+        """
+        with self._lock:
+            record = self._owned_record(self._store.record_of(identity))
+            if (record is None or record.retired or record.state != HELD or record.claim):
+                return False
+            self._release(record)
+            record.state = COMPLETED
+            record.hold_pending = False
+            record.retired = True
+            if not self._persist(record, retire_descendants=True):
+                return False
+            self._emit(record, "subject was closed; held record retired")
+            return True
+
     def park_stale_review(self, identity: str) -> "StageOutcome | None":
         """Park a Review whose PR head moved off its immutable target once the auto-revise rounds are
         spent: the stranded record can open no bounded successor, so the PR is handed to a human
@@ -447,7 +530,7 @@ class Coordinator:
         called for an open PR. Idempotent and crash-safe: a repeat re-observes the durable park and
         neither re-notifies nor double-releases the claim."""
         with self._lock:
-            record = self._store.record_of(identity)
+            record = self._owned_record(self._store.record_of(identity))
             if (record is None or record.retired or record.stage != "review"
                     or not record.claim):
                 return None
@@ -467,16 +550,18 @@ class Coordinator:
     def cycle(self, pool: str, *, now: int = 0) -> list[StageOutcome]:
         """Reconcile, returning the stage outcomes and holds settled this cycle, then admit
         eligible continuations first with strict head-of-line blocking, starting each through
-        the launcher. Newly started attempts run beyond this cycle and surface as outcomes in
-        a later cycle's reconciliation."""
+        the launcher. A final reconciliation observes a family that ended during its launch;
+        otherwise newly started attempts surface in a later cycle."""
         with self._lock:
+            self._launched_this_cycle = set()
             begin_cycle = getattr(self._gate, "begin_cycle", None)
             if begin_cycle is not None:
                 begin_cycle(pool)
             outcomes = self._reconcile()
             self._discard_disabled_cold_stages()
             waiting = [r for r in self._records.values()
-                       if r.pool == pool and r.state == WAITING and not r.hold_pending
+                       if self._manages_repository(r.repo)
+                       and r.pool == pool and r.state == WAITING and not r.hold_pending
                        and r.root is None]  # descendants share the root's reservation, never admit
             # Admission ranks each queue in three tiers (ADR 0039). An operator's interactive turn
             # (an Ask) outranks all background pipeline work (ADR 0034): it sorts to the head of
@@ -493,14 +578,22 @@ class Coordinator:
                                r.eligible_at, r.created_at, r.identity))
             cold = sorted((r for r in waiting if not r.continuation),
                           key=lambda r: (not r.interactive, r.stage not in PR_BOUND, r.identity))
+
+            def admit(record: Record) -> str:
+                result = self._admit(record, now)
+                if isinstance(result, StageOutcome):
+                    outcomes.append(result)
+                    return "unprepared"
+                return result
+
             for record in continuations:
                 # An admission (permit/gate) refusal or a launch that never started blocks the
                 # pool head-of-line (ADR 0029); only a preparation miss is skipped, since it
                 # reserved nothing and can retry next cycle without holding capacity hostage.
-                if self._admit(record, now) not in ("started", "unprepared", "deferred"):
+                if admit(record) not in ("started", "unprepared", "deferred"):
                     return outcomes
             for record in cold:
-                self._admit(record, now)
+                admit(record)
             # A stage whose home pool cannot launch it may move here (ADR 0028/0020) — a read-only
             # Review (fresh or continuation) whose review safety allows either pool, and a
             # *never-started* Build (attempts=0, no branch/worktree/PR yet, so its lineage pin is
@@ -509,6 +602,7 @@ class Coordinator:
             # reserve reverts, leaving the record on its home pool for that pool's own cycle.
             for record in self._migratable(pool, now):
                 self._admit_migration(record, pool, now)
+            outcomes.extend(self._reconcile(self._launched_this_cycle))
             return outcomes
 
     def _discard_disabled_cold_stages(self) -> None:
@@ -519,7 +613,8 @@ class Coordinator:
         attempt count is zero and capacity delays its restart.
         """
         for record in list(self._records.values()):
-            if (record.stage not in self._disabled_cold_stages or record.state != WAITING
+            if (not self._manages_repository(record.repo)
+                    or record.stage not in self._disabled_cold_stages or record.state != WAITING
                     or record.continuation or record.attempts != 0 or record.restart_resumes != 0
                     or record.start_fact not in {None, NOT_STARTED} or record.process_alive):
                 continue
@@ -528,7 +623,7 @@ class Coordinator:
 
     # --- reconciliation -----------------------------------------------------------------
 
-    def _reconcile(self) -> list[StageOutcome]:
+    def _reconcile(self, launched: set[tuple[str, str | None]] | None = None) -> list[StageOutcome]:
         """Resolve every ambiguous running record from its durable start fact and family
         liveness (ADR 0028/0030), returning the outcomes that terminated this cycle. The
         working set is reloaded first so a child's cross-process ``started`` write and any
@@ -539,6 +634,10 @@ class Coordinator:
         self._records = self._store.load()
         outcomes: list[StageOutcome] = []
         for record in list(self._records.values()):
+            if (not self._manages_repository(record.repo)
+                    or (launched is not None
+                    and (record.identity, record.launch_token) not in launched)):
+                continue
             if record.hold_pending:
                 outcome = self._finalize_hold(record)
                 if outcome is not None:
@@ -558,6 +657,29 @@ class Coordinator:
                 # exist (the child records `started` before replacing itself). If nothing is
                 # alive, this is not-started: release and preserve the attempt count.
                 if not self._launcher.is_alive(record.family):
+                    try:
+                        receipt = self._store.read_admission_receipt(record.identity)
+                    except StoreUnavailable:
+                        record.hold_reason = refused_before_start_hold_reason(
+                            "admission authority is unreadable")
+                        if self._hold(record):
+                            self._emit(
+                                record,
+                                f"attempt {record.attempts}/{ATTEMPT_BUDGET} refused before "
+                                "provider start — admission authority is unreadable; handoff "
+                                "pending; claim retained",
+                            )
+                            outcome = self._finalize_hold(record)
+                            if outcome is not None:
+                                outcomes.append(outcome)
+                        continue
+                    if receipt is not None:
+                        admitted = self._store.decode_committed_launch(
+                            receipt.route_cell_digest)
+                        result = self._launcher.start(record, self._store, admitted)
+                        self._started_here.add(record.identity)
+                        self._commit_start(record, result.fact, result.family)
+                        continue
                     self._release(record)
                     record.state = WAITING
                     self._persist(record)
@@ -609,6 +731,8 @@ class Coordinator:
         obs = self._adapter.observe(record)
         if getattr(obs, "has_end_fact", False):
             return False  # the provider recorded an end — a real failure, charged like any other
+        self._record_telemetry(record, obs, outcome=None, verified=False,
+                               interrupted_by_restart=True)
         attempt_no = record.attempts
         self._release(record)
         record.attempts -= 1               # refund the up-front charge; the resume re-charges it
@@ -721,22 +845,42 @@ class Coordinator:
                            "spent; claim retained pending durable handoff")
         return True
 
-    def _admit(self, record: Record, now: int, *, observed: bool = True) -> str:
+    def _admit(
+            self, record: Record, now: int, *, observed: bool = True,
+    ) -> str | StageOutcome:
         """Try to start one attempt. Returns ``unprepared`` (the stage adapter refused before
         admission — no permit, no attempt), ``deferred`` (an issue-bound stage yielded the pool to
         a waiting PR-bound stage — no permit, non-blocking, #293), ``blocked`` (admission/permits
         refused), ``started`` (a provider family exists and an attempt was consumed), or
         ``not_started`` (admitted but no provider came into existence — no attempt consumed).
+        A permanent immutable-admission refusal returns its finalized human-handoff outcome.
 
         ``observed=False`` marks a *probe* rather than a real turn at the pool — the destination
         trial a pool move runs, which reverts everything it touched when it does not start. A
         probe's refusal is nobody's evidence of anything: it must not count toward the breadcrumb
         or advance a clock, or a stage would escalate on how often it was speculatively tried
         somewhere it does not live (#406)."""
-        # The non-mutating provider/repository check must precede even stage preparation.  A
-        # second check below verifies the actual checkout preparation leaves for launch.
-        capability = self._capability_preflight(record, False)
-        if capability is not None and not capability.ready:
+        # Repair only the provider module's recognized historical durable-input shapes: #696's
+        # envelope followed by one approved advisory, or complete stale lead contracts before one
+        # complete terminal contract. Every other malformed input remains untouched and is refused
+        # by its stage adapter. Persisting here lets a paused daemon recover next cycle without
+        # reserving capacity or relying on a provider launch.
+        repaired_input = repair_provider_input(record.input_ptr or "")
+        if repaired_input != (record.input_ptr or ""):
+            record.input_ptr = repaired_input
+            if not self._persist(record):
+                return "unprepared"
+        # Production's source-root probe is advisory. Preparation may create or repair the final
+        # launch root, so only the one post-prepare observation is admission authority.
+        composed = self._store.composed_admission
+        if composed:
+            try:
+                capability = self._capability_preflight(record, False)
+            except Exception:
+                capability = None
+        else:
+            capability = self._capability_preflight(record, False)
+        if not composed and capability is not None and not capability.ready:
             return self._capability_failure(record, capability, observed)
         # A stage adapter that owns branch/worktree recovery may reject admission before it
         # happens; a preparation failure consumes neither a permit nor an attempt (ADR 0028).
@@ -768,17 +912,32 @@ class Coordinator:
             return "unprepared"
         capability = self._capability_preflight(record, True)
         if capability is not None and not capability.ready:
+            capability = self._repair_capability(record, capability, observed)
+        if capability is not None and not capability.ready:
+            if composed:
+                state = capability.state if capability.state in {
+                    "missing", "drifted", "incompatible"} else "incompatible"
+                return self._capability_environment_failure(record, state, now, observed)
             return self._capability_failure(record, capability, observed)
         # Preparation answered yes, so whatever refused it earlier is over — clear it before the
         # later admission checks run, or a stage that is now perfectly preparable would keep
         # publishing the checkout that used to refuse it while capacity is what actually holds it.
         # `_begin_start` may then put its own capacity reason in the cleared slot.
         self._note_refusal(record, "", False)
+        record.capability_repair_refusal = ""
         if observed:
             record.refusals = 0
             self._clear_stall(record)
             self._stall_logged.pop(record.identity, None)
-        if not self._begin_start(record, now):
+        ready_fact = capability.ready_fact if capability is not None else None
+        try:
+            admission = self._begin_start(record, now, capability=ready_fact)
+        except Exception as error:
+            from agentflow.coordinator.store import AdmissionRefused
+            if isinstance(error, AdmissionRefused):
+                return self._admission_failure(record, error.code, observed)
+            raise
+        if admission is None:
             if _refusal_state(record) != was_refused:
                 self._persist(record)
             # An issue-bound stage held back so a waiting PR-bound stage can take the pool is a
@@ -787,10 +946,188 @@ class Coordinator:
             if record.stage in ISSUE_BOUND and self._pr_bound_waiting(record.pool, now):
                 return "deferred"
             return "blocked"
-        result = self._launcher.start(record, self._store)
+        try:
+            if self._store.composed_admission:
+                admitted = self._store.decode_committed_launch(
+                    admission.admission_receipt.route_cell_digest)
+                result = self._launcher.start(record, self._store, admitted)
+            else:
+                result = self._launcher.start(record, self._store)
+        except SessionLeadInputError as exc:
+            self._commit_start(record, NOT_STARTED)
+            record = self._store.record_of(record.identity)
+            if record is None:
+                return "unprepared"
+            prepared = unprepared("session-lead-input-unreadable", str(exc))
+            self._note_refusal(record, miss_summary(prepared), refusal_expected(prepared))
+            if observed:
+                self._observe_refusal(record, prepared, now)
+                self._breadcrumb_refusal(record)
+                if self._park_refused(record, now):
+                    return "unprepared"
+                self._log_stalled(record, now)
+            if record.stage in PR_BOUND:
+                record.eligible_at = max(record.eligible_at, now + 1)
+                self._persist(record)
+            elif _refusal_state(record) != was_refused:
+                self._persist(record)
+            return "unprepared"
         self._started_here.add(record.identity)
         self._commit_start(record, result.fact, result.family)
         return STARTED if result.fact == STARTED else "not_started"
+
+    @staticmethod
+    def _capability_refusal_fingerprint(record: Record, capability) -> str:
+        payload = {
+            "root": record.capability_root or record.source or ".",
+            "stage": capability.stage,
+            "provider": capability.provider,
+            "state": capability.state,
+            "contracts": [
+                (item.id, item.version, item.runtime) for item in capability.contracts
+            ],
+            "evidence": list(capability.evidence),
+        }
+        return sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+    def _repair_capability(self, record: Record, capability, observed: bool):
+        """Attempt one named deterministic repair, then trust only a fresh preflight."""
+        if not observed or self._capability_repair is None:
+            return capability
+        fingerprint = self._capability_refusal_fingerprint(record, capability)
+        if record.capability_repair_refusal == fingerprint:
+            return capability
+        if record.capability_repair_refusal:
+            record.capability_repair_refusal = ""
+        try:
+            result = self._capability_repair(record, capability)
+        except Exception as exc:
+            from agentflow.capability_contracts import CapabilityRepairResult
+            result = CapabilityRepairResult(
+                False, f"{type(exc).__name__}: {exc}")
+        if result is None:
+            return capability
+        try:
+            reprobe = self._capability_preflight(record, True)
+        except Exception as exc:
+            reprobe = capability
+            result = replace(
+                result, repaired=False,
+                detail=f"{result.detail}; re-probe {type(exc).__name__}: {exc}",
+            )
+        root = record.capability_root or record.source or "."
+        requirements = ",".join(
+            f"{item.id}@{item.version}" for item in capability.contracts
+        ) or "none"
+        if reprobe is not None and reprobe.ready:
+            record.capability_repair_refusal = ""
+            outcome = f"ready — {result.detail}"
+        else:
+            reprobe = reprobe or capability
+            record.capability_repair_refusal = self._capability_refusal_fingerprint(
+                record, reprobe)
+            outcome = f"failed — {result.detail}; re-probe {reprobe.state}"
+        self._emit(
+            record,
+            f"capability repair root={root} provider={record.pool} requirements={requirements}; "
+            f"outcome={outcome}",
+        )
+        return reprobe
+
+    def _admission_failure(
+            self, record: Record, code: str, observed: bool,
+    ) -> str | StageOutcome:
+        """Retry transient admission refusals and hand immutable ones to a human."""
+        if not observed:
+            return "unprepared"
+        if code == "route_cell:stale":
+            rejection = self._repin_stale_route_cell(record)
+            if rejection is None:
+                self._emit(record, "route_cell:stale; re-pinned current RouteCell; retrying next "
+                                   "cycle; no attempt or permit spent")
+                return "unprepared"
+            detail = f"route_cell:stale; not re-pinned: {rejection}"
+            self._note_refusal(record, detail, False)
+            record.capability_preflight = ""
+            self._persist(record)
+            self._emit(record, f"{detail}; retrying next cycle; claim retained; "
+                               "no attempt or permit spent")
+            return "unprepared"
+        if code in _PERMANENT_ADMISSION_REFUSALS:
+            record.hold_reason = refused_before_start_hold_reason(code)
+            if not self._hold(record):
+                return "unprepared"
+            self._emit(record, f"{code}; refusing this immutable admission; no attempt or "
+                               "permit spent; claim retained pending durable handoff")
+            return self._finalize_hold(record) or "unprepared"
+        self._note_refusal(record, code, False)
+        record.capability_preflight = ""
+        if not self._persist(record):
+            return "unprepared"
+        self._emit(record, f"{code}; retrying next cycle; claim retained; "
+                           "no attempt or permit spent")
+        return "unprepared"
+
+    def _capability_environment_failure(
+            self, record: Record, state: str, now: int, observed: bool,
+    ) -> str:
+        """Clock an observed, repairable launch-root capability refusal.
+
+        Capability checks run after preparation, so treating a failed final check as a generic
+        admission refusal used to skip the refusal observer that preparation uses. The preflight
+        itself names a repair command, and a provider, receipt, or pinned launch root can change
+        between cycles; retry remains appropriate. It is nevertheless a human-clearable refusal
+        while it persists, so it shares preparation's durable breadcrumb, stall clock, and
+        refused-before-start handoff rather than retrying invisibly forever.
+        """
+        if not observed:
+            return "unprepared"
+        prepared = unprepared(f"capability_environment_failure:{state}", stall=True)
+        self._note_refusal(record, miss_summary(prepared), refusal_expected(prepared))
+        self._observe_refusal(record, prepared, now)
+        self._breadcrumb_refusal(record)
+        if self._park_refused(record, now):
+            return "unprepared"
+        self._log_stalled(record, now)
+        record.capability_preflight = ""
+        if not self._persist(record):
+            return "unprepared"
+        self._emit(record, f"{record.refusal}; retrying next cycle; claim retained; "
+                           "no attempt or permit spent")
+        return "unprepared"
+
+    def _repin_stale_route_cell(self, record: Record) -> str | None:
+        """Replace one superseded RouteCell pin with its active successor, or explain why not.
+
+        Admission already proved this exact pin stale.  Read the safety authority's active cell,
+        then accept only the same routing key and a different immutable digest.  Any lookup failure
+        or changed key keeps the original refusal: a stale pin is recoverable, but it is not
+        authority to bypass another admission failure.
+        """
+        identity = (record.repo, record.subject, record.stage, record.target,
+                    record.subject_revision)
+        try:
+            route = self._store.active_route_selection_identity(record)
+        except RouteAdmissionRefused as error:
+            return f"active RouteCell lookup refused: route_cell:{error.code}"
+        except Exception as error:
+            return f"active RouteCell lookup failed: {type(error).__name__}: {error}"
+        if (identity != (record.repo, record.subject, record.stage, record.target,
+                         record.subject_revision)):
+            return "stage identity changed during active RouteCell lookup"
+        if route.route_id != record.route_id:
+            return "active RouteCell changed the logical route"
+        if route.route_cell_digest == record.route_cell_digest:
+            return "active RouteCell reproduced the same digest"
+        record.route_id = route.route_id
+        record.route_cell_digest = route.route_cell_digest
+        record.launch_config_digest = route.launch_config_digest
+        self._note_refusal(record, "", False)
+        record.refusals = 0
+        self._clear_stall(record)
+        if not self._persist(record):
+            return "record changed before the active RouteCell could be persisted"
+        return None
 
     def _capability_failure(self, record: Record, capability, observed: bool) -> str:
         """Fail a real admission durably; leave speculative provider probes untouched."""
@@ -822,7 +1159,8 @@ class Coordinator:
         pool's cycle."""
         candidates = [
             r for r in self._records.values()
-            if r.state == WAITING and not r.hold_pending and r.root is None
+            if self._manages_repository(r.repo)
+            and r.state == WAITING and not r.hold_pending and r.root is None
             and r.eligible_at <= now
             and r.pool != pool and self._may_migrate(r, pool)
             and self._pool_cannot_fit(r)]
@@ -872,11 +1210,13 @@ class Coordinator:
             record, pool=dest_pool,
             source=_repool_source(record.source, dest_pool),
             lineage=dest_pool if record.stage in LINEAGE_PINNED else record.lineage)
-        capability = self._capability_preflight(candidate, False)
-        if capability is not None and not capability.ready:
-            return
+        if not self._store.composed_admission:
+            capability = self._capability_preflight(candidate, False)
+            if capability is not None and not capability.ready:
+                return
         home = (record.pool, record.model, record.demand, record.auto_merge_allowed,
-                record.lineage, record.source, record.refusal, record.refusal_expected)
+                record.lineage, record.source, record.refusal, record.refusal_expected,
+                record.route_id, record.route_cell_digest, record.launch_config_digest)
         record.pool = dest_pool
         record.model = (
             routing.model_for_stage(
@@ -886,14 +1226,25 @@ class Coordinator:
         demand = admission_demand(
             record.stage, dest_pool, record.model, record.complexity, record.effort)
         record.demand = demand if demand is not None else PERMIT_BUDGET
-        current_author = record.change_author_tool or record.builder_lineage
-        record.auto_merge_allowed = not (current_author is not None and dest_pool == current_author)
+        if record.subject_revision:
+            selection = self._route_selector(
+                record.repo, record.stage, record.pool, record.model,
+                complexity=record.complexity, effort=record.effort,
+                builder_complexity=record.builder_complexity)
+            route = self._store.route_selection_identity(selection)
+            record.route_id = route.route_id
+            record.route_cell_digest = route.route_cell_digest
+            record.launch_config_digest = route.launch_config_digest
+        current_author = current_head_author(
+            record.change_author_tool, record.builder_lineage)
+        record.auto_merge_allowed = current_author is not None and dest_pool != current_author
         if record.stage in LINEAGE_PINNED:
             record.lineage = dest_pool
             record.source = _repool_source(record.source, dest_pool)
         if self._admit(record, now, observed=False) != STARTED:
             (record.pool, record.model, record.demand, record.auto_merge_allowed,
-             record.lineage, record.source, record.refusal, record.refusal_expected) = home
+             record.lineage, record.source, record.refusal, record.refusal_expected,
+             record.route_id, record.route_cell_digest, record.launch_config_digest) = home
             record.state = WAITING
             self._persist(record)
 
@@ -905,18 +1256,20 @@ class Coordinator:
         permits are per-pool. Coupling pools here would invite a cross-pool deadlock. A gate-blocked
         autonomous review deliberately stays waiting for its required independent tool without
         consuming permits; reviewed-profile same-tool fallback is selected before submission."""
-        return pr_bound_waiting(self._records.values(), pool, now)
+        return pr_bound_waiting(
+            (record for record in self._records.values()
+             if self._manages_repository(record.repo)), pool, now)
 
-    def _begin_start(self, record: Record, now: int) -> bool:
+    def _begin_start(self, record: Record, now: int, *, capability=None):
         if (record.state != WAITING or record.hold_pending
                 or record.attempts >= ATTEMPT_BUDGET):
-            return False
+            return None
         if record.pool not in {"claude", "codex"}:
-            return False  # no permit ledger to charge an unknown pool (ADR 0029)
+            return None  # no permit ledger to charge an unknown pool (ADR 0029)
         if record.stage in LINEAGE_PINNED and record.pool != record.lineage:
-            return False  # a code-writing stage may not silently leave its pinned lineage
+            return None  # a code-writing stage may not silently leave its pinned lineage
         if record.stage in ISSUE_BOUND and self._pr_bound_waiting(record.pool, now):
-            return False  # new issue work defers while a PR-bound stage waits to start (#293)
+            return None  # new issue work defers while a PR-bound stage waits to start (#293)
         if not self._gate(deepcopy(record)):
             # An independent admission gate refusal (headroom, ceiling, cap, pacing) used to be
             # silent: a record pinned to a pool the weekly ratchet blocks sat `waiting` with its
@@ -931,7 +1284,7 @@ class Coordinator:
             reason = reason_of(deepcopy(record)) if reason_of is not None else None
             self._note_refusal(record, reason or "", False)
             self._emit_deferral(record, now, reason)
-            return False
+            return None
         # Store derives and commits the reservation successor. Default NoAdmission mode preserves
         # the shipped coordinator behavior; #627 remains the owner of composed Safety/Attribution
         # mode, RouteCell resolution, and briefing/capability admission receipts.
@@ -943,22 +1296,50 @@ class Coordinator:
         # this attempt; the winner's durable row remains authoritative and no reservation is
         # attempted from the stale object.
         if not self._persist(record):
-            return False
-        admission = self._store.reserve(ReservationIntent(
-            identity=record.identity,
-            expected_launch_token=record.launch_token,
-            expected_revision=record.revision,
-            now=now,
-            daemon_generation=self._daemon_generation,
-            budget=PERMIT_BUDGET,
-            limits=limits,
-            route_cell_digest=None,
-        ))
+            return None
+        briefing = None
+        if self._briefing_resolver is not None and record.stage != "converse":
+            briefing = self._briefing_resolver.brief_for(
+                record.repo, record.stage, record.subject_revision)
+            from agentflow.effective_policy import HoldBriefing
+            if type(briefing) is HoldBriefing:
+                from agentflow.coordinator.store import AdmissionRefused
+                raise AdmissionRefused(briefing.hold_code)
+            from agentflow.effective_policy import ReadyBriefing
+            if type(briefing) is ReadyBriefing:
+                from agentflow.prompts import stage_prompt_spec
+                try:
+                    record.input_ptr = stage_prompt_spec(record.stage).with_briefing(
+                        record.input_ptr or "", briefing)
+                except ValueError:
+                    from agentflow.coordinator.store import AdmissionRefused
+                    raise AdmissionRefused("briefing_mismatch") from None
+                if not self._persist(record):
+                    return None
+        common = {
+            "identity": record.identity,
+            "expected_launch_token": record.launch_token,
+            "expected_revision": record.revision,
+            "now": now,
+            "daemon_generation": self._daemon_generation,
+            "budget": PERMIT_BUDGET,
+            "limits": limits,
+        }
+        if self._store.composed_admission:
+            if not record.route_cell_digest or capability is None:
+                from agentflow.coordinator.store import AdmissionRefused
+                raise AdmissionRefused("admission_identity_migration_required")
+            admission = self._store.reserve(ReservationIntent(
+                **common, briefing=briefing, capability=capability,
+                route_cell_digest=record.route_cell_digest))
+        else:
+            admission = self._store.reserve_legacy(LegacyReservationIntent(
+                **common, route_cell_digest=record.route_cell_digest or None))
         if admission is None:
-            return False
+            return None
         for item in fields(Record):
             setattr(record, item.name, getattr(admission.successor, item.name))
-        return True
+        return admission
 
     def _emit_deferral(self, record: Record, now: int, reason: str | None) -> None:
         """Log why the admission gate refused this waiting record (#436), from the reason
@@ -1003,11 +1384,14 @@ class Coordinator:
             record.state = WAITING
             self._persist(record)
             return
-        record.family = family or record.family
+        # The child may have expanded the durable supervisor pid to the complete provider family
+        # after the launcher formed its result. Prefer the fresh durable value over that snapshot.
+        record.family = record.family or family
         was_continuation = record.continuation
         self._consume_attempt(record)
         if not self._persist(record):
             return
+        self._launched_this_cycle.add((record.identity, record.launch_token))
         started = getattr(self._gate, "started", None)
         if started is not None:
             started(record)
@@ -1079,6 +1463,9 @@ class Coordinator:
             if not self._persist(record):  # parsed outcome precedes any external projection
                 return None
         if verified:
+            project_outcome = getattr(self._adapter, "project_outcome", None)
+            if project_outcome is not None:
+                project_outcome(record, obs)
             record.state = COMPLETED
             if not self._persist(record, retire_descendants=True):
                 return None
@@ -1262,11 +1649,13 @@ class Coordinator:
     def _release(self, record: Record) -> None:
         record.process_alive = False
 
-    def _record_telemetry(self, record: Record, obs, *, outcome, verified: bool) -> None:
-        """Stamp this ended attempt's durable spend entry, keyed by its launch token (ADR 0040).
+    def _record_telemetry(self, record: Record, obs, *, outcome, verified: bool,
+                          interrupted_by_restart: bool = False) -> None:
+        """Stamp an ended or restart-interrupted attempt's durable spend entry by launch token.
 
-        Every attempt that ends is recorded — a completed stage, a superseded retry, a held
-        exhaustion — so no spend is lost. A telemetry write never fails a cycle: the durable
+        Every ended attempt is recorded — a completed stage, a superseded retry, a held
+        exhaustion — and restart recovery records the still-running attempt before re-admission,
+        so no observed helper spend is lost. A telemetry write never fails a cycle: the durable
         session artifact still carries the raw usage to re-derive later if the write is lost."""
         from agentflow.coordinator.profiles import profile_for
 
@@ -1282,9 +1671,11 @@ class Coordinator:
             restart_resumes=record.restart_resumes, round=record.round,
             conflict_round=record.conflict_round,
             verified=verified, outcome=outcome or "",
-            verify_miss=record.verify_miss,
-            cause=obs.cause.value, classification=obs.classification(),
+            verify_miss=record.verify_miss if not interrupted_by_restart else "",
+            cause=obs.cause.value,
+            classification="incomplete" if interrupted_by_restart else obs.classification(),
             started_at=record.started_at, finalized_at=int(time.time()),
+            interrupted_by_restart=interrupted_by_restart,
             usage=getattr(obs, "usage", AttemptUsage()))
         record_attempt(self._store.path, entry)
         # The provider's own five-hour quota fact, when this attempt's stream reported one, is the
@@ -1341,6 +1732,39 @@ def _identity(repo: str, subject: str, stage: str, target: str | None, round: in
     if uncertainty_handoffs:
         parts.append(f"u{uncertainty_handoffs}")
     return "|".join(parts)
+
+
+_COMMIT_REVISION = re.compile(r"^[a-f0-9]{40}$")
+
+
+def _subject_revision(submission: Submission) -> str:
+    """Capture the one source commit before the first durable write."""
+    if type(submission.target) is str and _COMMIT_REVISION.fullmatch(submission.target):
+        return submission.target
+    if type(submission.input_ptr) is str:
+        try:
+            source_ref = json.loads(submission.input_ptr).get("source_ref")
+        except (TypeError, ValueError, AttributeError):
+            source_ref = None
+        if type(source_ref) is str and _COMMIT_REVISION.fullmatch(source_ref):
+            return source_ref
+    candidates = []
+    if submission.source:
+        candidates.append((submission.source, "HEAD"))
+    if submission.capability_root:
+        candidates.append((submission.capability_root, "origin/main"))
+    for root, ref in candidates:
+        try:
+            result = subprocess.run(
+                ["git", "-C", root, "rev-parse", "--verify", f"{ref}^{{commit}}"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, check=False, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        revision = result.stdout.strip()
+        if result.returncode == 0 and _COMMIT_REVISION.fullmatch(revision):
+            return revision
+    return ""
 
 
 def _refusal_state(record: Record):

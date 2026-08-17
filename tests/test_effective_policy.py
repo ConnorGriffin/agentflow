@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from hashlib import sha256
 import inspect
 import json
+import subprocess
 
 import pytest
 
@@ -23,6 +24,7 @@ from agentflow.effective_policy import (
     BriefingReceipt,
     CapabilityRequirement,
     EffectivePolicyResolver,
+    ExactRevisionRepositoryOverlaySource,
     FleetPolicyV1,
     HoldBriefing,
     NarrowBound,
@@ -99,6 +101,246 @@ class ReceiptReader:
             raise self.error
         return self.receipts[receipt_id]
 
+    def fleet_policy_successors(self, receipt_id):
+        return tuple(item for key, item in self.receipts.items() if key != receipt_id)
+
+
+def test_repository_overlay_reads_exact_revision_not_mutable_head(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"],
+                   check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    overlay_path = repo / ".agentflow" / "briefing-overlay-v1.json"
+    overlay_path.parent.mkdir()
+    overlay_path.write_bytes(_canonical(_overlay_value(holds=["missing_policy"])))
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "old overlay"], check=True)
+    old = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+        text=True, stdout=subprocess.PIPE).stdout.strip()
+    overlay_path.write_bytes(_canonical(_overlay_value(holds=[])))
+    subprocess.run(["git", "-C", str(repo), "commit", "-qam", "new overlay"], check=True)
+
+    source = ExactRevisionRepositoryOverlaySource({REPOSITORY: repo})
+    assert source.read(REPOSITORY, old).holds == ("missing_policy",)
+    assert source.read(REPOSITORY, old).canonical_bytes != overlay_path.read_bytes()
+
+
+def test_repository_overlay_retries_show_timeout_once_and_reports_sanitized_diagnostic(
+        tmp_path, monkeypatch):
+    root = tmp_path / "configured-root"
+    root.mkdir()
+    encoded = _canonical(_overlay_value())
+    calls = []
+    diagnostics = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        if len(calls) == 1:
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"], output=b"secret")
+        return subprocess.CompletedProcess(command, 0, stdout=encoded)
+
+    monkeypatch.setattr(effective_policy.subprocess, "run", run)
+    source = ExactRevisionRepositoryOverlaySource(
+        {REPOSITORY: root}, on_diagnostic=diagnostics.append)
+
+    assert source.read(REPOSITORY, REVISION) is not None
+    assert calls == [
+        ["git", "show", f"{REVISION}:.agentflow/briefing-overlay-v1.json"],
+        ["git", "show", f"{REVISION}:.agentflow/briefing-overlay-v1.json"],
+    ]
+    assert len(diagnostics) == 1
+    assert "repository=octo/repo" in diagnostics[0]
+    assert f"revision={REVISION}" in diagnostics[0]
+    assert str(root) not in diagnostics[0]
+    assert "phase=show" in diagnostics[0]
+    assert "error_class=CLOSED" in diagnostics[0]
+    assert "secret" not in diagnostics[0]
+
+
+def test_repository_overlay_reports_lookup_diagnostic_for_unconfigured_repository(tmp_path):
+    diagnostics = []
+    source = ExactRevisionRepositoryOverlaySource(
+        {REPOSITORY: tmp_path}, on_diagnostic=diagnostics.append)
+
+    with pytest.raises(effective_policy.OverlayUnavailableError,
+                       match="repository or revision is unavailable"):
+        source.read("other/repo", REVISION)
+
+    assert len(diagnostics) == 1
+    assert "repository=other/repo" in diagnostics[0]
+    assert f"revision={REVISION}" in diagnostics[0]
+    assert "phase=lookup" in diagnostics[0]
+    assert str(tmp_path) not in diagnostics[0]
+
+
+def test_repository_overlay_retries_ls_tree_oserror_once_then_returns_absent_quietly(
+        tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    calls = []
+    diagnostics = []
+
+    def run(command, **_kwargs):
+        calls.append(command)
+        if command[1] == "show":
+            return subprocess.CompletedProcess(command, 1, stdout=b"")
+        if len(calls) == 2:
+            raise OSError("private launch detail")
+        return subprocess.CompletedProcess(command, 0, stdout=b"")
+
+    monkeypatch.setattr(effective_policy.subprocess, "run", run)
+    source = ExactRevisionRepositoryOverlaySource(
+        {REPOSITORY: root}, on_diagnostic=diagnostics.append)
+
+    assert source.read(REPOSITORY, REVISION) is None
+    assert len(calls) == 3
+    assert len(diagnostics) == 1
+    assert "phase=ls-tree" in diagnostics[0]
+    assert "private launch detail" not in diagnostics[0]
+
+
+def test_repository_overlay_does_not_retry_parse_failure(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    calls = []
+    diagnostics = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout=b"not-json")
+
+    monkeypatch.setattr(effective_policy.subprocess, "run", run)
+    source = ExactRevisionRepositoryOverlaySource(
+        {REPOSITORY: root}, on_diagnostic=diagnostics.append)
+
+    with pytest.raises(PolicyValidationError):
+        source.read(REPOSITORY, REVISION)
+    assert len(calls) == 1
+    assert len(diagnostics) == 1
+    assert "phase=parse" in diagnostics[0]
+
+
+def test_repository_overlay_decoder_limit_failure_is_permanent_at_resolver(
+        tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    malformed = b'{"integer":' + b"1" * 5_000 + b"}"
+
+    def run(command, **_kwargs):
+        return subprocess.CompletedProcess(command, 0, stdout=malformed)
+
+    monkeypatch.setattr(effective_policy.subprocess, "run", run)
+    resolver = EffectivePolicyResolver(
+        promotion_receipts=object(),
+        overlay_source=ExactRevisionRepositoryOverlaySource({REPOSITORY: root}),
+    )
+
+    assert resolver.brief_for(
+        REPOSITORY, "review", REVISION).hold_code == "invalid_overlay_authority"
+
+
+def test_repository_overlay_retries_show_oserror_once_then_remains_fail_closed(
+        tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    calls = []
+    diagnostics = []
+
+    def run(command, **_kwargs):
+        calls.append(command)
+        raise OSError("launch detail")
+
+    monkeypatch.setattr(effective_policy.subprocess, "run", run)
+    source = ExactRevisionRepositoryOverlaySource(
+        {REPOSITORY: root}, on_diagnostic=diagnostics.append)
+
+    with pytest.raises(effective_policy.OverlayUnavailableError, match="unavailable"):
+        source.read(REPOSITORY, REVISION)
+    assert len(calls) == 2
+    assert len(diagnostics) == 1
+    assert all("phase=show" in diagnostic for diagnostic in diagnostics)
+
+
+def test_repository_overlay_does_not_retry_unavailable_revision(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    calls = []
+
+    def run(command, **_kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 1, stdout=b"")
+
+    monkeypatch.setattr(effective_policy.subprocess, "run", run)
+    source = ExactRevisionRepositoryOverlaySource({REPOSITORY: root})
+
+    with pytest.raises(effective_policy.OverlayUnavailableError, match="revision is unavailable"):
+        source.read(REPOSITORY, REVISION)
+    assert len(calls) == 2
+
+
+def test_production_coordinator_wires_agentflow_log_to_overlay_diagnostics(monkeypatch):
+    import agentflow.pipeline as pipeline
+
+    captured = {}
+
+    class Source:
+        def __init__(self, repositories, *, on_diagnostic=None):
+            captured["source"] = (repositories, on_diagnostic)
+
+    class Resolver:
+        def __init__(self, **kwargs):
+            captured["resolver"] = kwargs
+
+    monkeypatch.setattr(effective_policy, "ExactRevisionRepositoryOverlaySource", Source)
+    monkeypatch.setattr(effective_policy, "EffectivePolicyResolver", Resolver)
+    monkeypatch.setattr(pipeline, "Store", lambda *args, **kwargs: object())
+    monkeypatch.setattr(pipeline, "Coordinator", lambda **kwargs: kwargs)
+    logs = []
+
+    pipeline.build_coordinator(logs.append, repositories={REPOSITORY: "/configured/root"})
+
+    repositories, callback = captured["source"]
+    assert repositories == {REPOSITORY: "/configured/root"}
+    callback("diagnostic")
+    assert logs == ["diagnostic"]
+
+
+def test_repository_overlay_distinguishes_missing_path_from_corrupt_present_object(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"],
+                   check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "--allow-empty", "-qm", "absent"],
+                   check=True)
+    missing_revision = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, text=True,
+        stdout=subprocess.PIPE).stdout.strip()
+    source = ExactRevisionRepositoryOverlaySource({REPOSITORY: repo})
+    assert source.read(REPOSITORY, missing_revision) is None
+
+    overlay_path = repo / ".agentflow" / "briefing-overlay-v1.json"
+    overlay_path.parent.mkdir()
+    overlay_path.write_bytes(_canonical(_overlay_value()))
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "present"], check=True)
+    present_revision = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, text=True,
+        stdout=subprocess.PIPE).stdout.strip()
+    blob = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse",
+         "HEAD:.agentflow/briefing-overlay-v1.json"], check=True, text=True,
+        stdout=subprocess.PIPE).stdout.strip()
+    (repo / ".git" / "objects" / blob[:2] / blob[2:]).unlink()
+
+    with pytest.raises(effective_policy.OverlayUnavailableError,
+                       match="overlay object is unavailable"):
+        source.read(REPOSITORY, present_revision)
+
 
 def _actual(expected):
     authority = expected.authority
@@ -154,8 +396,9 @@ def test_pins_contract_and_only_read_only_authorities_are_imported_or_called():
     assert set(STAGES) == {
         "intake", "attack", "research", "build", "review", "revise", "mockup", "respond"}
     assert set(HOLD_CODES) == {
-        "missing_policy", "incompatible_policy", "invalid_overlay", "missing_receipt",
-        "invalid_receipt", "invalid_briefing", "briefing_overflow"}
+        "missing_policy", "incompatible_policy", "invalid_overlay",
+        "invalid_overlay_authority", "missing_receipt", "invalid_receipt",
+        "invalid_briefing", "briefing_overflow"}
     module = ast.parse(inspect.getsource(__import__(
         "agentflow.effective_policy", fromlist=["effective_policy"])))
     imports = {
@@ -206,6 +449,8 @@ def test_overlay_can_add_each_closed_hold_code(hold_code):
 def test_each_native_failure_path_maps_to_the_closed_vocabulary():
     assert _resolver(overlay_error=OSError("secret")).brief_for(
         REPOSITORY, "review", REVISION).hold_code == "invalid_overlay"
+    assert _resolver(overlay_error=PolicyValidationError("secret")).brief_for(
+        REPOSITORY, "review", REVISION).hold_code == "invalid_overlay_authority"
     assert _resolver(receipt_error=OSError("secret")).brief_for(
         REPOSITORY, "review", REVISION).hold_code == "missing_receipt"
     expected = PINNED_EVALUATION_POLICY.receipts[0]
@@ -365,7 +610,7 @@ def test_overlay_fold_only_removes_narrows_holds_or_marks_stage_not_applicable()
 ])
 def test_new_targets_and_conflicting_restrictions_are_invalid_overlay(changes):
     assert _resolver(overlay=_overlay(**changes)).brief_for(
-        REPOSITORY, "review", REVISION).hold_code == "invalid_overlay"
+        REPOSITORY, "review", REVISION).hold_code == "invalid_overlay_authority"
 
 
 def test_widened_bound_wrong_repository_or_version_is_invalid_overlay():
@@ -378,7 +623,7 @@ def test_widened_bound_wrong_repository_or_version_is_invalid_overlay():
     assert EffectivePolicyResolver._apply_overlay(policy, widened) is None
     for overlay in (_overlay(repository="other/repo"), _overlay(policy_version=2)):
         assert _resolver(overlay=overlay).brief_for(
-            REPOSITORY, "review", REVISION).hold_code == "invalid_overlay"
+            REPOSITORY, "review", REVISION).hold_code == "invalid_overlay_authority"
 
 
 def test_overlay_rejects_unknown_duplicate_recursive_duplicate_unsorted_and_bad_digest():
@@ -409,7 +654,7 @@ def test_forged_typed_overlay_is_revalidated_before_any_field_is_applied():
         object.__setattr__(forged, field.name, getattr(valid, field.name))
     object.__setattr__(forged, "overlay_digest", "0" * 64)
     result = _resolver(overlay=forged).brief_for(REPOSITORY, "review", REVISION)
-    assert result.hold_code == "invalid_overlay"
+    assert result.hold_code == "invalid_overlay_authority"
 
 
 @pytest.mark.parametrize("field,value", [
@@ -561,6 +806,14 @@ def test_ready_briefing_validator_accepts_exact_16384_and_rejects_16385():
     over_policy = _sized_policy(16385)
     with pytest.raises(PolicyValidationError, match="briefing overflow"):
         _direct_ready(over_policy)
+
+
+def test_ready_briefing_version_is_its_newest_included_receipt():
+    policy = FleetPolicyV1(
+        2, PINNED_EVALUATION_POLICY.receipts, PINNED_EVALUATION_POLICY.capabilities)
+
+    with pytest.raises(PolicyValidationError, match="receipt policy version mismatch"):
+        _direct_ready(policy)
 
 
 def test_brief_for_accepts_exact_16384_and_returns_overflow_at_16385(monkeypatch):

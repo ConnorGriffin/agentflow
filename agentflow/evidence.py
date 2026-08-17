@@ -192,6 +192,10 @@ class EvidenceError(ValueError):
     """Evidence input or durable state was rejected fail-closed."""
 
 
+class PromotionReceiptChainError(EvidenceError):
+    """A verified receipt set did not form one consecutive fleet-policy chain."""
+
+
 def _token(value: str, name: str) -> None:
     if not isinstance(value, str) or not _ID.fullmatch(value) or "?" in value or "#" in value:
         raise EvidenceError(f"invalid {name}")
@@ -495,6 +499,7 @@ class EvidenceRecord:
     review_action: str
     validation_states: tuple[str, ...]
     links: tuple[EvidenceLink, ...]
+    normalized_signature: str = ""
     reviewed_parent_revision: str = ""
     fixer_revision: str = ""
 
@@ -579,6 +584,7 @@ class EvidenceReceiptReader:
         _token(event_id, "event_id")
         try:
             with self._connect() as conn:
+                EvidenceStore._validate_graph(conn)
                 row = conn.execute(
                     "SELECT * FROM events WHERE event_id=?", (event_id,)).fetchone()
                 if row is None:
@@ -596,7 +602,8 @@ class EvidenceReceiptReader:
                 return EvidenceRecord(
                     event_id, row["event_kind"], row["subject"], row["revision"],
                     row["failure_class"], row["producer_kind"], row["review_action"], states,
-                    links, "" if lineage is None else lineage["parent_revision"],
+                    links, row["fact_digest"] if row["event_kind"] == "failure_observation" else "",
+                    "" if lineage is None else lineage["parent_revision"],
                     "" if lineage is None else lineage["fixer_revision"],
                 )
         except sqlite3.Error as error:
@@ -648,6 +655,39 @@ class PromotionReceiptReader:
         except sqlite3.Error as error:
             raise EvidenceError("promotion receipt store is unavailable") from error
 
+    def fleet_policy_successors(self, receipt_id: str) -> tuple[PromotionReceipt, ...]:
+        """Return the verified, consecutive fleet-policy chain after one exact receipt."""
+        _token(receipt_id, "receipt_id")
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM receipts WHERE binding_status='verified'"
+                ).fetchall()
+                receipts = tuple(EvidenceStore._receipt(row) for row in rows)
+        except sqlite3.Error as error:
+            raise EvidenceError("promotion receipt store is unavailable") from error
+        from agentflow.promotion_contract import PromotionAuthorityError, parse_promotion_scope
+        chain: list[tuple[object, PromotionReceipt]] = []
+        try:
+            for receipt in receipts:
+                scope = parse_promotion_scope(receipt.authority.approved_scope)
+                if scope.kind == "fleet":
+                    chain.append((scope, receipt))
+        except (AttributeError, PromotionAuthorityError) as error:
+            raise PromotionReceiptChainError(
+                "promotion receipt chain was not accepted") from error
+        chain.sort(key=lambda item: (item[0].new, item[1].receipt_id))
+        if not chain or chain[0][1].receipt_id != receipt_id:
+            raise EvidenceError("unknown promotion receipt")
+        prior = 0
+        for scope, receipt in chain:
+            if (scope.prior != prior or scope.new != prior + 1
+                    or receipt.policy_version != scope.new):
+                raise PromotionReceiptChainError(
+                    "promotion receipt chain was not accepted")
+            prior = scope.new
+        return tuple(receipt for _, receipt in chain[1:])
+
 
 class EvidenceStore:
     """The sole governed five-verb Evidence interface; its schema is fail-closed."""
@@ -656,6 +696,26 @@ class EvidenceStore:
         self.verifier = verifier or FakeAuthorityVerifier()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn: self._initialize(conn)
+
+    @staticmethod
+    def _is_initialized_empty(path: Path) -> bool:
+        encoded = quote(path.resolve().as_posix(), safe="/")
+        conn: sqlite3.Connection | None = None
+        try:
+            conn = sqlite3.connect(f"file:{encoded}?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA query_only = ON")
+            conn.execute("BEGIN")
+            EvidenceStore._initialize(conn)
+            tables = ("events", "observations", "evaluations", "candidates",
+                      "candidate_events", "receipts", "event_links")
+            return all(conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is None
+                       for table in tables)
+        except (sqlite3.Error, EvidenceError):
+            return False
+        finally:
+            if conn is not None:
+                conn.close()
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path)
@@ -1124,6 +1184,8 @@ class EvidenceStore:
                 scope = parse_promotion_scope(authority.scope)
             except PromotionAuthorityError as error:
                 raise EvidenceError("promotion scope was not accepted") from error
+            if scope.new != scope.prior + 1:
+                raise EvidenceError("promotion scope must allocate the next policy version")
             if (candidate["proposal_digest"] != authority.content_hash
                     or candidate["policy_version"] != scope.new):
                 raise EvidenceError("candidate does not bind the promotion authority")

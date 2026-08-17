@@ -47,6 +47,16 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
 - **Evidence briefing** — the bounded canonical-event projection prepared for one
   subject; it is not a transcript, source archive, or alternate decision authority.
 
+- **Observational report** — a read-only projection of durable terminal review/revise
+  outcomes for one repository and bounded UTC window. It records association and
+  missingness only; it does not perform causal evaluation, generate lessons automatically,
+  or mutate policy.
+
+- **Observational cohort** — the bounded subjects selected by one observational report's
+  immutable terminal and telemetry facts. An operator may compare two reports manually;
+  that comparison remains observational, not causal, and does not itself generate lessons
+  or mutate policy.
+
 - **Environment failure** — a failure of the execution environment rather than the
   subject under examination; it is not evidence of a product or process defect.
 
@@ -399,6 +409,12 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
   A read-only stage owns no partial work, so beyond one repair a fresh session would replay
   identically — so it parks for a human instead (ADR 0043).
   *Avoid:* retry, replay (both imply re-running the same empty attempt).
+
+- **Capability repair** — one coordinator-owned, enrollment-locked attempt to materialize an
+  absent pinned provider destination or runtime after the authoritative launch-root probe observes
+  the deterministic gap. It is followed by one fresh probe in the same cycle; drift, symlinks,
+  unknown content, and an unchanged failed repair remain on the capability refusal clock.
+  *Avoid:* targeted repair (that is a fresh stage session repairing a missing stage outcome).
 
 - **Stage outcome** — the durable fact a pipeline stage must produce before the pipeline
   can advance, such as an intake route, opened PR, or review verdict. A clean process exit

@@ -33,17 +33,243 @@ from agentflow.coordinator import (AttackStageAdapter, BuildStageAdapter, Conver
                                    ResearchStageAdapter, RespondStageAdapter, ReviewStageAdapter,
                                    ReviseStageAdapter, StageRouter, tracer)
 from agentflow.coordinator.admission import MACHINE_CEILING, STAGE_CAPS
-from agentflow.coordinator.store import ReservationLimits, StoreUnavailable, default_store_path
+from agentflow.coordinator.store import (
+    OperationalSafetyAndCanary, ReservationLimits, SafetySources, Store, StoreUnavailable,
+    default_store_path,
+)
 from agentflow.gate import MAX_REVISES, revise_round_budget_remains
 from agentflow.labels import BUILDING, DRAWING, RESOLVING, TRIAGING
 from agentflow.pr_park import park_pr
 from agentflow.repo_facts import repo_profile
-from agentflow.review_policy import CONFLICT_UNCERTAINTY_PREFIX
+from agentflow.review_policy import CONFLICT_UNCERTAINTY_PREFIX, current_head_author
 from agentflow.stage_worktree import worktree_ready
 from agentflow.worktree_ref import source_facts
 
 
 _ORPHAN_CLAIM_GRACE_SECONDS = 60 * 60
+
+
+def recover_capability(
+    repository: str, config, *, acquire_lock, release_lock
+) -> tuple[int, dict]:
+    """Recover never-started incompatible Intake/Build records onto one enrolled root."""
+    import json
+
+    from agentflow.capability_contracts import preflight
+    from agentflow.coordinator import Submission
+    from agentflow.coordinator.record import COMPLETED, NOT_STARTED, WAITING
+    from agentflow.prompts import requirements_for
+    from agentflow.repo_facts import surface_declaration
+    from agentflow.worktree_ref import WorktreeKind, WorktreeRef, capture_subject_revision
+
+    report = {"repository": repository, "revision": "", "results": []}
+    matches = [cfg for cfg in config.repositories if cfg.repo == repository]
+    if len(matches) != 1:
+        report["results"] = [{"predecessor": "", "successor": "", "status": "skipped",
+                              "reason": "repository-unconfigured"}]
+        return 1, report
+    try:
+        acquired = acquire_lock(_log=lambda _message: None)
+    except OSError:
+        release_lock()
+        acquired = False
+    if not acquired:
+        report["results"] = [{"predecessor": "", "successor": "", "status": "skipped",
+                              "reason": "daemon-running"}]
+        return 1, report
+    try:
+        root = Path(matches[0].workdir)
+        declared_root = Path(matches[0].declared_workdir or matches[0].workdir)
+        root_usable = (root.is_dir() and not root.is_symlink()
+                       and not declared_root.is_symlink())
+        revision = capture_subject_revision(str(root)) if root_usable else ""
+    except BaseException:
+        release_lock()
+        raise
+    if not root_usable or not revision:
+        reason = "root-unusable" if not root_usable else "revision-unreadable"
+        report["results"] = [{"predecessor": "", "successor": "", "status": "skipped",
+                              "reason": reason}]
+        release_lock()
+        return 1, report
+    report["revision"] = revision
+    try:
+        store = Store(default_store_path())
+    except StoreUnavailable:
+        report["results"] = [{"predecessor": "", "successor": "", "status": "skipped",
+                              "reason": "transfer-failed"}]
+        release_lock()
+        return 2, report
+    except BaseException:
+        release_lock()
+        raise
+    try:
+        try:
+            records = store.load()
+        except StoreUnavailable:
+            report["results"] = [{"predecessor": "", "successor": "", "status": "skipped",
+                                  "reason": "transfer-failed"}]
+            return 2, report
+        candidates = sorted(
+            (r for r in records.values() if r.repo == repository
+             and r.refusal == "capability_environment_failure:incompatible"),
+            key=lambda r: r.identity)
+        context = {"ui": bool(surface_declaration(str(root)).surfaces)}
+        prepared: list[tuple[object, Submission]] = []
+        refused: list[dict[str, str]] = []
+        validation_failed = False
+        for prior in candidates:
+            result = {"predecessor": prior.identity, "successor": "", "status": "skipped",
+                      "reason": ""}
+            if prior.stage not in {"intake", "build"}:
+                result["reason"] = "unsupported-stage"
+                refused.append(result)
+                validation_failed = True
+                continue
+            started = bool(
+                prior.attempts or prior.attempt_committed or prior.launch_token or prior.started_at
+                or prior.family or prior.process_alive
+                or prior.start_fact not in {None, NOT_STARTED})
+            if started:
+                result["reason"] = "started"
+                refused.append(result)
+                validation_failed = True
+                continue
+            fresh = (prior.state == WAITING and prior.claim and not prior.retired
+                     and not prior.hold_pending)
+            recovered = prior.state == COMPLETED and prior.retired and not prior.claim
+            if not fresh and not recovered:
+                result["reason"] = "ineligible-state"
+                refused.append(result)
+                validation_failed = True
+                continue
+            try:
+                subject = int(prior.subject)
+            except (TypeError, ValueError):
+                result["reason"] = "input-unreadable"
+                refused.append(result)
+                validation_failed = True
+                continue
+            try:
+                payload = (json.loads(prior.input_ptr or "") if prior.stage == "intake"
+                           else prior.input_ptr)
+            except (TypeError, ValueError):
+                payload = None
+            if ((prior.stage == "intake" and not isinstance(payload, dict))
+                    or (prior.stage == "build" and not isinstance(payload, str))):
+                result["reason"] = "input-unreadable"
+                refused.append(result)
+                validation_failed = True
+                continue
+            ref = WorktreeRef.parse(prior.source)
+            source_path = Path(prior.source or "")
+            expected_kind = (WorktreeKind.INTAKE if prior.stage == "intake"
+                             else WorktreeKind.BUILD)
+            owner = prior.pool if prior.stage == "intake" else (prior.branch_lineage or prior.pool)
+            valid_source = bool(
+                ref is not None and ref.kind is expected_kind and ref.tool == owner
+                and str(ref.number) == str(prior.subject) and source_path.is_dir()
+                and not source_path.is_symlink()
+                and (prior.stage == "intake" or prior.lineage == prior.pool))
+            if not valid_source:
+                result["reason"] = "source-unreadable"
+                refused.append(result)
+                validation_failed = True
+                continue
+            if not preflight(root, prior.stage, prior.pool,
+                             requirements_for(prior.stage, context)).ready:
+                result["reason"] = "capability-not-ready"
+                refused.append(result)
+                validation_failed = True
+                continue
+            resume = prior.resume + 1
+            if prior.stage == "intake":
+                payload["source_ref"] = revision
+                source = WorktreeRef.for_intake(str(root), prior.pool, subject).path
+                input_ptr = json.dumps(payload, sort_keys=True)
+                branch = prior.branch_lineage
+            else:
+                lane = f"{prior.pool}-recovery-s{resume}"
+                source = WorktreeRef.for_build(str(root), lane, subject, ref.slug).path
+                input_ptr, branch = prior.input_ptr, lane
+            submission = Submission(
+                repo=repository,
+                subject=prior.subject,
+                stage=prior.stage,
+                target=prior.target,
+                pool=prior.pool,
+                complexity=prior.complexity,
+                effort=prior.effort,
+                source=source,
+                input_ptr=input_ptr,
+                claim=True,
+                resume=resume,
+                builder_lineage=prior.builder_lineage,
+                branch_lineage=branch,
+                builder_complexity=prior.builder_complexity,
+                builder_effort=prior.builder_effort,
+                session_lead=prior.session_lead,
+                capability_root=str(root),
+                capability_context=context,
+                subject_revision=revision,
+                transfer_from=prior.identity,
+                supersede=True,
+                continuation=prior.continuation,
+                interactive=prior.interactive,
+                floodgates=prior.floodgates,
+            )
+            prepared.append((prior, submission))
+        if refused:
+            report["results"] = sorted(refused, key=lambda item: item["predecessor"])
+            return (1 if validation_failed else 2), report
+        coordinator = Coordinator(store=store)
+        already_recovered = []
+        for prior, submission in prepared:
+            if prior.state != COMPLETED:
+                continue
+            try:
+                identity = coordinator.submit_stage(submission)
+            except StoreUnavailable as exc:
+                reason = ("successor-conflict" if "successor is already occupied" in str(exc)
+                          else "transfer-failed")
+                report["results"] = [{"predecessor": prior.identity, "successor": "",
+                                      "status": "skipped", "reason": reason}]
+                return 2, report
+            already_recovered.append((prior, identity))
+        report["results"].extend(
+            {"predecessor": prior.identity, "successor": identity,
+             "status": "already_recovered", "reason": "already-recovered"}
+            for prior, identity in already_recovered)
+        for prior, submission in prepared:
+            if prior.state == COMPLETED:
+                continue
+            try:
+                identity = coordinator.submit_stage(submission)
+            except StoreUnavailable as exc:
+                reason = ("successor-conflict" if "successor is already occupied" in str(exc)
+                          else "transfer-failed")
+                report["results"].append({"predecessor": prior.identity, "successor": "",
+                                          "status": "skipped", "reason": reason})
+                report["results"].sort(key=lambda item: item["predecessor"])
+                return 2, report
+            report["results"].append({
+                "predecessor": prior.identity, "successor": identity,
+                "status": "recovered", "reason": "recovered"})
+        report["results"].sort(key=lambda item: item["predecessor"])
+        return 0, report
+    finally:
+        try:
+            store.close()
+        finally:
+            release_lock()
+
+
+def production_store() -> Store:
+    """Build the one production admission owner; callers never open sealed sub-owners."""
+    from agentflow.evidence import PromotionReceiptReader
+    reader = PromotionReceiptReader.for_production()
+    return Store(default_store_path(), admission_mode=OperationalSafetyAndCanary(
+        SafetySources(), reader))
 
 
 def owned_issues(cfg, *, store_path=None, lane=None) -> set[int]:
@@ -142,7 +368,7 @@ def reconcile_orphaned_claims(cfg, *, _log=None) -> int:
 
 
 # --- production wiring (live orchestration; not unit-tested, ADR 0020) -------------------
-def _capability_preflight(record, materialize: bool):
+def _capability_preflight(record, materialize: bool, *, _log=None):
     """Validate the prepared provider launch root, including historical durable records."""
     from agentflow.capability_contracts import CapabilityPreflightResult, preflight
     from agentflow.prompts import STAGE_PROMPTS, requirements_for
@@ -191,18 +417,43 @@ def _capability_preflight(record, materialize: bool):
             f"agentflow enroll {repair_root} --apply")
     context = dict(durable_context)
     context["ui"] = bool(declaration.surfaces)
+    requirements = requirements_for(record.stage, context)
     if materialize:
-        ok, detail = materialize_launch_capabilities(source_root, actual_root, record.pool)
+        requirement_ids = {requirement.id for requirement in requirements}
+        materialize_runtime = any(requirement.runtime for requirement in requirements)
+        materialize_kwargs = {
+            "materialize_runtime": materialize_runtime,
+            "requirement_ids": requirement_ids,
+        }
+        if _log is not None:
+            materialize_kwargs["_log"] = _log
+        ok, detail = materialize_launch_capabilities(
+            source_root, actual_root, record.pool, **materialize_kwargs
+        )
         if not ok:
             return CapabilityPreflightResult(
-                record.stage, record.pool, requirements_for(record.stage, context),
+                record.stage, record.pool, requirements,
                 "incompatible", (f"launch-root-materialization-failed: {detail}",),
                 f"agentflow enroll {actual_root} --apply")
-    return preflight(inspection_root, record.stage, record.pool,
-                     requirements_for(record.stage, context))
+    return preflight(inspection_root, record.stage, record.pool, requirements)
 
 
-def build_coordinator(_log=None) -> Coordinator:
+def _repair_capability_refusal(record, capability):
+    """Route deterministic source-root repairs through enrollment's locked operation."""
+    from agentflow.enroll import repair_capability_refusal
+    from agentflow.worktree_ref import WorktreeRef
+
+    root = Path(record.capability_root) if record.capability_root else None
+    if root is None and record.source:
+        parsed = WorktreeRef.parse(record.source)
+        root = Path(parsed.workdir) if parsed is not None else Path(record.source)
+    if root is None:
+        return None
+    return repair_capability_refusal(root, record.pool, capability.contracts)
+
+
+def build_coordinator(_log=None, *, repositories=None, store=None, briefing_resolver=None,
+                      evidence_store=None) -> Coordinator:
     """The daemon's coordinator for all nine logical stages (issues #103–#108, ADR 380).
     Its Build adapter verifies the real PR outcome and reuses the retained worktree; its Review
     adapter verifies a durable starting/final-head verdict and retains the detached bounded-fix
@@ -211,12 +462,52 @@ def build_coordinator(_log=None) -> Coordinator:
     same branch and releases the change claim on completion; its Mockup adapter verifies one
     pushed visual round and releases its drawing claim at the human-pick boundary. One
     :class:`StageRouter` dispatches each adapter call on the record's stage."""
+    if evidence_store is None and repositories is not None:
+        from agentflow.evidence import EvidenceStore
+        evidence_store = EvidenceStore()
+
+    def terminal_evidence(record, _obs):
+        if evidence_store is None:
+            return
+        from hashlib import sha256
+        from agentflow.evidence_pipeline import EvidenceProducer, StageFact
+
+        outcome = (coordinated_research.read_findings(record)
+                   if record.stage == "research" else record.outcome)
+        if not outcome:
+            return
+        producer = EvidenceProducer(evidence_store, repository=record.repo)
+        source = producer.stage_source(
+            record.identity, record.stage, str(record.subject), record.subject_revision,
+            sha256((record.input_ptr or "").encode()).hexdigest(),
+            observed_at=max(0, record.started_at))
+        signature = sha256(outcome.encode()).hexdigest()
+        producer.stage(StageFact(
+            record.identity, record.stage, source, signature, "model_judged",
+            max(0, record.started_at),
+            objection_ref=signature if record.stage == "attack" else ""))
+
+    def review_evidence(record, obs):
+        if evidence_store is None:
+            return
+        from agentflow.evidence_pipeline import EvidenceProducer
+        coordinated_review.record_evidence(
+            EvidenceProducer(evidence_store, repository=record.repo), record, obs)
+
+    def revise_evidence(record, obs):
+        if evidence_store is None:
+            return
+        from agentflow.evidence_pipeline import EvidenceProducer
+        coordinated_revise.record_evidence(
+            EvidenceProducer(evidence_store, repository=record.repo), record, obs)
+
     intake = IntakeStageAdapter(
         worktree_reset=coordinated_intake.reset_worktree,
         apply_route=coordinated_intake.apply_route,
         claim_ready=coordinated_intake.intake_claim_ready,
         worktree_dispose=coordinated_intake.dispose_worktree,
-        handoff=coordinated_intake.hold_intake)
+        handoff=coordinated_intake.hold_intake,
+        evidence=terminal_evidence if evidence_store is not None else None)
     build = BuildStageAdapter(
         pr_exists=coordinated_build._pr_exists, worktree_ready=worktree_ready,
         handoff=coordinated_build._hold_build,
@@ -227,11 +518,14 @@ def build_coordinator(_log=None) -> Coordinator:
         worktree_reset=coordinated_review._review_worktree_reset,
         handoff=park_pr,
         settle=coordinated_review._settle_review,
-        prepare_settle=coordinated_review._prepare_review_settlement)
+        prepare_settle=coordinated_review._prepare_review_settlement,
+        evidence=review_evidence if evidence_store is not None else None,
+        capture_state=coordinated_review.capture_verdict_state)
     revise = ReviseStageAdapter(
         revision_ready=coordinated_revise._revision_ready, worktree_ready=worktree_ready,
         handoff=park_pr,
-        uncertainty=coordinated_revise._conflict_uncertainty_outcome)
+        uncertainty=coordinated_revise._conflict_uncertainty_outcome,
+        evidence=revise_evidence if evidence_store is not None else None)
     respond = RespondStageAdapter(
         reply_ready=coordinated_respond._reply_ready, worktree_ready=worktree_ready,
         handoff=coordinated_respond._park_respond,
@@ -252,19 +546,43 @@ def build_coordinator(_log=None) -> Coordinator:
         findings_ready=coordinated_research._findings_ready,
         resolve=coordinated_research.resolve,
         park=coordinated_research.park,
-        worktree_ready=coordinated_research._research_worktree_ready)
+        worktree_ready=coordinated_research._research_worktree_ready,
+        evidence=terminal_evidence if evidence_store is not None else None)
     attack = AttackStageAdapter(
         worktree_reset=coordinated_attack.reset_worktree,
         apply_objections=coordinated_attack.apply_objections,
         claim_ready=coordinated_attack.attack_claim_ready,
         worktree_dispose=coordinated_attack.dispose_worktree,
-        handoff=coordinated_attack.hold_attack)
+        handoff=coordinated_attack.hold_attack,
+        evidence=terminal_evidence if evidence_store is not None else None)
     router = StageRouter({"intake": intake, "build": build, "review": review, "revise": revise,
                           "respond": respond, "mockup": mockup, "converse": converse,
                           "research": research, "attack": attack})
+    if store is None and repositories is not None:
+        from agentflow.effective_policy import (
+            EffectivePolicyResolver, ExactRevisionRepositoryOverlaySource,
+        )
+        from agentflow.evidence import PromotionReceiptReader
+        receipt_reader = PromotionReceiptReader.for_production()
+        store = Store(default_store_path(), admission_mode=OperationalSafetyAndCanary(
+            SafetySources(), receipt_reader))
+        briefing_resolver = EffectivePolicyResolver(
+            promotion_receipts=receipt_reader,
+            overlay_source=ExactRevisionRepositoryOverlaySource(
+                repositories, on_diagnostic=_log))
+    capability_preflight = (
+        _capability_preflight
+        if _log is None
+        else lambda record, materialize: _capability_preflight(
+            record, materialize, _log=_log
+        )
+    )
     return Coordinator(
-        adapter=router, gate=_production_gate(), capability_preflight=_capability_preflight,
+        adapter=router, gate=_production_gate(), capability_preflight=capability_preflight,
+        capability_repair=_repair_capability_refusal,
         disabled_cold_stages=frozenset({"mockup"}), log=_log or (lambda _line: None),
+        store=store, briefing_resolver=briefing_resolver,
+        managed_repositories=(frozenset(repositories) if repositories is not None else None),
     )
 
 
@@ -477,17 +795,21 @@ def _open_review_on_completed_build(coord: Coordinator, build_identity: str) -> 
     acceptance, surfaces = context
     from agentflow.review_policy import ReviewState
     profile = repo_profile(_workdir)
+    author = current_head_author(build.change_author_tool, build.builder_lineage)
+    if author is None:
+        coord.park_completed(build_identity)  # do not infer the head author from its branch lane
+        return
     assignment, _changed_files = coordinated_review._review_assignment_facts(
         build.repo, pr.number, profile=profile)
-    reviewer_tool = (pick_reviewer(build.pool, allow_same_tool=False)
-                     if profile == "autonomous" else pick_reviewer(build.pool))
+    reviewer_tool = (pick_reviewer(author, allow_same_tool=False)
+                     if profile == "autonomous" else pick_reviewer(author))
     if reviewer_tool is None:
         return  # ADR 0020: no tool free to review this cycle — post nothing; the completed
                 # build keeps its claim and this opener re-drives next cycle.
     submission = coordinated_review.review_submission(
         build, pr.head_ref_oid, reviewer_tool, pr.number,
         acceptance=acceptance, surfaces=surfaces,
-        review=ReviewState(assignment=assignment, change_author_tool=build.pool))
+        review=ReviewState(assignment=assignment, change_author_tool=author))
     if submission is not None:
         coord.submit_stage(submission)
 
@@ -695,20 +1017,24 @@ def _open_review_on_completed_revise(coord: Coordinator, revise_identity: str) -
     conflict_resolution = bool(revise.conflict_round)
     from agentflow.review_policy import ReviewState
     profile = repo_profile(_workdir)
+    author = current_head_author(revise.change_author_tool, revise.builder_lineage)
+    if author is None:
+        coord.park_completed(revise_identity)  # no durable author for this exact head
+        return
     inherited = ReviewState.from_record(revise)
     if conflict_resolution and revise.uncertainty_handoffs and inherited is not None:
         # A private decision resolution is a Full product change. The PR-body proposal cannot
         # downgrade the required product+standards pass when the resolved Revise completes.
         review = replace(
             inherited, reviewed_from_sha=revise.target,
-            cross_tool_covered=False, sequence=inherited.sequence + 1)
+            change_author_tool=author, cross_tool_covered=False, sequence=inherited.sequence + 1)
     else:
         assignment, _changed_files = coordinated_review._review_assignment_facts(
             revise.repo, pr.number, conflict_resolution=conflict_resolution, profile=profile)
-        review = ReviewState(assignment=assignment, change_author_tool=revise.pool,
+        review = ReviewState(assignment=assignment, change_author_tool=author,
                              reviewed_from_sha=revise.target)
-    reviewer_tool = (pick_reviewer(revise.pool, allow_same_tool=False)
-                     if profile == "autonomous" else pick_reviewer(revise.pool))
+    reviewer_tool = (pick_reviewer(author, allow_same_tool=False)
+                     if profile == "autonomous" else pick_reviewer(author))
     if reviewer_tool is None:
         return  # ADR 0020: no tool free to review this cycle — post nothing; the completed
                 # revise keeps its claim and this opener re-drives next cycle.
@@ -832,7 +1158,8 @@ def reconcile_and_project(coord: Coordinator, *, _log=None) -> list:
     # die after a stage completion is committed but before it consumes the returned outcome.
     # A completed stage keeps its claim until its successor is atomically persisted.
     for record in tracer.load_records():
-        if (record.state == COMPLETED and not record.retired and record.claim
+        if (coord._manages_repository(record.repo)
+                and record.state == COMPLETED and not record.retired and record.claim
                 and not record.hold_pending):  # a pending park is already retried by reconcile
             opener = _OPENERS.get(record.stage)
             if opener is not None:

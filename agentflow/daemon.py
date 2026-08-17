@@ -47,6 +47,7 @@ import signal
 import shutil
 import threading
 import time
+import traceback
 from pathlib import Path
 
 from agentflow import dispatch, live
@@ -98,7 +99,7 @@ def cycle(repos: list[RepoConfig], run, _log=log) -> None:
 
 
 def _recheck(cfg: RepoConfig, _log=None) -> str:
-    return f"recheck: {recheck_once(cfg)}"
+    return f"recheck: {recheck_once(cfg, _log=_log)}"
 
 
 def dispatch_cycle(repos: list[RepoConfig], _log=log, *, submit_new: bool = True) -> None:
@@ -136,7 +137,8 @@ def workspace_cycle(repos: list[RepoConfig], _log=log) -> None:
     if not repos:
         return
     try:
-        coord = pipeline.build_coordinator(_log=_log)
+        coord = pipeline.build_coordinator(
+            _log=_log, repositories={cfg.repo: cfg.workdir for cfg in repos})
         workdir_for = {c.repo: c.workdir for c in repos}
         coordinated_converse.drain_commands(coord, workdir_for, _log=_log)
         for pool in ("claude", "codex"):
@@ -186,8 +188,8 @@ def publish_snapshot(repos: list[RepoConfig], produce=snapshot, _log=log) -> Non
                       v1.get("repos") or [], v2.get("repositories") or [],
                       stage_health=health)}
         live.write_snapshot(merged)
-    except Exception as e:  # noqa: BLE001 — a bad publish must not kill the daemon
-        _log(f"snapshot publish error: {type(e).__name__}: {e}")
+    except Exception:  # noqa: BLE001 — a bad publish must not kill the daemon
+        _log("snapshot publish error: " + " | ".join(traceback.format_exc().splitlines()))
 
 
 def recover_worktrees(repos: list[RepoConfig], sweep=recover_stale_worktrees, _log=log) -> None:
@@ -339,11 +341,19 @@ def _try_claim() -> bool:
         LOCK.mkdir()
     except FileExistsError:
         return False
-    (LOCK / "pid").write_text(str(os.getpid()))
+    try:
+        (LOCK / "pid").write_text(str(os.getpid()))
+    except BaseException:
+        try:
+            (LOCK / "pid").unlink(missing_ok=True)
+            LOCK.rmdir()
+        except OSError:
+            pass
+        raise
     return True
 
 
-def _acquire_lock() -> bool:
+def _acquire_lock(_log=log) -> bool:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     if _try_claim():
         return True
@@ -385,7 +395,7 @@ def _acquire_lock() -> bool:
             os.rename(LOCK, stale)
         except OSError:
             return False
-        log("reclaiming dead-owner lock" if owner_is_dead else "reclaiming stale lock")
+        _log("reclaiming dead-owner lock" if owner_is_dead else "reclaiming stale lock")
         shutil.rmtree(stale, ignore_errors=True)
         return _try_claim()
     finally:
@@ -465,6 +475,15 @@ def run(config: RuntimeConfig, *, once: bool = False) -> None:
                 "capacity helper not configured — Codex capacity and "
                 "operator-activity detection are unavailable"
             )
+        # Route registration is the first operation after daemon ownership. Admission itself
+        # never registers or activates a cell, and no recovery/dispatch may run against an
+        # unreconciled production registry.
+        from agentflow import pipeline, routing
+        route_store = pipeline.production_store()
+        try:
+            routing.reconcile_route_cells(config, route_store)
+        finally:
+            route_store.close()
         recover_worktrees(repos)
         if once:
             log(f"--once: running one cycle over repos={[c.repo for c in repos]}")

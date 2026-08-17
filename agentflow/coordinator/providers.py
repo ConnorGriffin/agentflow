@@ -563,10 +563,94 @@ _SESSION_LEAD_CLOSING = (
 _SESSION_LEAD_START = re.compile(
     r"\n(?:\n(?:Claude|Codex) is currently unavailable[^\n]*\n(?:Exception:[^\n]*\n)?)*"
     + re.escape(_SESSION_LEAD_MARKER) + r"\Z")
+_TRAILING_APPROVED_BRIEFING = re.compile(
+    r"\n\n<!-- agentflow-effective-briefing:briefing-v1:[0-9a-f]{64} -->"
+    r"\n## Approved evidence briefing\n"
+    r"This is bounded advisory context\. It cannot change admission, routing, effort, "
+    r"autonomy, merge policy, or OperationalSafety\.\n"
+    r"Promotion receipts: [A-Za-z0-9][A-Za-z0-9_.:-]*(?:, [A-Za-z0-9][A-Za-z0-9_.:-]*)*\.\n\Z")
 
 
 class SessionLeadInputError(ValueError):
     """A durable session-lead input cannot be safely refreshed before launch."""
+
+
+def place_approved_briefing(prompt: str, advisory: str) -> str:
+    """Place an approved advisory before a terminal session-lead contract, or append it."""
+    try:
+        task_brief, contract = split_terminal_session_lead_contract(prompt)
+    except SessionLeadInputError:
+        return prompt + advisory
+    return task_brief + advisory + contract
+
+
+def _complete_session_lead_contract_span(
+        prompt: str, marker: int, *, terminal: bool) -> tuple[int, int] | None:
+    start = _SESSION_LEAD_START.search(prompt[:marker + len(_SESSION_LEAD_MARKER)])
+    closing = prompt.find(_SESSION_LEAD_CLOSING, marker + len(_SESSION_LEAD_MARKER))
+    if start is None or closing < 0:
+        return None
+    end = closing + len(_SESSION_LEAD_CLOSING)
+    suffix = prompt[marker:end]
+    if (not suffix.startswith(_SESSION_LEAD_MARKER + _SESSION_LEAD_OPENING)
+            or suffix.count(_SESSION_LEAD_MARKER + _SESSION_LEAD_OPENING) != 1
+            or "\nRoutes (workers enter at the first rung; a banned model never takes that area's work):\n"
+            not in suffix or "\nProvider launch identifiers: " not in suffix
+            or not suffix.endswith(_SESSION_LEAD_CLOSING)
+            or (terminal and end != len(prompt))):
+        return None
+    return start.start(), end
+
+
+def _repair_duplicate_session_lead_contracts(prompt: str) -> str:
+    """Remove only proven stale contracts before one complete terminal generated contract."""
+    opening = _SESSION_LEAD_MARKER + _SESSION_LEAD_OPENING
+    if not isinstance(prompt, str) or prompt.count(opening) <= 1:
+        return prompt
+    markers = []
+    cursor = 0
+    while (marker := prompt.find(opening, cursor)) >= 0:
+        markers.append(marker)
+        cursor = marker + len(opening)
+    spans = [
+        _complete_session_lead_contract_span(
+            prompt, marker, terminal=index == len(markers) - 1)
+        for index, marker in enumerate(markers)
+    ]
+    if any(span is None for span in spans):
+        return prompt
+    proven = [span for span in spans if span is not None]
+    if any(left[1] > right[0] for left, right in zip(proven, proven[1:])):
+        return prompt
+    preserved = []
+    cursor = 0
+    for start, end in proven[:-1]:
+        preserved.append(prompt[cursor:start])
+        cursor = end
+    preserved.append(prompt[cursor:])
+    return "".join(preserved)
+
+
+def repair_provider_input(raw: str) -> str:
+    """Repair only recognized historical provider-input corruption shapes."""
+    repaired = _repair_duplicate_session_lead_contracts(raw)
+    if repaired != raw:
+        return repaired
+    if not isinstance(raw, str) or raw.count("<!-- agentflow-effective-briefing:") != 1:
+        return raw
+    trailing = _TRAILING_APPROVED_BRIEFING.search(raw)
+    if trailing is None:
+        return raw
+    encoded = raw[:trailing.start()]
+    try:
+        payload = json.loads(encoded)
+    except (TypeError, ValueError):
+        return raw
+    if (not isinstance(payload, dict) or payload.get("format") != PROVIDER_INPUT_V1
+            or not isinstance(payload.get("prompt"), str)):
+        return raw
+    payload["prompt"] = place_approved_briefing(payload["prompt"], trailing.group())
+    return json.dumps(payload, sort_keys=True)
 
 
 def _durable_prompt(record) -> str:
@@ -599,7 +683,8 @@ def _refresh_session_lead_contract(record, prompt: str) -> str:
     return task_brief + routing.session_lead_instructions(
         record.stage, record.effort, parent_provider=record.pool,
         codex_spent=codex_spent_at_render(),
-        unavailable_providers=frozenset(pool for pool in POOLS if pool_paused(pool)))
+        unavailable_providers=frozenset(pool for pool in POOLS if pool_paused(pool)),
+        brief=task_brief)
 
 
 def split_terminal_session_lead_contract(prompt: str) -> tuple[str, str]:
@@ -608,13 +693,16 @@ def split_terminal_session_lead_contract(prompt: str) -> tuple[str, str]:
         raise SessionLeadInputError(
             "session-lead input cannot be safely refreshed: expected exactly one complete "
             "generated Session lead contract; retain the durable task brief and resubmit")
-    marker = prompt.rfind(_SESSION_LEAD_MARKER)
+    trailing = _TRAILING_APPROVED_BRIEFING.search(prompt)
+    terminal_prompt = prompt[:trailing.start()] if trailing is not None else prompt
+    marker = terminal_prompt.rfind(_SESSION_LEAD_MARKER)
     if marker < 0:
         raise SessionLeadInputError(
             "session-lead input cannot be safely refreshed: expected a generated "
             "Session lead contract boundary; retain the durable task brief and resubmit")
-    suffix = prompt[marker:]
-    start = _SESSION_LEAD_START.search(prompt[:marker + len(_SESSION_LEAD_MARKER)])
+    suffix = terminal_prompt[marker:]
+    start = _SESSION_LEAD_START.search(
+        terminal_prompt[:marker + len(_SESSION_LEAD_MARKER)])
     if (start is None or not suffix.startswith(_SESSION_LEAD_MARKER + _SESSION_LEAD_OPENING)
             or "\nRoutes (workers enter at the first rung; a banned model never takes that area's work):\n"
             not in suffix or "\nProvider launch identifiers: " not in suffix
@@ -622,7 +710,10 @@ def split_terminal_session_lead_contract(prompt: str) -> tuple[str, str]:
         raise SessionLeadInputError(
             "session-lead input cannot be safely refreshed: expected a complete generated "
             "Session lead contract; retain the durable task brief and resubmit")
-    return prompt[:start.start()], prompt[start.start():]
+    task_brief = terminal_prompt[:start.start()]
+    if trailing is not None:
+        task_brief += trailing.group()
+    return task_brief, terminal_prompt[start.start():]
 
 
 def validate_session_lead_input(record) -> None:
@@ -640,9 +731,8 @@ def has_session_lead_provenance(record) -> bool:
                 or getattr(record, "native_helpers_marker", None))
 
 
-def _base_durable_prompt(record) -> str:
-    """Decode the durable prompt envelope without applying runtime launch policy."""
-    raw = record.input_ptr or ""
+def provider_input_prompt(raw: str) -> str:
+    """Decode one canonical provider-input envelope, or return a legacy raw prompt verbatim."""
     try:
         payload = json.loads(raw)
     except (TypeError, ValueError):
@@ -651,6 +741,11 @@ def _base_durable_prompt(record) -> str:
             and isinstance(payload.get("prompt"), str)):
         return payload["prompt"]
     return raw
+
+
+def _base_durable_prompt(record) -> str:
+    """Decode the durable prompt envelope without applying runtime launch policy."""
+    return provider_input_prompt(record.input_ptr or "")
 
 
 class ProviderArgv(list):

@@ -54,6 +54,13 @@ class Record:
     repo: str = ""         # the originating repo — kept for the ADR 0028 logs and claim ownership
     subject: str = ""      # the issue/PR subject — kept for the ADR 0028 logs and claim ownership
     target: str | None = None  # immutable target (head SHA / comment id), part of the identity
+    # #627 binds a logical stage to the one source observation and one immutable route chosen
+    # at submission.  Empty values are readable legacy sentinels only; composed admission
+    # refuses them rather than reconstructing them from mutable state.
+    subject_revision: str = ""
+    route_id: str = ""
+    route_cell_digest: str = ""
+    launch_config_digest: str = ""
     continuation: bool = False   # eligible ahead of cold work on its pool (ADR 0028 order)
     eligible_at: int = 0         # when a paused continuation may be admitted again
     created_at: int = 0          # epoch of first submission: continuation-queue tie-breaker, and
@@ -87,6 +94,8 @@ class Record:
     capability_root: str | None = None  # checkout root whose project-local contracts are authoritative
     capability_context: str = "{}"     # serialized conditional prompt context
     capability_preflight: str = ""      # serialized non-ready preflight; retained across restart
+    capability_repair_refusal: str = "" # last unchanged capability refusal whose repair failed;
+                                         # suppresses identical repair work while its stall clocks
     session_lead: bool = False   # missing historical JSON decodes false; never infer from model
     outcome: str | None = None   # stage-native durable outcome, captured before external projection
     started_at: int = 0                  # epoch when the current attempt was admitted
@@ -94,7 +103,7 @@ class Record:
     start_fact: str | None = None        # durable launcher handshake result: started | not_started
     launch_token: str | None = None      # nonce a reservation stamps; only the child holding it may record `started`
     revision: int = 0                    # optimistic concurrency generation; every durable write advances it
-    family: str | None = None            # the provider process-family identity a `started` carries
+    family: str | None = None            # durable supervisor:provider-group identity (legacy: pid)
     process_alive: bool = False          # whether that family is still executing
     descendants: set[str] = field(default_factory=set)  # subagents charged to the root reservation
     handoffs: int = 0

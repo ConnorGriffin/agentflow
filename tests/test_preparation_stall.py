@@ -29,6 +29,7 @@ from conftest import NeverStartsLauncher, record_of
 
 from agentflow import (coordinated_attack, coordinated_intake, coordinated_review, github, live,
                        pr_park)
+from agentflow.capability_contracts import CapabilityPreflightResult
 from agentflow.coordinator import AttackStageAdapter, IntakeStageAdapter, StageRouter, Submission
 from agentflow.coordinator import tracer
 from agentflow.coordinator.record import (STALL_OBSERVATION_MAX_GAP, STALL_PARK_AFTER,
@@ -426,6 +427,34 @@ def test_a_pool_move_probe_neither_counts_nor_clocks(make_coord):
     assert not probed.hold_pending
 
 
+def test_a_capability_refusing_pool_move_probe_neither_counts_nor_clocks(make_coord):
+    """A capability failure on a speculative destination is not an observed refusal (#406)."""
+    class _ClaudeIsFull:
+        def __call__(self, record) -> bool:
+            return record.pool == "codex"
+
+        def deferral_reason(self, record):
+            return "five-hour utilization at 99%" if record.pool == "claude" else None
+
+    def capability(record, _materialize):
+        state = "incompatible" if record.pool == "codex" else "ready"
+        return CapabilityPreflightResult(record.stage, record.pool, (), state, (), "repair")
+
+    coord = make_coord(adapter=StageRouter({"build": object()}), gate=_ClaudeIsFull(),
+                       launcher=NeverStartsLauncher(), capability_preflight=capability)
+    ident = coord.submit_stage(Submission(
+        repo="o/r", subject="7", stage="build", pool="claude", complexity="deep",
+        source="/work/.agentflow/worktrees/claude/issue-7-x"))
+
+    for minute in range(0, 121, 10):
+        coord.cycle("codex", now=minute * MINUTE)
+
+    probed = record_of(coord, ident)
+    assert probed.pool == "claude" and probed.refusal == ""
+    assert probed.stall_refusal_id == "" and probed.refusals == 0
+    assert not probed.hold_pending
+
+
 @pytest.mark.parametrize("state", ["dirty", "unregistered", "moved-off-the-remote"])
 def test_the_checkouts_preparation_already_fixes_itself_never_start_a_clock(
         tmp_path, make_coord, state):
@@ -566,7 +595,7 @@ def test_the_new_record_fields_default_so_older_stores_still_open(coord_state):
     finally:
         store.close()
 
-    assert SCHEMA_VERSION == 3
+    assert SCHEMA_VERSION == 5
     assert restored.refusals == 0 and restored.stall_refusal_id == ""
     assert restored.stall_started_at == 0 and restored.stall_last_observed_at == 0
 

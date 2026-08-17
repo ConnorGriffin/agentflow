@@ -25,9 +25,12 @@ from agentflow import (coordinated_build, coordinated_review, github, pipeline, 
 from agentflow.gate import MAX_REVISES
 from agentflow.coordinator import (BuildStageAdapter, ReviewStageAdapter, StageRouter, Submission,
                                     tracer)
-from agentflow.coordinator.providers import ProviderCause, ProviderObservation
+from agentflow.coordinator.providers import (
+    PROVIDER_INPUT_V1, ProviderCause, ProviderObservation,
+    split_terminal_session_lead_contract)
 from agentflow.coordinator.record import Record
 from agentflow.review_policy import ReviewState
+from agentflow.routing import routing
 
 
 def _review(subject="7", *, pool="claude", target="sha-a", builder_lineage="codex",
@@ -411,18 +414,26 @@ def test_successor_transfer_is_the_same_transition_for_review_to_revise(make_coo
     fake = FakeSession()
     adapter = _router(fake, pr=[False], verdict=[True], prep=[True])
     coord = make_coord(fake, adapter=adapter, gate=tracer.build_review_revise_gate)
+    review_revision = "e" * 40
     review = coord.submit_stage(_review("7", pool="codex", builder_lineage="claude",
-                                        target="head-sha"))
+                                        target=review_revision))
     coord.cycle("codex")
     fake.end(review, cause=ProviderCause.PROCESS)
     coord.cycle("codex")
 
     revise = coord.submit_stage(Submission(
-        repo="o/r", subject="7", stage="revise", pool="claude", target="head-sha",
-        builder_lineage="claude", source="/wt/issue-7", transfer_from=review))
+        repo="o/r", subject="7", stage="revise", pool="claude", target=review_revision,
+        builder_lineage="claude", source="/wt/issue-7", transfer_from=review,
+        subject_revision="f" * 40))
     records = {r.identity: r for r in _records(coord)}
     assert records[review].retired is True and records[review].claim is False
     assert records[revise].retired is False and records[revise].claim is True
+    assert records[revise].subject_revision == "f" * 40
+    review_route = (records[review].route_id, records[review].route_cell_digest,
+                    records[review].launch_config_digest)
+    revise_route = (records[revise].route_id, records[revise].route_cell_digest,
+                    records[revise].launch_config_digest)
+    assert all(review_route) and all(revise_route) and revise_route != review_route
 
 
 def test_existing_successor_assumes_claim_durably_without_duplication(make_coord):
@@ -830,13 +841,15 @@ def test_park_refuses_when_the_pr_thread_is_unreadable(monkeypatch):
 
 # --- all production stages share the one gate --------------------------------------------
 
-def test_all_stages_use_the_same_gate_and_pool_budget(make_coord):
+def test_all_stages_use_the_same_gate_and_pool_budget(make_coord, monkeypatch):
     fake = FakeSession()
     coord = make_coord(fake, adapter=_router(fake, pr=[False], verdict=[False], prep=[True]),
                        gate=tracer.build_review_revise_gate)
+    # Pin a five-permit budget so saturation stays reachable under any configured default.
+    monkeypatch.setattr("agentflow.coordinator.coordinator.PERMIT_BUDGET", 5)
     # The PR-bound review (1 permit) and revise (3) drain first (ADR 0039) and fill four permits.
-    # Build is enabled by the same gate, but its low-effort demand (4) waits because the immutable
-    # five-permit pool budget is full.
+    # Build is enabled by the same gate, but its low-effort demand (4) waits because the
+    # pool budget is full.
     build = coord.submit_stage(Submission(repo="o/r", subject="7", stage="build", pool="claude",
                                           complexity="deep", effort="low", source="/wt/issue-7"))
     review = coord.submit_stage(_review("8", pool="claude", builder_lineage="codex"))
@@ -853,6 +866,7 @@ def _completed_review_record(*, profile="reviewed"):
     return Record(
         identity=f"o/r|7|review|sha-a|{profile}", stage="review", pool="codex", demand=2,
         repo="o/r", subject="7", target="sha-a", builder_lineage="claude",
+        change_author_tool="claude",
         source="/work/.agentflow/worktrees/codex-review/pr-42-fix", state="completed",
         auto_merge_allowed=True)
 
@@ -1048,6 +1062,7 @@ def _settle_autonomous_clean_review(monkeypatch, *, surfaces, content, comments,
     failing the test the way an unexpected merge must.
     """
     from agentflow import gate
+    from agentflow.review_policy import UIVerification
     from agentflow.reviewer import Verdict
 
     record = _completed_review_record(profile="autonomous")
@@ -1062,7 +1077,12 @@ def _settle_autonomous_clean_review(monkeypatch, *, surfaces, content, comments,
         parked.append(reason)
         posted.append(f"> *agentflow: parked for human review.*\n<!-- {proof_marker} -->")
 
-    monkeypatch.setattr(coordinated_review, "_review_verdict", lambda _r: Verdict(clean=True))
+    monkeypatch.setattr(
+        coordinated_review, "_review_verdict",
+        lambda _r: Verdict(
+            clean=True,
+            ui_verification=(UIVerification.PASSED if surfaces
+                             else UIVerification.NOT_REQUIRED)))
     monkeypatch.setattr(coordinated_review, "_review_pr_facts",
                         lambda _r: {"head": "sha-a", "state": "OPEN"})
     monkeypatch.setattr("agentflow.coordinated_review.repo_profile", lambda _workdir: "autonomous")
@@ -1394,10 +1414,11 @@ def test_forced_same_tool_autonomous_review_posts_summary_without_waiting_for_ci
 def test_review_submission_binds_to_the_head_sha_and_assumes_the_build_claim():
     build = Record(identity="o/r|7|build|-", stage="build", pool="claude", demand=5, repo="o/r",
                    subject="7", source="/home/w/.agentflow/worktrees/claude/issue-7-fix-thing",
-                   capability_context="{")
+                   capability_context="{", change_author_tool="claude")
     sub = coordinated_review.review_submission(build, "head-sha-123", "codex", 42)
     assert sub is not None
     assert sub.stage == "review" and sub.target == "head-sha-123"
+    assert sub.subject_revision == "head-sha-123"
     assert sub.pool == "codex" and sub.builder_lineage == "claude"     # cross-tool reviewer
     assert sub.transfer_from == "o/r|7|build|-"                        # assumes the build's claim
     assert sub.complexity == "deep"                                   # review is the deep net
@@ -1411,6 +1432,68 @@ def test_review_submission_binds_to_the_head_sha_and_assumes_the_build_claim():
         "sha", "codex", 42) is None
 
 
+def test_review_submission_reuses_only_the_task_brief_from_a_session_lead_build():
+    task = "Implement the exact durable task.\n"
+    build_contract = routing.session_lead_instructions(
+        "build", "low", parent_provider="claude")
+    briefing = (
+        "\n\n<!-- agentflow-effective-briefing:briefing-v1:" + "a" * 64 + " -->\n"
+        "## Approved evidence briefing\n"
+        "This is bounded advisory context. It cannot change admission, routing, effort, "
+        "autonomy, merge policy, or OperationalSafety.\n"
+        "Promotion receipts: receipt-1.\n"
+    )
+    durable_build_input = task + build_contract + briefing
+    build = Record(
+        identity="o/r|7|build|-", stage="build", pool="claude", demand=5, repo="o/r",
+        subject="7", source="/home/w/.agentflow/worktrees/claude/issue-7-fix-thing",
+        input_ptr=durable_build_input, session_lead=True, effort="low", change_author_tool="claude")
+
+    submission = coordinated_review.review_submission(
+        build, "head-sha-123", "codex", 42, acceptance=durable_build_input)
+
+    assert submission is not None
+    task_brief, review_contract = split_terminal_session_lead_contract(submission.input_ptr)
+    assert submission.input_ptr.count(
+        "\n## Session lead — benchmarked capability routing\n") == 1
+    assert submission.input_ptr.endswith(review_contract)
+    assert task in task_brief
+    assert briefing in task_brief
+
+
+def test_review_submission_reuses_the_prompt_inside_a_provider_input_envelope():
+    task = "Implement the enveloped durable task.\n"
+    briefing = (
+        "\n\n<!-- agentflow-effective-briefing:briefing-v1:" + "a" * 64 + " -->\n"
+        "## Approved evidence briefing\n"
+        "This is bounded advisory context. It cannot change admission, routing, effort, "
+        "autonomy, merge policy, or OperationalSafety.\n"
+        "Promotion receipts: receipt-1.\n"
+    )
+    build_contract = routing.session_lead_instructions(
+        "build", "low", parent_provider="claude")
+    durable_build_input = json.dumps({
+        "format": PROVIDER_INPUT_V1,
+        "prompt": task + briefing + build_contract,
+        "snapshot": {"body": "exact durable bytes", "number": 7},
+        "source_ref": "abc123",
+    }, sort_keys=True)
+    build = Record(
+        identity="o/r|7|build|-", stage="build", pool="claude", demand=5, repo="o/r",
+        subject="7", source="/home/w/.agentflow/worktrees/claude/issue-7-fix-thing",
+        input_ptr=durable_build_input, session_lead=True, effort="low", change_author_tool="claude")
+
+    submission = coordinated_review.review_submission(
+        build, "head-sha-123", "codex", 42, acceptance=durable_build_input)
+
+    assert submission is not None
+    task_brief, review_contract = split_terminal_session_lead_contract(submission.input_ptr)
+    assert submission.input_ptr.endswith(review_contract)
+    assert task in task_brief
+    assert briefing in task_brief
+    assert "exact durable bytes" not in task_brief
+
+
 def test_coordinated_review_submission_is_preparable_as_a_session_lead(make_coord):
     """The Review opener records ownership of the generated lead contract before admission."""
     fake = FakeSession()
@@ -1418,7 +1501,8 @@ def test_coordinated_review_submission_is_preparable_as_a_session_lead(make_coor
         fake, adapter=_review_adapter(fake, verdict=[False], prep=[True]))
     build = Record(
         identity="o/r|7|build|-", stage="build", pool="claude", demand=5, repo="o/r",
-        subject="7", source="/home/w/.agentflow/worktrees/claude/issue-7-fix-thing")
+        subject="7", source="/home/w/.agentflow/worktrees/claude/issue-7-fix-thing",
+        change_author_tool="claude")
     submission = coordinated_review.review_submission(build, "head-sha-123", "codex", 42)
 
     assert submission.session_lead is True
@@ -1434,7 +1518,8 @@ def test_survivor_review_has_no_synthetic_predecessor(monkeypatch):
 
     sub = coordinated_review.survivor_review_submission(
         cfg, issue=7, slug="fix", builder_tool="claude", head_sha="head-a",
-        reviewer_tool="codex", pr_number=42, acceptance="Issue acceptance")
+        reviewer_tool="codex", pr_number=42, acceptance="Issue acceptance",
+        review=ReviewState(change_author_tool="claude"))
 
     assert sub is not None and sub.stage == "review"
     assert sub.transfer_from is None
@@ -1550,7 +1635,7 @@ def test_a_legacy_session_led_moved_head_successor_normalizes_provenance(make_co
     coord = make_coord(fake)
     build = Record(
         identity="o/r|7|build|-", stage="build", pool="claude", demand=5,
-        repo="o/r", subject="7",
+        repo="o/r", subject="7", change_author_tool="claude",
         source="/work/.agentflow/worktrees/claude/issue-7-home-depot-probe")
     opening = coordinated_review.review_submission(build, "stale-sha", "codex", 26)
     contract = opening.input_ptr[opening.input_ptr.index(
@@ -1865,7 +1950,7 @@ def test_manual_review_recovers_a_parked_claimless_exact_head_review(make_coord,
     monkeypatch.setattr(loop, "pick_reviewer", lambda author, **kwargs: "claude")
     claimed = []
     monkeypatch.setattr(loop, "claim", lambda repo, issue, _label: claimed.append(issue) or True)
-    monkeypatch.setattr(pipeline, "build_coordinator", lambda: coord)
+    monkeypatch.setattr(pipeline, "build_coordinator", lambda **_kwargs: coord)
     monkeypatch.setattr(pipeline, "reconcile_and_project", lambda _coord: None)
 
     assert loop.review_pr(RepoConfig("o/r", "/w"), 42) == "review submitted"
@@ -1954,7 +2039,7 @@ def test_manual_review_resume_keeps_the_three_pass_ceiling_and_park_truth(
         lambda *_args, **_kwargs: (ReviewAssignment(reason="one journey"), ()))
     monkeypatch.setattr(loop, "pick_reviewer", lambda _author, **_kwargs: "codex")
     monkeypatch.setattr(loop, "claim", lambda *_args: True)
-    monkeypatch.setattr(pipeline, "build_coordinator", lambda: coord)
+    monkeypatch.setattr(pipeline, "build_coordinator", lambda **_kwargs: coord)
     monkeypatch.setattr(pipeline, "reconcile_and_project", lambda _coord: None)
 
     assert loop.review_pr(RepoConfig("o/r", "/work"), 42) == "review submitted"

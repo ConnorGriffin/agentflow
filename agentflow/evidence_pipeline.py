@@ -214,6 +214,61 @@ class EvidenceProducer:
             for index in range(criterion_count))
         return RequestRevision(subject, authority, revision, claim, criteria)
 
+    def review_source(self, review_id: str, reviewed_sha: str, *, locator: str,
+                      observed_at: int = 0) -> RequestRevision:
+        """Bind a review decision to its immutable reviewed commit without source prose."""
+        if not review_id or not re.fullmatch(r"[a-f0-9]{40}", reviewed_sha) or not locator:
+            raise ValueError("review source lacks durable identity")
+        source_digest = _digest("review-source-v1", self._repository, locator, reviewed_sha)
+        authority = AuthorityPointer(
+            "github", self._repository, locator, reviewed_sha, "sha256", source_digest,
+            "review-source")
+        subject = SubjectRevision("review", f"review/{review_id}", reviewed_sha)
+        observed = str(observed_at)
+        revision = self._producer(
+            _id("observation", "review-revision", review_id, reviewed_sha, observed), subject, authority,
+            observed_at, "revision", source_digest, "observed")
+        claim = self._producer(
+            _id("observation", "review-claim", review_id, reviewed_sha, observed), subject, authority,
+            observed_at, "claim", _digest("review-claim-v1", review_id, reviewed_sha),
+            "observed", (EvidenceLink("derives_from", revision.event_id, 0),))
+        criterion = self._producer(
+            _id("observation", "review-criterion", review_id, reviewed_sha, observed), subject, authority,
+            observed_at, "criterion", _digest("review-criterion-v1", review_id, reviewed_sha),
+            "observed", (EvidenceLink("derives_from", revision.event_id, 0),))
+        return RequestRevision(subject, authority, revision, claim, (criterion,))
+
+    def stage_source(self, stage_id: str, stage: str, issue: str, source_revision: str,
+                     input_digest: str, *, observed_at: int = 0) -> RequestRevision:
+        """Bind a terminal stage fact to its frozen content-free input and checkout revision."""
+        if (not stage_id or stage not in {"intake", "attack", "research"} or not issue
+                or not re.fullmatch(r"[a-f0-9]{40}", source_revision)
+                or not _valid_digest(input_digest)):
+            raise ValueError("stage source lacks durable identity")
+        locator = f"issues/{issue}"
+        source_digest = _digest(
+            "stage-source-v1", self._repository, stage_id, stage, issue,
+            source_revision, input_digest)
+        authority = AuthorityPointer(
+            "github", self._repository, locator, source_revision, "sha256", input_digest,
+            "stage-source")
+        subject = SubjectRevision(
+            "issue", f"issue/{issue}", f"issue-{source_digest[:32]}", locator, source_digest)
+        revision = self._producer(
+            _id("observation", "stage-revision", source_digest, str(observed_at)),
+            subject, authority, observed_at, "revision", source_digest, "observed")
+        claim = self._producer(
+            _id("observation", "stage-claim", source_digest, str(observed_at)),
+            subject, authority, observed_at, "claim",
+            _digest("stage-claim-v1", source_digest), "observed",
+            (EvidenceLink("derives_from", revision.event_id, 0),))
+        criterion = self._producer(
+            _id("observation", "stage-criterion", source_digest, str(observed_at)),
+            subject, authority, observed_at, "criterion",
+            _digest("stage-criterion-v1", source_digest), "observed",
+            (EvidenceLink("derives_from", revision.event_id, 0),))
+        return RequestRevision(subject, authority, revision, claim, (criterion,))
+
     def provenance(self, captured: RequestRevision, current: GitHubRequest | None) -> Provenance:
         if current is None:
             return Provenance("unavailable")
@@ -393,7 +448,7 @@ class EvidenceMiner:
 
     def candidates(self, inputs: Iterable[LessonInput], *, policy_version: int,
                    nominated_at: int) -> tuple[LessonCandidate, ...]:
-        groups: dict[tuple[str, str], set[str]] = {}
+        groups: dict[tuple[str, str, str, str], set[str]] = {}
         for item in inputs:
             if not _valid_digest(item.proposal_digest):
                 continue
@@ -418,7 +473,10 @@ class EvidenceMiner:
                 continue
             if method not in _UPSTREAM_CONTRACTS:
                 continue
-            groups.setdefault((method, item.proposal_digest), set()).add(event.event_id)
-        return tuple(LessonCandidate(_id("lesson", method, digest, *sorted(events)), tuple(sorted(events)),
+            groups.setdefault((method, item.proposal_digest, failure.failure_class,
+                               failure.normalized_signature), set()).add(failure.event_id)
+        return tuple(LessonCandidate(_id("lesson", method, digest, failure_class, signature,
+                                         *sorted(events)), tuple(sorted(events)),
             digest, policy_version, nominated_at)
-            for (method, digest), events in sorted(groups.items()) if len(events) >= 2)
+            for (method, digest, failure_class, signature), events in sorted(groups.items())
+            if len(events) >= 2)

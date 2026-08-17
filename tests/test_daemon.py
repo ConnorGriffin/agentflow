@@ -100,6 +100,103 @@ def test_cycle_passes_log_into_run():
     assert any("build: ok" in m for m in emitted)          # result line also appeared
 
 
+def test_recheck_passes_the_daemon_log_into_the_repository_loop(monkeypatch):
+    seen = []
+    monkeypatch.setattr(daemon, "recheck_once",
+                        lambda cfg, _log=None: seen.append((cfg, _log)) or "loop result")
+
+    log = seen.append
+    assert daemon._recheck(B, _log=log) == "recheck: loop result"
+    assert seen[0][0] == B
+    assert seen[0][1] is log  # the same sink reaches the per-repository loop
+
+
+def test_recheck_composed_coordinator_emits_sanitized_overlay_diagnostic(
+        monkeypatch, tmp_path):
+    """The daemon's real per-repository recheck path wires the composed coordinator's overlay
+    diagnostic into the same log sink, without requiring a live GitHub or provider session."""
+    from agentflow import (coordinated_intake, coordinated_review, coordinated_revise,
+                           effective_policy, loop, pipeline)
+    from agentflow.coordinator import Submission
+    from agentflow.loop import RebaseResult
+
+    cfg = RepoConfig("owner/repo", str(tmp_path / "repo"))
+    monkeypatch.setenv("AGENTFLOW_STATE", str(tmp_path / "state"))
+    monkeypatch.setattr(github, "list_open_prs", lambda repo, limit: [
+        github.PrRow(42, "agentflow/claude/issue-42-follow-up", "")])
+    monkeypatch.setattr(github, "pr_comment_rows", lambda repo, pr: [])
+    monkeypatch.setattr(loop, "repo_profile", lambda workdir: "autonomous")
+    monkeypatch.setattr(loop, "_base_advanced_for", lambda workdir, branch: True)
+    monkeypatch.setattr(loop, "_survivor_head_author", lambda *_args: "claude")
+    monkeypatch.setattr(loop, "_conflict_revise_owns_head", lambda cfg, n, branch: False)
+    monkeypatch.setattr(loop, "_rebase_branch", lambda cfg, branch, wt: RebaseResult.CLEAN)
+    monkeypatch.setattr(loop, "remove_worktree_if_safe", lambda workdir, wt: True)
+    monkeypatch.setattr(loop, "pick_reviewer", lambda tool, **kwargs: "codex")
+    monkeypatch.setattr(loop, "_issue_acceptance", lambda cfg, number: "acceptance")
+    monkeypatch.setattr(loop, "claim", lambda repo, number, label: True)
+    monkeypatch.setattr(loop, "supersede_clean_review", lambda comments: True)
+    monkeypatch.setattr(loop, "_run", lambda *args, **kwargs:
+                        types.SimpleNamespace(returncode=0, stdout="a" * 40 + "\n"))
+    monkeypatch.setattr(
+        coordinated_review, "survivor_review_submission",
+        lambda *args, **kwargs: Submission(
+            repo=cfg.repo, subject="42", stage="review", target="a" * 40,
+            subject_revision="a" * 40, pool="codex", source=cfg.workdir,
+            builder_lineage="claude", branch_lineage="claude"))
+    monkeypatch.setattr(coordinated_review, "_resume_tainted_reviews", lambda coordinator: None)
+    monkeypatch.setattr(coordinated_review, "_resettle_diverged_reviews", lambda coordinator: None)
+    monkeypatch.setattr(coordinated_review, "_review_worktree_reset", lambda record: True)
+    monkeypatch.setattr(coordinated_revise, "_retire_dead_revises", lambda coordinator: None)
+    monkeypatch.setattr(coordinated_intake, "_retire_dead_intakes", lambda coordinator: None)
+    monkeypatch.setattr(pipeline, "_production_gate", lambda: lambda record: True)
+    monkeypatch.setattr(
+        pipeline, "_capability_preflight",
+        lambda record, materialize, **_kwargs: None,
+    )
+
+    def overlay_run(command, **kwargs):
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"], output=b"secret")
+
+    monkeypatch.setattr(effective_policy.subprocess, "run", overlay_run)
+    logs = []
+
+    cycle([cfg], run=daemon._recheck, _log=logs.append)
+
+    diagnostics = [line for line in logs if "repository overlay read failed" in line]
+    assert len(diagnostics) == 1
+    assert "repository=owner/repo" in diagnostics[0]
+    assert "phase=show" in diagnostics[0]
+    assert "error_class=CLOSED" in diagnostics[0]
+    assert cfg.workdir not in diagnostics[0]
+    assert "secret" not in diagnostics[0]
+
+
+def test_single_repository_composition_leaves_other_repository_waiting_record_untouched(
+        monkeypatch, tmp_path):
+    """A recheck helper may only admit the repository it configured for policy lookup."""
+    from agentflow import pipeline
+    from agentflow.coordinator import Coordinator, Submission
+    from agentflow.coordinator.store import Store, default_store_path
+
+    seed = Store(default_store_path())
+    identity = Coordinator(store=seed).submit_stage(Submission(
+        repo="owner/a", subject="680", stage="build", pool="claude", complexity="deep",
+        subject_revision="a" * 40))
+    seed.close()
+    monkeypatch.setattr(pipeline, "_production_gate", lambda: lambda record: True)
+    monkeypatch.setattr(pipeline, "_capability_preflight", lambda record, materialize: None)
+    monkeypatch.setattr(pipeline, "worktree_ready", lambda record: True)
+    logs = []
+
+    coordinator = pipeline.build_coordinator(
+        _log=logs.append, repositories={"owner/b": str(tmp_path / "repo-b")})
+    pipeline.reconcile_and_project(coordinator)
+
+    record = coordinator.stage_record(identity)
+    assert record is not None and record.state == "waiting" and record.refusal == ""
+    assert not any("invalid_overlay" in line for line in logs)
+
+
 def test_dispatch_cycle_has_no_claim_reclaimer_and_forwards_pause(monkeypatch):
     seen = []
     monkeypatch.setattr(daemon.dispatch, "run_cycle",
@@ -117,11 +214,18 @@ def test_main_once_runs_one_cycle_and_exits(tmp_path):
     """--once runs exactly one cycle without entering the poll loop."""
     events = []
 
+    class RouteStore:
+        def close(self):
+            events.append(("routes-closed", None))
+
     with (
         mock.patch("agentflow.daemon.STATE_DIR", tmp_path),
         mock.patch("agentflow.daemon.LOCK", tmp_path / "daemon.lock"),
         mock.patch("agentflow.daemon.recover_worktrees",
                    side_effect=lambda repos: events.append(("recover", list(repos)))),
+        mock.patch("agentflow.pipeline.production_store", return_value=RouteStore()),
+        mock.patch("agentflow.routing.reconcile_route_cells",
+                   side_effect=lambda config, store: events.append(("routes", config))),
         mock.patch("agentflow.daemon.dispatch_cycle",
                    side_effect=lambda repos: events.append(("cycle", list(repos)))),
         mock.patch("agentflow.daemon.publish_snapshot",
@@ -130,8 +234,115 @@ def test_main_once_runs_one_cycle_and_exits(tmp_path):
     ):
         daemon.run(RuntimeConfig((A, B), (), tmp_path / "config.toml"), once=True)
 
-    assert events == [("recover", [A, B]), ("cycle", [A, B]), ("publish", [A, B])]
+    assert events == [
+        ("routes", RuntimeConfig((A, B), (), tmp_path / "config.toml")),
+        ("routes-closed", None),
+        ("recover", [A, B]), ("cycle", [A, B]), ("publish", [A, B]),
+    ]
     assert not (tmp_path / "daemon.lock").exists()  # lock released on exit
+
+
+def test_once_production_path_reaches_provider_command_through_composed_admission(
+        tmp_path, monkeypatch):
+    """Exercise daemon -> dispatch -> production Coordinator -> Store -> provider argv."""
+    from pathlib import Path
+
+    from agentflow import coordinated_converse, dispatch, pipeline
+    from agentflow.coordinator import Coordinator
+    from agentflow.coordinator.launcher import LocalLauncher
+    from agentflow.coordinator.store import Store, default_store_path
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"],
+                   check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    (repo / "AGENTS.md").write_text("profile: reviewed\nui-surfaces: none\n")
+    source_skills = repo / ".agents" / "skills"
+    source_skills.mkdir(parents=True)
+    (source_skills / ".keep").write_text("capability source root\n")
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "fixture"], check=True)
+
+    worktree = Path(coordinated_converse.ask_worktree(str(repo), "codex", "production-path"))
+    worktree.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "--detach", str(worktree), "HEAD"],
+        check=True, stdout=subprocess.DEVNULL)
+    # Materialization is non-clobbering. Converse has no methodology requirements, so inert
+    # existing destinations make this fixture independent of globally installed skills.
+    for name in ("tdd", "codebase-design", "domain-modeling", "agentflow",
+                 "ui-craft", "drive-local-webapp"):
+        (worktree / ".agents" / "skills" / name).mkdir(parents=True, exist_ok=True)
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    marker = tmp_path / "provider-argv.txt"
+    fake_codex = fake_bin / "codex"
+    fake_codex.write_text(
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$AGENTFLOW_PROVIDER_MARKER\"\nexit 0\n")
+    fake_codex.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setenv("AGENTFLOW_CODEX_BIN", str(fake_codex))
+    monkeypatch.setenv("AGENTFLOW_PROVIDER_MARKER", str(marker))
+
+    seed_store = Store(default_store_path())
+    seed = Coordinator(store=seed_store)
+    identity = seed.submit_stage(coordinated_converse.converse_submission(
+        "octo/app", str(repo), "production-path", 0, "Summarize this repository.",
+        pool="codex"))
+    seed_store.close()
+
+    # Model the concrete no-restart boundary: the launched handle becomes absent
+    # before the pass's final reconciliation.  The command and admission remain
+    # real; this hook only waits for the intentionally instant fake provider to
+    # reach that observation point instead of depending on process scheduling.
+    real_is_alive = LocalLauncher.is_alive
+
+    def exited_during_final_observation(family):
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if marker.exists() and not real_is_alive(family):
+                return False
+            time.sleep(0.01)
+        return real_is_alive(family)
+
+    monkeypatch.setattr(LocalLauncher, "is_alive", staticmethod(exited_during_final_observation))
+
+    # Bound only external discovery, GitHub reconciliation, and publication. The named internal
+    # production seams under test remain the real implementations.
+    monkeypatch.setattr(daemon, "recover_worktrees", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        daemon,
+        "recheck_once",
+        lambda _cfg, _log=None: "bounded external recheck",
+    )
+    monkeypatch.setattr(daemon, "publish_snapshot", lambda _repos: None)
+    monkeypatch.setattr(daemon, "log", lambda _line: None)
+    monkeypatch.setattr(dispatch, "_refresh_claude_quota", lambda _log: None)
+    monkeypatch.setattr(dispatch, "_submit_repo", lambda _cfg, _coord, _log: None)
+    monkeypatch.setattr(pipeline, "reconcile_orphaned_claims", lambda *_args, **_kwargs: 0)
+
+    cfg = RepoConfig("octo/app", str(repo))
+    daemon.run(RuntimeConfig((cfg,), (), tmp_path / "config.toml"), once=True)
+
+    deadline = time.monotonic() + 2
+    while not marker.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert marker.exists()
+    argv = marker.read_text().splitlines()
+    assert argv[0] == "exec" and "--ignore-user-config" in argv
+    reopened = Store(default_store_path())
+    receipt = reopened.read_admission_receipt(identity)
+    record = reopened.record_of(identity)
+    assert receipt is not None and record is not None
+    # The real provider command is admitted and starts, then its instant exit is
+    # reconciled as a continuation in this same --once cycle.
+    assert record.state == "waiting" and record.start_fact == "started"
+    assert record.continuation and record.claim and not record.process_alive
+    assert receipt.route_cell_digest == record.route_cell_digest
+    reopened.close()
 
 
 def test_sigterm_releases_lock_so_a_fresh_daemon_can_start(tmp_path):
@@ -673,13 +884,17 @@ def test_publish_snapshot_composes_v1_and_schema_v2(tmp_path, monkeypatch):
     assert published["attention"]["rows"][0]["url"] == "https://github.com/owner/a/pull/7"
 
 
-def test_publish_snapshot_skips_the_whole_publish_on_error(tmp_path, monkeypatch, capsys):
+def test_publish_snapshot_skips_the_whole_publish_on_error(tmp_path, monkeypatch):
     monkeypatch.setattr(live, "SNAPSHOT_FILE", tmp_path / "snapshot.json")
 
     def boom(repos, dispatch_enabled):
         raise RuntimeError("gh outage")
 
-    daemon.publish_snapshot([A], produce=boom, _log=print)
+    logs = []
+    daemon.publish_snapshot([A], produce=boom, _log=logs.append)
 
     assert live.read_snapshot() is None
-    assert "snapshot publish error" in capsys.readouterr().out
+    assert len(logs) == 1
+    assert "snapshot publish error: Traceback" in logs[0]
+    assert "tests/test_daemon.py" in logs[0]
+    assert "RuntimeError: gh outage" in logs[0]

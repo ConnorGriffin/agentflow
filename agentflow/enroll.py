@@ -10,7 +10,7 @@ The module owns three closely related jobs:
 
 Usage:
   python -m agentflow.enroll <owner/repo>            # sweep legacy labels
-  python -m agentflow.enroll audit                   # fleet declaration census
+  python -m agentflow.enroll audit                   # fleet declaration and CI-policy census
   python -m agentflow.enroll surfaces <dir> [--apply]  # propose/apply one repo's line
 
 Enrolment seeds `ui-surfaces: none` without looking at the repo, so `surfaces` is also what
@@ -21,14 +21,18 @@ claiming to be headless while its own checkout says otherwise.
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import tomllib
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from importlib.resources import files
 from pathlib import Path
@@ -41,6 +45,7 @@ from agentflow.provider_skills import (
 from agentflow.repo_facts import (UI_SURFACES_NONE, SurfaceDeclaration, _UI_SURFACES_RE,
                                   surface_declaration)
 from agentflow.runtime_contracts import playwright_runtime_status as _runtime_status
+from agentflow.skill_ownership import clear_skill_ownership, mark_skill_owned, skill_ownership
 
 # Directory names that hold a user-facing surface when a repo has one. Deliberately narrow:
 # a wrong guess here writes a declaration that either misses real UI or gates a backend path.
@@ -53,6 +58,8 @@ _SKIP_DIRS = {".git", ".agentflow", "node_modules", "dist", "build", ".venv", "v
 _MAX_DEPTH = 3
 
 _DECLARATION_KEY = "ui-surfaces:"
+_REPAIR_LOCKS: dict[Path, threading.Lock] = {}
+_REPAIR_LOCKS_GUARD = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -101,6 +108,182 @@ class StageCapability:
 
 def _manifest() -> dict:
     return tomllib.loads(files("agentflow").joinpath("capabilities.toml").read_text())
+
+
+@contextmanager
+def _capability_repair_lock(root: Path):
+    """Serialize enrollment-owned repairs for coordinators sharing one repository root.
+
+    Non-reentrant (the per-root ``threading.Lock`` plus the ``flock`` it guards): a nested
+    acquisition on the same root within one call chain deadlocks. Callers must not hold this
+    lock across a call into `_install_connor_skills`/`_replace_skill_tree`, which acquire it
+    themselves.
+    """
+    lock_dir = root / ".agentflow"
+    if lock_dir.is_symlink() or (lock_dir.exists() and not lock_dir.is_dir()):
+        raise OSError(".agentflow repair lock directory is incompatible")
+    lock_dir.mkdir(exist_ok=True)
+    lock_path = lock_dir / "enrollment.lock"
+    with _REPAIR_LOCKS_GUARD:
+        local_lock = _REPAIR_LOCKS.setdefault(root, threading.Lock())
+    with local_lock:
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(lock_path, flags, 0o600)
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise OSError("enrollment repair lock is not a regular file")
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(descriptor)
+
+
+def repair_capability_refusal(root: str | Path, provider: str, requirements):
+    """Repair one deterministic missing capability set without touching occupied content."""
+    from agentflow.capability_contracts import CapabilityRepairResult
+
+    requested_root = Path(root).expanduser()
+    if requested_root.is_symlink() or not requested_root.is_dir():
+        return None
+    root = requested_root.resolve()
+    if provider not in {"claude", "codex"}:
+        return None
+    with _capability_repair_lock(root):
+        manifest = _manifest()
+        specs = {item["id"]: item for item in manifest["capabilities"]}
+        skill_specs = [
+            specs[item.id] for item in requirements
+            if item.id in specs and specs[item.id].get("skill")
+        ]
+        missing = []
+        if provider == "claude":
+            for spec in skill_specs:
+                name = spec["skill"]
+                source = root / ".agents" / "skills" / name
+                destination = root / ".claude" / "skills" / name
+                if _skill_destination_status(source, spec["files"]) != "ok":
+                    return None
+                status = _skill_destination_status(destination, spec["files"])
+                if status == "absent":
+                    missing.append(name)
+                elif status != "ok":
+                    return None
+        runtime_missing = False
+        if any(item.runtime for item in requirements):
+            harness = specs["screenshot-harness"]
+            if _content_status(
+                [root / "scripts" / "screenshots.mjs"], harness["sha256"]
+            ) != "ok":
+                return None
+            location = ".agents" if provider == "codex" else ".claude"
+            drive = specs["drive-local-webapp"]
+            drive_root = root / location / "skills" / drive["skill"]
+            drive_status = _skill_destination_status(drive_root, drive["files"])
+            materializing_drive = (
+                provider == "claude"
+                and drive_status == "absent"
+                and drive["skill"] in missing
+            )
+            if drive_status != "ok" and not materializing_drive:
+                return None
+            runtime = drive_root / "node_modules"
+            if runtime.exists() or runtime.is_symlink():
+                return None
+            runtime_missing = True
+        if not missing and not runtime_missing:
+            location = ".agents" if provider == "codex" else ".claude"
+            if not skill_specs or any(
+                _skill_destination_status(
+                    root / location / "skills" / spec["skill"], spec["files"]
+                ) != "ok"
+                for spec in skill_specs
+            ):
+                return None
+            from agentflow.provider_skills import native_discovery_status, prove_native_discovery
+
+            receipt_status, detail = native_discovery_status(root, provider)
+            if (receipt_status != "missing"
+                    and detail != f"{provider} native-discovery receipt is stale or incompatible"):
+                return None
+            repaired, probe_detail = prove_native_discovery(root, provider)
+            return CapabilityRepairResult(repaired, probe_detail)
+        created_skills = [
+            (root / ".claude" / "skills" / spec["skill"], spec["files"])
+            for spec in skill_specs if spec["skill"] in missing
+        ]
+        installed_snapshots: dict[Path, tuple | None] = {}
+
+        def tree_snapshot(path: Path) -> tuple | None:
+            """Fingerprint every entry without following links; unreadable means preserve."""
+            entries = []
+            try:
+                for current, directories, filenames in os.walk(path, followlinks=False):
+                    directories.sort()
+                    filenames.sort()
+                    base = Path(current)
+                    for name in directories + filenames:
+                        item = base / name
+                        relative = str(item.relative_to(path))
+                        if item.is_symlink():
+                            entries.append((relative, "link", str(item.readlink())))
+                        elif item.is_dir():
+                            entries.append((relative, "dir", ""))
+                        elif item.is_file():
+                            entries.append((
+                                relative, "file",
+                                hashlib.sha256(item.read_bytes()).hexdigest(),
+                            ))
+                        else:
+                            entries.append((relative, "other", ""))
+            except OSError:
+                return None
+            return tuple(entries)
+
+        def restore_created_skills() -> list[str]:
+            """Undo only our still-pinned copies; preserve concurrent changes."""
+            errors = []
+            for destination, _files_manifest in reversed(created_skills):
+                if not destination.exists() and not destination.is_symlink():
+                    continue
+                installed = installed_snapshots.get(destination)
+                if installed is None or tree_snapshot(destination) != installed:
+                    errors.append(f"{destination} changed concurrently; preserved")
+                    continue
+                try:
+                    shutil.rmtree(destination)
+                    clear_skill_ownership(destination)
+                except OSError as exc:
+                    errors.append(f"{destination}: {exc}")
+            return errors
+
+        try:
+            outcomes = []
+            for name in missing:
+                outcome = _wire_claude_skill(root, name)
+                outcomes.append(outcome)
+                if not outcome.startswith("WARN:"):
+                    destination = root / ".claude" / "skills" / name
+                    installed_snapshots[destination] = tree_snapshot(destination)
+            if runtime_missing:
+                outcomes.append(_install_ui_runtime(root, provider=provider))
+            if any(outcome.startswith("WARN:") for outcome in outcomes):
+                rollback = restore_created_skills()
+                detail = "; ".join(outcomes)
+                if rollback:
+                    detail += "; rollback: " + "; ".join(rollback)
+                return CapabilityRepairResult(False, detail)
+        except Exception as exc:
+            rollback = restore_created_skills()
+            detail = f"{type(exc).__name__}: {exc}"
+            if rollback:
+                detail += "; rollback: " + "; ".join(rollback)
+            return CapabilityRepairResult(False, detail)
+        repaired = []
+        if missing:
+            repaired.append("materialized absent pinned capability destinations for Claude")
+        if runtime_missing:
+            repaired.append("installed pinned Playwright runtime")
+        return CapabilityRepairResult(True, "; ".join(repaired))
 
 
 def _run_command(command: list[str], *, cwd: Path | None = None, timeout: int = 30):
@@ -217,7 +400,7 @@ def _methodology_problem(root: Path) -> str | None:
     manifest = _manifest()
     names = manifest["methodology_skills"]["skills"]
     if all(states[(".agents/skills", name)] == "ok" for name in names) and all(
-        _legacy_claude_skill_link(root, name) for name in names
+        states[(".claude/skills", name)] == "absent" for name in names
     ):
         return None
     rendered = ", ".join(f"{location}/{name}={state}" for (location, name), state in states.items())
@@ -241,14 +424,14 @@ def _skills_problem(
         return None
     names = manifest["connor_skills"]["skills"]
     if all(destinations[(".agents/skills", name)] == "ok" for name in names) and all(
-        _legacy_claude_skill_link(root, name) for name in names
+        destinations[(".claude/skills", name)] == "absent"
+        or _legacy_claude_skill_link(root, name)
+        for name in names
     ):
         return None
-    # Converge never rewrites the vendored skill pack (no reproducible content to write —
-    # it comes from a temp clone the installer owns, not `_asset_text`), but a repo that was
-    # already fully installed and has since drifted is not a blocking precondition either;
-    # doctor() keeps reporting it. A partially-installed or otherwise-occupied destination
-    # still refuses, converge or not.
+    # Converge may repair drift only when the destination retains a valid ownership marker;
+    # unowned or incompatible content remains a blocking precondition. The pinned release is
+    # fetched into a temporary installer root, never synthesized from `_asset_text`.
     if converge and all(state in ("ok", "drifted") for state in destinations.values()):
         return None
     if any(state != "absent" for state in destinations.values()):
@@ -503,11 +686,12 @@ def _backup_once(path: Path) -> None:
         shutil.copy2(path, backup)
 
 
-def _append_once(path: Path, line: str) -> None:
+def _append_once(path: Path, line: str, *, backup: bool = True) -> None:
     existing = path.read_text() if path.exists() else ""
     if line in existing.splitlines():
         return
-    _backup_once(path)
+    if backup:
+        _backup_once(path)
     separator = "" if not existing or existing.endswith("\n") else "\n"
     path.write_text(f"{existing}{separator}{line}\n")
 
@@ -641,6 +825,45 @@ def _install_file(path: Path, content: str, *, overwrite: bool = False) -> str:
     return f"DO:   installed {path}"
 
 
+def _normalize_skill_lock(
+    root: Path, names: list[str], *, source: str, commit: str
+) -> str | None:
+    lock = root / "skills-lock.json"
+    try:
+        if not lock.exists():
+            return None
+        if not lock.is_file():
+            return f"WARN: {lock} is not a regular skills lock file"
+        document = json.loads(lock.read_text())
+    except OSError as exc:
+        return f"WARN: could not read {lock}: {exc}"
+    except json.JSONDecodeError as exc:
+        return f"WARN: could not parse {lock}: {exc}"
+    if not isinstance(document, dict):
+        return f"WARN: {lock} must contain a JSON object"
+    skills = document.get("skills")
+    if not isinstance(skills, dict):
+        return f"WARN: {lock} has no valid skills object"
+    if any(not isinstance(entry, dict) for entry in skills.values()):
+        return f"WARN: {lock} contains an invalid skill entry"
+    changed = False
+    for name in names:
+        entry = skills.get(name)
+        if entry is None:
+            continue
+        normalized = {**entry, "source": source, "sourceType": "git", "ref": commit}
+        if normalized != entry:
+            skills[name] = normalized
+            changed = True
+    if not changed:
+        return None
+    try:
+        lock.write_text(json.dumps(document, indent=2) + "\n")
+    except OSError as exc:
+        return f"WARN: could not write {lock}: {exc}"
+    return None
+
+
 def _ensure_fleet_config(root: Path) -> str:
     from agentflow.config import ConfigurationError, default_config_path, load_config
 
@@ -680,10 +903,49 @@ def _ensure_fleet_config(root: Path) -> str:
     return f"DO:   added {repo} to {target}"
 
 
-def _install_connor_skills(root: Path) -> str:
+def _replace_skill_tree(destination: Path, source: Path, files_manifest: list[dict]) -> str:
+    """Atomically swap one owned skill tree for a complete pinned replacement."""
+    with _capability_repair_lock(destination.parents[2]):
+        if (
+            _skill_destination_status(destination, files_manifest) != "drifted"
+            or skill_ownership(destination) is None
+        ):
+            return f"WARN: {destination} changed before owned-drift repair"
+        for leftover in destination.parent.glob(f".{destination.name}-*"):
+            if leftover.is_dir() and not leftover.is_symlink():
+                shutil.rmtree(leftover)
+        temporary = Path(
+            tempfile.mkdtemp(prefix=f".{destination.name}-", dir=destination.parent)
+        )
+        replacement = temporary / "replacement"
+        backup = temporary / "previous"
+        try:
+            shutil.copytree(source, replacement)
+            destination.replace(backup)
+            try:
+                replacement.replace(destination)
+            except OSError:
+                backup.replace(destination)
+                raise
+            shutil.rmtree(backup)
+            return f"DO:   repaired owned drift at {destination}"
+        finally:
+            shutil.rmtree(temporary, ignore_errors=True)
+
+
+def _install_connor_skills(root: Path, *, converge: bool = False) -> str:
     manifest = _manifest()
     names = manifest["connor_skills"]["skills"]
     specs = {item.get("skill"): item for item in manifest["capabilities"]}
+    expected = manifest["connor_skills"]["commit"]
+    warning = _normalize_skill_lock(
+        root,
+        names,
+        source=manifest["connor_skills"]["source"],
+        commit=expected,
+    )
+    if warning:
+        return warning
     destinations = _public_skill_destination_states(root, manifest)
     if all(state == "ok" for state in destinations.values()):
         return "ok:   Connor skill pack already installed"
@@ -692,23 +954,35 @@ def _install_connor_skills(root: Path) -> str:
         or _legacy_claude_skill_link(root, name)
         for name in names
     ):
-        outcomes = [_wire_claude_skill(root, name) for name in names]
+        outcomes = [_wire_claude_skill(root, name, expected) for name in names]
         refreshed = _public_skill_destination_states(root, manifest)
         if not any(outcome.startswith("WARN:") for outcome in outcomes) and all(
             state == "ok" for state in refreshed.values()
         ):
             return "DO:   materialized the pinned Connor skill pack for Claude"
+    repairs = {
+        (location, name)
+        for (location, name), state in destinations.items()
+        if state == "drifted" and skill_ownership(root / location / name) is not None
+    }
+    if converge and repairs and all(
+        state == "ok" or (location, name) in repairs
+        for (location, name), state in destinations.items()
+    ):
+        repair_names = {name for _location, name in repairs}
+    else:
+        repair_names = set()
     if any(state != "absent" for state in destinations.values()):
-        rendered = ", ".join(
-            f"{location}/{name}={state}"
-            for (location, name), state in destinations.items()
-        )
-        return (
-            "WARN: existing public skill destinations are partial or conflicting; "
-            f"installer was not run ({rendered})"
-        )
+        if not repair_names:
+            rendered = ", ".join(
+                f"{location}/{name}={state}"
+                for (location, name), state in destinations.items()
+            )
+            return (
+                "WARN: existing public skill destinations are partial or conflicting; "
+                f"installer was not run ({rendered})"
+            )
     resolved, error = _resolved_skill_release(manifest)
-    expected = manifest["connor_skills"]["commit"]
     if error:
         return f"WARN: public skill release could not be verified — {error}"
     if resolved != expected:
@@ -735,13 +1009,43 @@ def _install_connor_skills(root: Path) -> str:
                 f"{result.stdout.strip()}, expected {expected}"
             )
         for name in names:
+            if repair_names and name not in repair_names:
+                continue
             command = _connor_skill_command(manifest, source_tree, skill=name)
-            result = _run_command(command, cwd=root, timeout=120)
+            install_root = Path(temporary) if name in repair_names else root
+            result = _run_command(command, cwd=install_root, timeout=120)
             if result.returncode:
                 reason = (result.stderr or result.stdout).strip().splitlines()
                 tail = reason[-1] if reason else f"exit {result.returncode}"
                 return f"WARN: Connor skill install failed — {tail}"
-            wiring = _wire_claude_skill(root, name)
+            warning = _normalize_skill_lock(
+                root,
+                [name],
+                source=manifest["connor_skills"]["source"],
+                commit=expected,
+            )
+            if warning:
+                return warning
+            if name in repair_names:
+                source = install_root / ".agents" / "skills" / name
+                for location, repaired_name in repairs:
+                    if repaired_name != name:
+                        continue
+                    destination = root / location / name
+                    outcome = _replace_skill_tree(destination, source, specs[name]["files"])
+                    if outcome.startswith("WARN:"):
+                        return outcome
+                    try:
+                        mark_skill_owned(destination, expected)
+                    except OSError as exc:
+                        return f"WARN: could not record AgentFlow ownership for {destination}: {exc}"
+            else:
+                destination = root / ".agents" / "skills" / name
+                try:
+                    mark_skill_owned(destination, expected)
+                except OSError as exc:
+                    return f"WARN: could not record AgentFlow ownership for {destination}: {exc}"
+            wiring = _wire_claude_skill(root, name, expected)
             if wiring.startswith("WARN:"):
                 return wiring
     states = {
@@ -765,12 +1069,19 @@ def _install_methodology_skills(root: Path) -> str:
     """
     manifest = _manifest()
     source = manifest["methodology_skills"]
+    warning = _normalize_skill_lock(
+        root,
+        source["skills"],
+        source=source["source"],
+        commit=source["commit"],
+    )
+    if warning:
+        return warning
     states = _methodology_destination_states(root, manifest)
     if all(state == "ok" for state in states.values()):
         return "ok:   methodology contracts already installed"
     if all(states[(".agents/skills", name)] == "ok" for name in source["skills"]) and all(
         states[(".claude/skills", name)] == "absent"
-        or _legacy_claude_skill_link(root, name)
         for name in source["skills"]
     ):
         outcomes = [_wire_claude_skill(root, name) for name in source["skills"]]
@@ -806,6 +1117,14 @@ def _install_methodology_skills(root: Path) -> str:
             result = _run_command(command, cwd=root, timeout=120)
             if result.returncode:
                 return "WARN: methodology contract install failed"
+            warning = _normalize_skill_lock(
+                root,
+                [name],
+                source=source["source"],
+                commit=source["commit"],
+            )
+            if warning:
+                return warning
             wiring = _wire_claude_skill(root, name)
             if wiring.startswith("WARN:"):
                 return wiring
@@ -814,23 +1133,43 @@ def _install_methodology_skills(root: Path) -> str:
     return "DO:   installed pinned methodology contracts"
 
 
-def _install_ui_runtime(root: Path) -> str:
+def _install_ui_runtime(root: Path, *, provider: str | None = None) -> str:
     manifest = _manifest()
     specs = {item.get("skill"): item for item in manifest["capabilities"]}
+    locations = (
+        ({"codex": ".agents/skills", "claude": ".claude/skills"}[provider],)
+        if provider is not None else (".agents/skills", ".claude/skills")
+    )
     for name in manifest["connor_skills"]["skills"]:
-        if _skill_status(root, name, specs[name]["files"]) != "ok":
+        if any(
+            _skill_destination_status(root / location / name, specs[name]["files"]) != "ok"
+            for location in locations
+        ):
             return "WARN: UI runtime skipped because the pinned skill pack is not intact"
     playwright = manifest["playwright"]
-    if _playwright_available(
-        root,
-        version=playwright["version"],
-        node_minimum=playwright["node_minimum"],
-        verify_runtime=True,
-    ):
+
+    def available() -> bool:
+        if provider is None:
+            return _playwright_available(
+                root, version=playwright["version"],
+                node_minimum=playwright["node_minimum"], verify_runtime=True,
+            )
+        status, _detail = _runtime_status(
+            root, version=playwright["version"], node_minimum=playwright["node_minimum"],
+            manifest=manifest, provider=provider,
+        )
+        if status != "ok":
+            return False
+        result = _run_command(
+            ["node", str(root / "scripts" / "screenshots.mjs"), "--self-check"],
+            cwd=root, timeout=30,
+        )
+        return result.returncode == 0
+
+    if available():
         return "ok:   pinned Playwright, Chromium, and screenshot harness are ready"
     skill_dirs = {
-        (root / location / "drive-local-webapp").resolve()
-        for location in (".agents/skills", ".claude/skills")
+        (root / location / "drive-local-webapp").resolve() for location in locations
     }
     for skill in skill_dirs:
         commands = (
@@ -848,12 +1187,7 @@ def _install_ui_runtime(root: Path) -> str:
                 reason = (result.stderr or result.stdout).strip().splitlines()
                 tail = reason[-1] if reason else f"exit {result.returncode}"
                 return f"WARN: UI runtime setup failed — {tail}"
-    if not _playwright_available(
-        root,
-        version=playwright["version"],
-        node_minimum=playwright["node_minimum"],
-        verify_runtime=True,
-    ):
+    if not available():
         return "WARN: UI runtime setup completed but the screenshot harness self-check failed"
     return "DO:   installed pinned Playwright and Chromium; self-check passed"
 
@@ -864,7 +1198,15 @@ def _legacy_claude_skill_link(root: Path, name: str) -> bool:
     return target.is_symlink() and target.readlink() == desired
 
 
-def _wire_claude_skill(root: Path, name: str) -> str:
+def _wire_claude_skill(root: Path, name: str, pin: str | None = None) -> str:
+    """Materialize a repo skill's Claude-local copy and mark its provenance.
+
+    ``pin`` should be the same resolved pin the caller already recorded for this skill's
+    other destination, so one enrollment run records one pin per skill rather than two —
+    pass it explicitly whenever the caller has already resolved one. Callers that have not
+    (e.g. wiring a pre-existing ``.agents`` destination whose own pin is unknown here) fall
+    back to that destination's own marker, then to the manifest's pinned ``version``.
+    """
     target = root / ".claude" / "skills" / name
     source = root / ".agents" / "skills" / name
     if target.is_dir() and not target.is_symlink():
@@ -877,6 +1219,18 @@ def _wire_claude_skill(root: Path, name: str) -> str:
         return f"WARN: {source} is not a safe materialization source"
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(source, target)
+    try:
+        if pin is None:
+            source_ownership = skill_ownership(source)
+            if source_ownership is not None:
+                pin = source_ownership["pin"]
+            else:
+                specs = {item.get("skill"): item for item in _manifest()["capabilities"]}
+                pin = specs[name].get("version") or specs[name].get("source") or "unpinned"
+        mark_skill_owned(target, pin)
+    except (KeyError, OSError) as exc:
+        shutil.rmtree(target)
+        return f"WARN: could not record AgentFlow ownership for {target}: {exc}"
     return f"DO:   materialized {target} for Claude Code"
 
 
@@ -885,6 +1239,12 @@ class _EnrollmentJournal:
         self._temporary = tempfile.TemporaryDirectory(prefix="agentflow-enroll-")
         self._root = Path(self._temporary.name)
         self._entries: list[tuple[Path, Path | None]] = []
+        # Only a parent this enrollment run watched come into existence is ours to remove on
+        # rollback — a parent that already existed may be a concurrent repair's ``.agentflow``,
+        # and blindly rmdir-ing it races that repair's own mkdir+open of its lock file.
+        self._absent_parents_at_start = {
+            path.parent for path in dict.fromkeys(paths) if not path.parent.exists()
+        }
         for index, path in enumerate(dict.fromkeys(paths)):
             backup = self._root / str(index)
             if path.is_symlink():
@@ -912,6 +1272,18 @@ class _EnrollmentJournal:
                 shutil.copytree(backup, path, symlinks=True)
             else:
                 shutil.copy2(backup, path)
+        for path, _backup in self._entries:
+            if path.name == "skill-ownership" and path.parent in self._absent_parents_at_start:
+                try:
+                    path.parent.rmdir()
+                except OSError:
+                    pass
+
+    def discard_created_backups(self) -> None:
+        """Remove rollback copies that a successful enrollment no longer needs."""
+        for path, backup in self._entries:
+            if backup is None and path.name.endswith(".pre-agentflow") and path.is_file():
+                path.unlink()
 
     def close(self) -> None:
         self._temporary.cleanup()
@@ -932,6 +1304,7 @@ def _enrollment_journal(root: Path) -> _EnrollmentJournal:
         root / ".claude",
         root / "scripts",
         root / "skills-lock.json",
+        root / ".agentflow" / "skill-ownership",
         config,
     ]
     if config.is_symlink():
@@ -945,9 +1318,10 @@ def _apply_enrollment(
     root: Path, profile: str, surfaces: tuple[str, ...], *, converge: bool = False
 ) -> list[str]:
     outcomes: list[str] = []
-    _append_once(root / ".gitignore", ".agentflow/")
+    _append_once(root / ".gitignore", ".agentflow/", backup=False)
     if surfaces:
-        _append_once(root / ".gitignore", ".agents/skills/**/node_modules/")
+        _append_once(root / ".gitignore", ".agents/skills/**/node_modules/", backup=False)
+        _append_once(root / ".gitignore", ".claude/skills/**/node_modules/", backup=False)
 
     agents = root / "AGENTS.md"
     claude = root / "CLAUDE.md"
@@ -1006,9 +1380,65 @@ def _apply_enrollment(
                 harness, _asset_text("scripts/screenshots.mjs"), overwrite=converge
             )
         )
-        outcomes.append(_install_connor_skills(root))
+        outcomes.append(
+            _install_connor_skills(root, converge=True)
+            if converge else _install_connor_skills(root)
+        )
         outcomes.append(_install_ui_runtime(root))
     return outcomes
+
+
+def _enrollment_write_targets(root: Path, surfaces: tuple[str, ...]) -> list[tuple[Path, str]]:
+    """The repository-local paths enrollment must be able to stage after a clean apply."""
+    targets = [
+        (root / ".gitignore", "enrollment file"),
+        (root / "AGENTS.md", "enrollment file"),
+        (root / "CLAUDE.md", "enrollment file"),
+        (root / "skills-lock.json", "enrollment file"),
+    ]
+    manifest = _manifest()
+    skills = set(manifest["methodology_skills"]["skills"])
+    for spec in manifest["capabilities"]:
+        name = spec.get("skill")
+        if not name or "files" not in spec:
+            continue
+        required = (
+            spec["id"] == "agentflow-skill"
+            or name in skills
+            or (surfaces and spec["requirement"] == "ui")
+        )
+        if not required:
+            continue
+        for location in (".agents/skills", ".claude/skills"):
+            targets.extend(
+                (root / location / name / item["path"], "required capability file")
+                for item in spec["files"]
+            )
+    if surfaces:
+        targets.append((root / "scripts" / "screenshots.mjs", "required capability file"))
+    return targets
+
+
+def _ignored_enrollment_path(root: Path, surfaces: tuple[str, ...]) -> str | None:
+    """Name the first enrollment write Git would exclude, using Git as the rule authority."""
+    for path, kind in _enrollment_write_targets(root, surfaces):
+        if any(parent.is_symlink() for parent in path.parents if parent != root):
+            # A legacy Claude skill link is replaced by a materialized directory during
+            # apply (#708). Git cannot check a would-be child below that link.
+            continue
+        relative = path.relative_to(root)
+        result = _run_command(
+            ["git", "-C", str(root), "check-ignore", "-v", "--", str(relative)], timeout=30
+        )
+        if result.returncode == 1:
+            continue
+        if result.returncode:
+            detail = (result.stderr or result.stdout).strip() or "git check-ignore failed"
+            return f"could not verify whether {relative} is ignored — {detail}"
+        rule = (result.stdout or "").strip().split("\t", 1)[0]
+        if rule:
+            return f"{kind} {relative} is ignored by {rule}"
+    return None
 
 
 def enroll_repository(
@@ -1040,6 +1470,7 @@ def enroll_repository(
             or _managed_files_problem(root, surfaces, converge=converge)
             or _skills_problem(root, surfaces, converge=converge)
             or _methodology_problem(root)
+            or _ignored_enrollment_path(root, surfaces)
         )
         if problem:
             print(f"  WARN: {problem} — repository left unchanged")
@@ -1050,6 +1481,8 @@ def enroll_repository(
             if any(outcome.startswith("WARN:") for outcome in outcomes):
                 journal.restore()
                 outcomes.append("WARN: enrollment failed and all managed changes were rolled back")
+            else:
+                journal.discard_created_backups()
         except Exception:
             journal.restore()
             raise
@@ -1103,17 +1536,14 @@ def _repo_drift(root: Path) -> tuple[list[str], list[str]]:
     return drift, notes
 
 
-def _converge_paths(root: Path) -> list[Path]:
-    """The fixed pair of `_asset_text` targets converge may have rewritten — nothing else
-    is ever in the overwrite set, so this is also everything the sweep commit stages."""
-    return [
-        path
-        for path in (
-            root / ".agents" / "skills" / "agentflow" / "SKILL.md",
-            root / "scripts" / "screenshots.mjs",
-        )
-        if path.is_file()
-    ]
+def _uncommitted_paths(status: str) -> list[str]:
+    """The non-index side of porcelain output after converge stages the clean checkout."""
+    paths = []
+    for line in status.splitlines():
+        if len(line) < 4 or (line[:2] != "??" and line[1] == " "):
+            continue
+        paths.append(line[3:])
+    return paths
 
 
 def _current_ref(root: Path) -> str | None:
@@ -1146,21 +1576,22 @@ def _converge_and_ship(root: Path, repo: str) -> tuple[bool, str]:
         report = enroll_repository(str(root), apply=True, converge=True)
         if not report.ready:
             return False, "enrollment did not converge cleanly"
-        paths = _converge_paths(root)
-        if not paths:
-            return True, "nothing to commit"
         add = _run_command(
-            ["git", "-C", str(root), "add", *[str(p) for p in paths]], timeout=30
+            ["git", "-C", str(root), "add", "-A"], timeout=30
         )
-        if add.returncode:
-            return False, "git add failed"
         status = _run_command(["git", "-C", str(root), "status", "--porcelain"], timeout=30)
+        uncommitted = _uncommitted_paths(status.stdout or "")
+        if uncommitted:
+            return False, "enrollment did not converge — uncommitted paths: " + ", ".join(uncommitted)
+        if add.returncode:
+            reason = (add.stderr or add.stdout or "").strip()
+            return False, f"git add failed — {reason}"
         if not (status.stdout or "").strip():
             return True, "already current after converge"
         commit = _run_command(
             [
                 "git", "-C", str(root), "commit", "-s", "-m",
-                "agentflow: converge bundled skill assets to the pinned content",
+                "agentflow: converge repository enrollment artifacts",
             ],
             timeout=30,
         )
@@ -1178,12 +1609,13 @@ def _converge_and_ship(root: Path, repo: str) -> tuple[bool, str]:
         pr = github.create_pr(
             repo,
             head=_SYNC_BRANCH,
-            title="agentflow: converge enrollment to pinned bundled assets",
+            title="agentflow: converge repository enrollment artifacts",
             body=(
-                "Automated by `agentflow enroll --sync --apply`: rewrites this repo's bundled "
-                "AgentFlow skill and/or screenshot harness to match the pinned content recorded "
-                "in capabilities.toml. A drifted vendored skill pack (ui-craft, drive-local-webapp) "
-                "is reported by `agentflow doctor`, not rewritten here."
+                "Automated by `agentflow enroll --sync --apply`: commits every repository-local "
+                "enrollment artifact it materialized or converged. A drifted vendored skill pack "
+                "(ui-craft, drive-local-webapp) is repaired here only when AgentFlow's ownership "
+                "record proves it materialized the destination; unowned drift stays reported by "
+                "`agentflow doctor`."
             ),
         )
         if pr.url is None:
@@ -1352,6 +1784,9 @@ def audit_lines(repos) -> list[str]:
     """One line per enrolled repo plus a census tail, naming every repo the gate cannot fire
     in: the ones that never answered, and the ones whose headless answer their own checkout
     contradicts."""
+    from agentflow.ci_policy import audit_workflows
+
+    repos = list(repos)
     lines = []
     undeclared = []
     contradicted = []
@@ -1362,9 +1797,10 @@ def audit_lines(repos) -> list[str]:
             state = f"{UI_SURFACES_NONE} — but this checkout has a user-facing surface"
             contradicted.append(cfg.repo)
         lines.append(f"  {cfg.repo}: {state}")
+        lines.extend(f"  {cfg.repo}: {finding}" for finding in audit_workflows(cfg.workdir))
         if not declaration.declared:
             undeclared.append(cfg.repo)
-    declared = len(lines) - len(undeclared)
+    declared = len(repos) - len(undeclared)
     lines.append(f"{declared} declared / {len(undeclared)} undeclared")
     if undeclared:
         lines.append("undeclared (the UI-evidence gate cannot fire there): "
@@ -1450,7 +1886,7 @@ def configured_repositories():
 
 
 def _audit_command() -> None:
-    print("UI-surface declarations across the enrolled fleet")
+    print("Fleet enrollment and CI-policy audit")
     for line in audit_lines(configured_repositories()):
         print(line)
 

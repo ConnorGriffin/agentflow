@@ -49,3 +49,10 @@ caller-supplied classifications or methods. The five `EvidenceStore` verbs remai
 governed Evidence interface from ADR 580; the storage-owned receipt reader is a bounded,
 content-free query seam rather than table access or a sixth verb. No pipeline source content,
 prompts, transcripts, or policy mutations are retained.
+
+Issue #571 wires terminal Intake, Attack, Research, Review, and Revise outcomes through this same
+producer after each stage's own durable result exists. Intake, Attack, and Research bind their
+frozen provider-input digest and exact checkout revision without retaining either input or result
+prose. Review records its typed verdict ledger before projection; Revise links its verified pushed
+head to that exact finding set. A router callback is projection plumbing only, not a second
+Evidence interface or settlement owner.

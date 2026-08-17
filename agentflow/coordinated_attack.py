@@ -115,6 +115,7 @@ def attack_submission(intake_record, draft: IntakeResult, tool: str) -> Submissi
         round=round, max_rounds=max_rounds(draft.complexity)))
     return Submission(
         repo=intake_record.repo, subject=intake_record.subject, stage="attack",
+        subject_revision=getattr(intake_record, "subject_revision", ""),
         target=intake_record.target, pool=tool, complexity=_dial(draft), round=round, claim=True,
         source=str(WorktreeRef.for_attack(ref.workdir, tool, number).path),
         input_ptr=json.dumps({"format": PROVIDER_INPUT_V1, "snapshot": snapshot,
@@ -149,6 +150,7 @@ def renewed_attack_submission(attack_record, tool: str) -> Submission | None:
         round=round, max_rounds=max_rounds(draft.complexity)))
     return Submission(
         repo=attack_record.repo, subject=attack_record.subject, stage="attack",
+        subject_revision=getattr(attack_record, "subject_revision", ""),
         target=attack_record.target, pool=tool, complexity=_dial(draft), round=round, claim=True,
         source=str(WorktreeRef.for_attack(ref.workdir, tool, number).path),
         input_ptr=json.dumps({"format": PROVIDER_INPUT_V1, "snapshot": snapshot,
@@ -184,6 +186,7 @@ def redraft_submission(attack_record, result: AttackResult, tool: str) -> Submis
         max_rounds=max_rounds(draft.complexity)))
     return Submission(
         repo=attack_record.repo, subject=attack_record.subject, stage="intake",
+        subject_revision=getattr(attack_record, "subject_revision", ""),
         target=attack_record.target, pool=tool, complexity="deep", round=attack_record.round, claim=True,
         source=str(WorktreeRef.for_intake(ref.workdir, tool, number).path),
         input_ptr=json.dumps({"format": PROVIDER_INPUT_V1, "snapshot": snapshot,

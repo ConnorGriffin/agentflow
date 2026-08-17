@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from hashlib import sha256
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -34,7 +35,8 @@ from agentflow import github
 from agentflow.balancer import BUILD_POOLS, pick_reviewer
 from agentflow.coordinator import Coordinator, tracer
 from agentflow.coordinator.providers import (
-    SessionLeadInputError, has_session_lead_provenance, split_terminal_session_lead_contract)
+    SessionLeadInputError, has_session_lead_provenance, provider_input_prompt,
+    split_terminal_session_lead_contract)
 from agentflow.coordinator.store import StoreUnavailable
 from agentflow.coordinator.verification import PREPARED, unprepared
 from agentflow.gate import MAX_REVISES, revise_round_budget_remains
@@ -44,11 +46,60 @@ from agentflow.pr_park import (chain_uncertainty, exact_head_review_chain, park_
                                park_proof_marker)
 from agentflow.prompts import UI_GAP_REASON, stage_prompt_spec
 from agentflow.repo_facts import repo_profile, surface_declaration, surfaces_phrase, ui_surfaces
+from agentflow.review_policy import current_head_author
 from agentflow.reviewer import review_worktree
 from agentflow.routing import routing
 from agentflow.runner import _run, codex_spent_at_render, remove_worktree_if_safe
 from agentflow.stage_worktree import worktree_owns_head
 from agentflow.worktree_ref import WorktreeRef, review_source_facts
+
+
+def _evidence_digest(*values: str) -> str:
+    return sha256("\0".join(values).encode()).hexdigest()
+
+
+def _evidence_identity(record) -> str:
+    return "review-" + _evidence_digest(
+        "review-id-v1", record.repo, record.subject, record.target or "", str(record.round))[:32]
+
+
+def _evidence_source(producer, record):
+    """Bind Evidence to the exact reviewed commit and PR locator, never review prose."""
+    facts = review_source_facts(record)
+    if facts is None or not record.target:
+        return None
+    _workdir, pr = facts
+    return producer.review_source(
+        _evidence_identity(record), record.target, locator=f"pulls/{pr}",
+        observed_at=max(0, record.started_at))
+
+
+def _evidence_actions(record):
+    """Return only durably captured classifications; this adapter never infers them."""
+    from agentflow.review_policy import ReviewState
+
+    state = ReviewState.from_record(record)
+    if state is None:
+        return ()
+    return tuple(item for item in state.findings if item.failure_class)
+
+
+def record_evidence(producer, record, _obs=None, *, source=None):
+    """Persist eligible review decisions through the existing typed producer interface."""
+    from agentflow.evidence_pipeline import ReviewFinding
+
+    source = source or _evidence_source(producer, record)
+    if source is None:
+        return ()
+    results = []
+    review_id = _evidence_identity(record)
+    for sequence, item in enumerate(_evidence_actions(record), 1):
+        results.append(producer.review(ReviewFinding(
+            review_id, record.target, record.review_axis, record.review_depth, sequence,
+            item.action.value, "code-review", source,
+            _evidence_digest("review-signature-v1", item.failure_class, item.grounding),
+            item.failure_class, "model_judged", max(0, record.started_at))))
+    return tuple(results)
 
 
 # The one extra lens a re-review gains when a conflict Revise produced the head under review (ADR
@@ -128,13 +179,23 @@ def review_submission(build_record, head_sha, reviewer_tool, pr_number,
     if parts is None or not head_sha:
         return None
     workdir, slug = parts
+    if (build_record.stage == "build" and acceptance
+            and acceptance == (build_record.input_ptr or "")
+            and has_session_lead_provenance(build_record)):
+        try:
+            acceptance, _build_contract = split_terminal_session_lead_contract(
+                provider_input_prompt(acceptance))
+        except SessionLeadInputError:
+            return None
     brief = REVIEW_PROMPT.format(
         pr=pr_number, issue=build_record.subject, starting_sha=head_sha,
         acceptance=acceptance or "(none provided)",
         surfaces=surfaces or "any user-facing surface")
-    state = review or ReviewState(change_author_tool=build_record.pool)
+    state = review or ReviewState()
     assignment = state.assignment
-    author = state.change_author_tool or build_record.pool
+    author = current_head_author(build_record.change_author_tool, build_record.builder_lineage)
+    if author is None:
+        return None
     brief = with_review_assignment(
         brief,
         depth=assignment.depth, reason=assignment.reason, axis=assignment.axis,
@@ -153,7 +214,7 @@ def review_submission(build_record, head_sha, reviewer_tool, pr_number,
         cross_tool_covered=reviewer_tool != author)
     return Submission(
         repo=build_record.repo, subject=build_record.subject, stage="review",
-        target=head_sha, pool=reviewer_tool,
+        target=head_sha, subject_revision=head_sha, pool=reviewer_tool,
         complexity=routing.review_complexity(
             build_record.builder_complexity, build_record.complexity),
         source=str(review_worktree(workdir, reviewer_tool, pr_number, slug)),
@@ -183,7 +244,10 @@ def conflict_decision_review_submission(revise_record, *, head_sha: str, pr_numb
             revise_record.outcome[len(CONFLICT_UNCERTAINTY_PREFIX):])
     except json.JSONDecodeError:
         return None
-    reviewer_tool = other_tool(revise_record.pool)
+    author = current_head_author(revise_record.change_author_tool, revise_record.builder_lineage)
+    if author is None:
+        return None
+    reviewer_tool = other_tool(author)
     if reviewer_tool is None:
         return None
     handoff = (
@@ -204,7 +268,7 @@ def conflict_decision_review_submission(revise_record, *, head_sha: str, pr_numb
             assignment=ReviewAssignment(
                 ReviewDepth.FULL, "competing product behaviors in a conflict",
                 ReviewAxis.DECISION),
-            change_author_tool=revise_record.pool, handoff=handoff,
+            change_author_tool=author, handoff=handoff,
             uncertainty=uncertainty_value, uncertainty_handoffs=1))
 
 
@@ -227,8 +291,11 @@ def review_successor_submission(review_record, verdict):
     if passes >= 3:
         return None
     workdir, pr = facts
+    author = review_record.pool
+    if author not in BUILD_POOLS:
+        return None
     next_tool = pick_reviewer(
-        review_record.pool, allow_same_tool=repo_profile(workdir) != "autonomous")
+        author, allow_same_tool=repo_profile(workdir) != "autonomous")
     if next_tool is None:
         return None
     prior = ReviewState.from_record(review_record)
@@ -259,11 +326,11 @@ def review_successor_submission(review_record, verdict):
         depth=depth,
         reason=reason,
         axis=axis,
-        change_author_tool=review_record.pool, handoff=handoff)
+        change_author_tool=author, handoff=handoff)
     state = ReviewState(
         assignment=ReviewAssignment(depth, reason, axis),
-        change_author_tool=review_record.pool, reviewed_from_sha=review_record.target,
-        passes=passes, cross_tool_covered=next_tool != review_record.pool,
+        change_author_tool=author, reviewed_from_sha=review_record.target,
+        passes=passes, cross_tool_covered=next_tool != author,
         tainted=prior.tainted, handoff=handoff,
         # A Full mutation invalidates both previous axes. Product and standards must inspect the
         # entire new head before any assigned fix ledger can be considered complete.
@@ -271,7 +338,7 @@ def review_successor_submission(review_record, verdict):
         uncertainty_handoffs=prior.uncertainty_handoffs)
     return Submission(
         repo=review_record.repo, subject=review_record.subject, stage="review",
-        target=verdict.final_sha, pool=next_tool,
+        target=verdict.final_sha, subject_revision=verdict.final_sha, pool=next_tool,
         complexity=routing.review_complexity(
             review_record.builder_complexity, review_record.complexity),
         source=str(review_worktree(workdir, next_tool, pr, _review_slug(review_record))),
@@ -315,7 +382,7 @@ def review_axis_successor_submission(review_record, verdict, *, axis=None, tool=
     combined_actions = merge_findings(prior.findings, verdict.actions)
     actions = [
         {"action": item.action.value, "summary": item.summary, "grounding": item.grounding,
-         "file": item.file, "line": item.line}
+         "file": item.file, "line": item.line, "failure_class": item.failure_class}
         for item in combined_actions]
     uncertainty_value = verdict.uncertainty
     handoff = (
@@ -328,7 +395,9 @@ def review_axis_successor_submission(review_record, verdict, *, axis=None, tool=
         key=lambda value: ("focused", "targeted", "full").index(value.value))
     reason = (verdict.depth_reason if verdict.depth != prior.assignment.depth
               else prior.assignment.reason)
-    author = prior.change_author_tool or review_record.builder_lineage
+    author = current_head_author(prior.change_author_tool, review_record.builder_lineage)
+    if author is None:
+        return None
     session_lead = has_session_lead_provenance(review_record)
     prompt = _with_durable_review_assignment(
         review_record,
@@ -336,7 +405,7 @@ def review_axis_successor_submission(review_record, verdict, *, axis=None, tool=
         depth=depth,
         reason=reason,
         axis=axis,
-        change_author_tool=author or "", handoff=handoff)
+        change_author_tool=author, handoff=handoff)
     state = replace(
         prior, assignment=ReviewAssignment(depth, reason, axis),
         change_author_tool=author,
@@ -348,7 +417,7 @@ def review_axis_successor_submission(review_record, verdict, *, axis=None, tool=
         uncertainty_handoffs=prior.uncertainty_handoffs + (1 if uncertainty else 0))
     return Submission(
         repo=review_record.repo, subject=review_record.subject, stage="review",
-        target=review_record.target, pool=next_tool,
+        target=review_record.target, subject_revision=review_record.target or "", pool=next_tool,
         complexity=routing.review_complexity(
             review_record.builder_complexity, review_record.complexity),
         source=str(review_worktree(workdir, next_tool, pr, _review_slug(review_record))),
@@ -368,8 +437,9 @@ def tainted_review_submission(review_record, reviewer_tool: str):
         ReviewAssignment, ReviewAxis, ReviewDepth, ReviewState)
 
     facts = review_source_facts(review_record)
-    author = review_record.change_author_tool or review_record.builder_lineage
-    if facts is None or not review_record.target or reviewer_tool == author:
+    author = current_head_author(review_record.change_author_tool, review_record.builder_lineage)
+    if (author is None or facts is None or not review_record.target
+            or reviewer_tool == author):
         return None
     prior = ReviewState.from_record(review_record)
     if prior is None:
@@ -387,7 +457,7 @@ def tainted_review_submission(review_record, reviewer_tool: str):
         review_record,
         review_record.input_ptr or "",
         depth=depth, reason=review_record.depth_reason or "taint-clearing independent review",
-        axis=axis, change_author_tool=author or "", handoff=handoff)
+        axis=axis, change_author_tool=author, handoff=handoff)
     state = replace(
         prior,
         assignment=ReviewAssignment(
@@ -396,7 +466,7 @@ def tainted_review_submission(review_record, reviewer_tool: str):
         cross_tool_covered=True, tainted=True, taint_cleared=False, handoff=handoff)
     return Submission(
         repo=review_record.repo, subject=review_record.subject, stage="review",
-        target=review_record.target, pool=reviewer_tool,
+        target=review_record.target, subject_revision=review_record.target or "", pool=reviewer_tool,
         complexity=routing.review_complexity(
             review_record.builder_complexity, review_record.complexity),
         source=str(review_worktree(workdir, reviewer_tool, pr, _review_slug(review_record))),
@@ -426,8 +496,9 @@ def decision_resume_review_submission(review_record, reviewer_tool: str, *, targ
         ReviewAssignment, ReviewAxis, ReviewDepth, ReviewState, decision_answer_handoff)
 
     facts = review_source_facts(review_record)
-    author = review_record.change_author_tool or review_record.builder_lineage
-    if facts is None or not review_record.target or not target or not answer.strip():
+    author = current_head_author(review_record.change_author_tool, review_record.builder_lineage)
+    if (author is None or facts is None or not review_record.target or not target
+            or not answer.strip()):
         return None
     prior = ReviewState.from_record(review_record)
     if prior is None:
@@ -441,14 +512,14 @@ def decision_resume_review_submission(review_record, reviewer_tool: str, *, targ
     prompt = _with_durable_review_assignment(
         review_record,
         review_record.input_ptr or "",
-        depth=depth, reason=reason, axis=axis, change_author_tool=author or "", handoff=handoff)
+        depth=depth, reason=reason, axis=axis, change_author_tool=author, handoff=handoff)
     state = replace(
         prior, assignment=ReviewAssignment(depth, reason, axis),
         change_author_tool=author, sequence=sequence,
         cross_tool_covered=reviewer_tool != author, handoff=handoff, uncertainty=None)
     return Submission(
         repo=review_record.repo, subject=review_record.subject, stage="review",
-        target=review_record.target, pool=reviewer_tool,
+        target=review_record.target, subject_revision=review_record.target or "", pool=reviewer_tool,
         complexity=routing.review_complexity(
             review_record.builder_complexity, review_record.complexity),
         source=str(review_worktree(workdir, reviewer_tool, pr, _review_slug(review_record))),
@@ -483,9 +554,11 @@ def survivor_review_submission(cfg, *, issue: int, slug: str, builder_tool: str,
         pr=pr_number, issue=issue, starting_sha=head_sha,
         acceptance=acceptance or "(none provided)",
         surfaces=surfaces_phrase(surface_declaration(cfg.workdir)))
-    state = review or ReviewState(change_author_tool=builder_tool)
+    state = review or ReviewState()
     assignment = state.assignment
-    author = state.change_author_tool or builder_tool
+    author = state.change_author_tool
+    if author not in BUILD_POOLS:
+        return None
     prompt = with_review_assignment(
         prompt,
         depth=assignment.depth, reason=assignment.reason, axis=assignment.axis,
@@ -497,6 +570,7 @@ def survivor_review_submission(cfg, *, issue: int, slug: str, builder_tool: str,
         cross_tool_covered=reviewer_tool != author)
     return Submission(
         repo=cfg.repo, subject=str(issue), stage="review", target=head_sha,
+        subject_revision=head_sha,
         pool=reviewer_tool, complexity=routing.review_complexity(None, "deep"),
         source=str(review_worktree(cfg.workdir, reviewer_tool, pr_number, slug)),
         claim=True, input_ptr=_review_prompt(prompt), builder_lineage=builder_tool,
@@ -593,6 +667,33 @@ def _verdict_ready(record, obs):
             # independent combined/standards result.
             record.review_taint_cleared = True
     return VERIFIED
+
+
+def capture_verdict_state(record, payload: str) -> bool:
+    """Materialize one already-verified verdict into the durable typed Review ledger."""
+    from agentflow.review_policy import ReviewState, merge_findings, merge_follow_ups
+    from agentflow.reviewer import parse_verdict
+
+    review = ReviewState.from_record(record)
+    if review is None:
+        return False
+    verdict = parse_verdict(
+        payload, expected_sha=record.target, expected_depth=record.review_depth,
+        expected_axis=record.review_axis, expected_author=record.change_author_tool,
+        owned_heads=((record.review_prior_push,) if record.review_prior_push else ()))
+    if not verdict.parsed:
+        return False
+    findings = (verdict.actions if record.review_axis == "fix"
+                else merge_findings(review.findings, verdict.actions))
+    captured = replace(
+        review, findings=findings,
+        fixes=tuple(dict.fromkeys(review.fixes + verdict.fixes)),
+        follow_ups=merge_follow_ups(review.follow_ups, verdict.follow_ups),
+        checks=tuple(dict.fromkeys(review.checks + verdict.checks)),
+        uncertainty=verdict.uncertainty)
+    for name, value in captured.record_fields().items():
+        setattr(record, name, value)
+    return True
 
 
 def _commit_is_gone(workdir: str, sha: str) -> bool:
@@ -751,9 +852,9 @@ def resume_answered_review(cfg, coordinator, pr: int, *, comment: str, target: s
             # answer either.
             return (f"#{issue}: an exact-head review already owns this issue — deferring the "
                     f"answered decision on PR #{pr}")
-        author = record.change_author_tool or record.builder_lineage
+        author = current_head_author(record.change_author_tool, record.builder_lineage)
         source_facts = review_source_facts(record)
-        if not author or source_facts is None:
+        if author is None or source_facts is None:
             return None            # no lineage to resume — the park stays the human's move
         reviewer_tool = pick_reviewer(
             author, allow_same_tool=repo_profile(source_facts[0]) != "autonomous")
@@ -845,6 +946,9 @@ def _prepare_review_settlement(record) -> bool:
 RED_CHECK_SPENT_REASON = ("has a failing check on its reviewed head and no automatic revise "
                           "rounds remain")
 ACTION_REQUIRED_REASON = "has a check on its reviewed head that is asking for a human directly"
+PENDING_CHECK_REASON = "has a required check on its reviewed head that is still pending"
+UI_VERIFICATION_UNAVAILABLE_REASON = "could not run the required UI verification"
+UI_VERIFICATION_UNKNOWN_REASON = "could not determine whether UI verification was required"
 
 
 def _red_check_lines(checks) -> tuple[str, ...]:
@@ -852,6 +956,25 @@ def _red_check_lines(checks) -> tuple[str, ...]:
     exact commit it was read on. Pure (test surface)."""
     return tuple(f"Check `{name}` completed red on reviewed head {checks.sha}."
                  for name in checks.failing)
+
+
+def _pending_check_lines(checks) -> tuple[str, ...]:
+    """The one durable handoff fact for a non-terminal exact-head check rollup."""
+    return (f"Required checks are still pending on reviewed head {checks.sha}.",)
+
+
+def _settle_pending_check(record, verdict, workdir: str, pr: int, checks,
+                          *, autonomous: bool) -> str | None:
+    """Park a would-be clean review whose required checks have not completed.
+
+    This is deliberately a handoff rather than a settlement retry: a pending check cannot prove
+    PASS, and an external check that never completes must not leave a completed Review spinning
+    forever without an operator-visible terminal state.
+    """
+    return _park_review_settlement(
+        record, verdict, workdir, pr, reason=PENDING_CHECK_REASON, autonomous=autonomous,
+        checks=_pending_check_lines(checks),
+        missing="The reviewed head's required checks have not completed successfully.")
 
 
 def _settle_red_check(record, verdict, workdir: str, pr: int, checks,
@@ -925,7 +1048,7 @@ def _settle_review(record) -> str | None:
     from agentflow import ratchet
     from agentflow.gate import (MergeDecision, ci_is_green, decide_merge,
                                 post_clean_review_summary, reply_pending, squash_merge,
-                                ui_evidence_gap)
+                                ui_evidence_gap, ui_verification_required)
 
     facts = review_source_facts(record)
     if facts is None:
@@ -972,12 +1095,39 @@ def _settle_review(record) -> str | None:
         # once when the auto-revise rounds are spent (#208).
         return None
 
+    author = current_head_author(record.change_author_tool, record.builder_lineage)
+    if author is None:
+        return _park_review_settlement(
+            record, verdict, workdir, pr, reason="current head author is unreadable",
+            autonomous=autonomous)
+
     surfaces = ui_surfaces(workdir)
     ui_gap = ui_evidence_gap(record.repo, pr, surfaces)
+    ui_verification_needed = (False if ui_gap
+                              else ui_verification_required(record.repo, pr, surfaces))
+    if ui_verification_needed is None:
+        return _park_review_settlement(
+            record, verdict, workdir, pr, reason=UI_VERIFICATION_UNKNOWN_REASON,
+            autonomous=autonomous, checks=verdict.checks,
+            missing="The pipeline could not determine whether the reviewed change requires UI "
+                    "verification.")
+    if not ui_gap and verdict.ui_verification.value == "unavailable":
+        return _park_review_settlement(
+            record, verdict, workdir, pr, reason=UI_VERIFICATION_UNAVAILABLE_REASON,
+            autonomous=autonomous, checks=verdict.checks,
+            missing="The reviewer could not execute the required UI verification.")
+    if ui_verification_needed and verdict.ui_verification.value != "passed":
+        return _park_review_settlement(
+            record, verdict, workdir, pr,
+            reason="did not record the required UI verification", autonomous=autonomous,
+            checks=verdict.checks,
+            missing="The reviewed change touches a declared UI surface but has no runnable UI "
+                    "verification result.")
     # The head check gate (ADR 417): a clean exit first reads the checks on the exact reviewed
     # head, from GitHub — a reviewer cannot clear it by not looking. It is consulted only on the
     # exits that would otherwise finish clean: an unreadable answer defers only the clean
-    # settlement, and every park below still completes. Pending and absent checks change nothing.
+    # settlement, while every park below still completes. Pending checks park; absent checks do
+    # not change settlement.
     if not autonomous:
         if verdict.clean and not ui_gap:
             head_checks = github.commit_head_checks(record.repo, reviewed_head)
@@ -985,6 +1135,9 @@ def _settle_review(record) -> str | None:
                 return None
             if head_checks.failing:
                 return _settle_red_check(
+                    record, verdict, workdir, pr, head_checks, autonomous=False)
+            if head_checks.pending:
+                return _settle_pending_check(
                     record, verdict, workdir, pr, head_checks, autonomous=False)
             if not post_clean_review_summary(record.repo, pr, verdict, reviewed_head):
                 return None
@@ -1003,6 +1156,9 @@ def _settle_review(record) -> str | None:
                 return None
             if head_checks.failing:
                 return _settle_red_check(
+                    record, verdict, workdir, pr, head_checks, autonomous=True)
+            if head_checks.pending:
+                return _settle_pending_check(
                     record, verdict, workdir, pr, head_checks, autonomous=True)
             if not post_clean_review_summary(record.repo, pr, verdict, reviewed_head):
                 return None
@@ -1034,6 +1190,9 @@ def _settle_review(record) -> str | None:
         if head_checks.failing:
             return _settle_red_check(
                 record, verdict, workdir, pr, head_checks, autonomous=True)
+        if head_checks.pending:
+            return _settle_pending_check(
+                record, verdict, workdir, pr, head_checks, autonomous=True)
     # CI already completed in prepare_completed, outside SQLite's write transaction. Recheck it
     # once without polling, together with the exact head, immediately before merge.
     ci_green = _REVIEW_CI_OBSERVED.pop(record.identity, None)
@@ -1045,7 +1204,7 @@ def _settle_review(record) -> str | None:
     # never reaches it (the gate above owns red), so no revise round churns here.
     decision = decide_merge(
         verdict=verdict, ci_green=ci_green, reviewer_tool=record.pool,
-        builder_tool=record.change_author_tool or record.builder_lineage or "",
+        builder_tool=author,
         revises_used=record.round,
         ui_evidence_missing=ui_gap, reply_pending=pending_reply)
     if decision is not MergeDecision.MERGE:
@@ -1180,12 +1339,13 @@ def _moved_head_review_submission(record, head_sha: str):
     from agentflow.coordinator import Submission
     from agentflow.review_policy import ReviewState
     facts = review_source_facts(record)
-    if facts is None or not head_sha or not record.builder_lineage:
+    author = current_head_author(record.change_author_tool, record.builder_lineage)
+    if facts is None or not head_sha or author is None:
         return None
     workdir, pr = facts
     slug = _review_slug(record)
     reviewer_tool = pick_reviewer(
-        record.builder_lineage, allow_same_tool=repo_profile(workdir) != "autonomous")
+        author, allow_same_tool=repo_profile(workdir) != "autonomous")
     if reviewer_tool is None:
         return None  # ADR 0020: no tool free to review this cycle — leave the record, retry later
     prompt = ((record.input_ptr or "").replace(record.target, head_sha)
@@ -1196,6 +1356,7 @@ def _moved_head_review_submission(record, head_sha: str):
     review = replace(review, reviewed_from_sha=record.target)
     return Submission(
         repo=record.repo, subject=record.subject, stage="review", target=head_sha,
+        subject_revision=head_sha,
         pool=reviewer_tool,
         complexity=routing.review_complexity(
             record.builder_complexity, record.complexity),
@@ -1214,11 +1375,11 @@ def _kill_running_family(record) -> None:
     orphaned process does not keep burning tokens on a superseded head (#220). Fail-open: a family
     already gone or an os.kill error never blocks the retire or park."""
     import signal
-    from agentflow.coordinator.launcher import pid_family_alive
+    from agentflow.coordinator.launcher import pid_family_alive, stop_pid_family
     if not pid_family_alive(record.family):
         return
     try:
-        os.kill(int(record.family), signal.SIGTERM)
+        stop_pid_family(record.family, signal.SIGTERM)
     except (OSError, ValueError):
         pass
 
@@ -1259,7 +1420,8 @@ def _resettle_diverged_reviews(coord: Coordinator) -> None:
     from agentflow.coordinator.record import COMPLETED, RUNNING
     records = {record.identity: record for record in tracer.load_records()}
     for record in list(records.values()):
-        if (record.stage != "review" or record.retired or record.hold_pending
+        if (not coord._manages_repository(record.repo)
+                or record.stage != "review" or record.retired or record.hold_pending
                 or not record.claim or not record.target):
             continue
         verdict = _review_verdict(record) if record.state == COMPLETED else None
@@ -1291,6 +1453,11 @@ def _resettle_diverged_reviews(coord: Coordinator) -> None:
                 _kill_running_family(record)
             coord.park_stale_review(record.identity)
             continue
+        if current_head_author(record.change_author_tool, record.builder_lineage) is None:
+            if record.state == RUNNING:
+                _kill_running_family(record)
+            coord.park_stale_review(record.identity)
+            continue
         submission = _moved_head_review_submission(record, head)
         if submission is not None:
             if record.state == RUNNING:
@@ -1306,7 +1473,8 @@ def _resume_tainted_reviews(coord: Coordinator) -> None:
 
     records = list(tracer.load_records())
     candidates = [record for record in records
-                  if record.stage == "review" and record.retired and record.review_tainted
+                  if coord._manages_repository(record.repo)
+                  and record.stage == "review" and record.retired and record.review_tainted
                   and not record.review_taint_cleared and record.target]
     for record in candidates:
         same_head = [
@@ -1323,8 +1491,8 @@ def _resume_tainted_reviews(coord: Coordinator) -> None:
         pr_facts = _review_pr_facts(record)
         if pr_facts is None or pr_facts["state"] != "OPEN" or pr_facts["head"] != record.target:
             continue
-        author = record.change_author_tool or record.builder_lineage
-        if not author:
+        author = current_head_author(record.change_author_tool, record.builder_lineage)
+        if author is None:
             continue
         reviewer_tool = pick_reviewer(author, allow_same_tool=False)
         if reviewer_tool is None:

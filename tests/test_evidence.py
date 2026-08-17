@@ -613,6 +613,27 @@ def test_read_only_receipt_query_is_separate_from_the_governed_store(tmp_path):
     assert receipts.read(event.event_id).event_id == event.event_id
 
 
+def test_receipt_reader_revalidates_persisted_lineage_before_each_read(tmp_path):
+    path = tmp_path / "evidence.db"
+    store = EvidenceStore(path=path)
+    subject = SubjectRevision("issue", "issue/596", "rev-1", "issues/596", "a" * 64)
+    first_target = store.observe(_producer("obs-r1", subject, "revision", "b" * 64, 1))
+    second_target = store.observe(_producer("obs-r2", subject, "revision", "c" * 64, 2))
+    source = store.observe(_producer(
+        "obs-c", subject, "criterion", "d" * 64, 3,
+        (0, "derives_from", first_target.event_id)))
+    receipts = EvidenceReceiptReader(path=path)
+
+    conn = sqlite3.connect(path)
+    conn.execute("UPDATE event_links SET target_event_id=? WHERE source_event_id=?",
+                 (second_target.event_id, source.event_id))
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(EvidenceError, match="producer identity"):
+        receipts.read(source.event_id)
+
+
 @pytest.mark.parametrize("outcome,digest", [("merge", "1" * 64), ("park", "2" * 64)])
 def test_public_journey_carries_two_findings_to_distinct_settlement_outcomes(
         tmp_path, outcome, digest):

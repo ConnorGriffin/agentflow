@@ -96,6 +96,7 @@ def test_public_respond_prepare_recreates_only_from_the_owned_remote_pr_branch(
         return SimpleNamespace(returncode=0, stdout="")
 
     monkeypatch.setattr("agentflow.stage_worktree._run", git)
+    monkeypatch.setattr("agentflow.stage_worktree.mark_worktree_owned", lambda *_a, **_k: None)
     monkeypatch.setattr("agentflow.runner.ClaudeRunner.provision", lambda self, wt: None)
     adapter = RespondStageAdapter(
         reply_ready=lambda record, obs: False,
@@ -400,6 +401,7 @@ def test_respond_submission_adopts_the_branch_lineage_and_holds_the_claim():
         "base-sha")
     assert sub is not None
     assert sub.stage == "respond" and sub.subject == "7" and sub.target == "cid-9"
+    assert sub.subject_revision == "base-sha"
     assert sub.pool == "claude" and sub.builder_lineage == "claude"   # the change's original lineage
     assert sub.complexity == "deep" and sub.claim is True
     assert sub.source == "/home/w/.agentflow/worktrees/claude/issue-7-fix-thing"  # retained PR-branch wt

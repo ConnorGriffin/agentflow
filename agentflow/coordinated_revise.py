@@ -48,7 +48,8 @@ def _session_lead_prompt(prompt: str, effort: str | None, parent_pool: str) -> s
     """Render the provider-neutral session-lead brief."""
     brief = prompt + routing.session_lead_instructions(
         "revise", effort, parent_provider=parent_pool, codex_spent=codex_spent_at_render(),
-        unavailable_providers=frozenset(pool for pool in POOLS if pool_paused(pool)))
+        unavailable_providers=frozenset(pool for pool in POOLS if pool_paused(pool)),
+        brief=prompt)
     return brief
 
 
@@ -74,6 +75,7 @@ def survivor_conflict_revise_submission(cfg, *, issue: int, slug: str, builder_t
         surfaces=surfaces_phrase(declaration)), None, parent_pool)
     return Submission(
         repo=cfg.repo, subject=str(issue), stage="revise", target=head_sha,
+        subject_revision=head_sha,
         pool=parent_pool, complexity="deep", conflict_round=conflict_round,
         source=WorktreeRef.for_build(cfg.workdir, builder_tool, issue, slug).path,
         claim=True, input_ptr=brief,
@@ -108,6 +110,7 @@ def revise_submission(review_record, complexity, findings="", *, surfaces="", ta
     test surface (ADR 0020). Returns ``None`` if the builder worktree cannot be reconstructed or
     the reviewed SHA is missing."""
     from agentflow.coordinator import Submission
+    from agentflow.review_policy import ReviewState
     facts = _revise_builder_source(review_record)
     reviewed_head = target_sha or review_record.target
     if facts is None or not reviewed_head:
@@ -116,17 +119,51 @@ def revise_submission(review_record, complexity, findings="", *, surfaces="", ta
     brief = _session_lead_prompt(stage_prompt_spec("revise").render(
         n=pr_number, repo=review_record.repo, findings=findings or "- (see review)",
         surfaces=surfaces or "any user-facing surface"), review_record.builder_effort, parent_pool)
+    review = ReviewState.from_record(review_record)
+    if review is not None:
+        review = replace(review, change_author_tool=parent_pool)
     return Submission(
         repo=review_record.repo, subject=review_record.subject, stage="revise",
-        target=reviewed_head, pool=parent_pool, complexity=complexity,
+        target=reviewed_head, subject_revision=reviewed_head,
+        pool=parent_pool, complexity=complexity,
         effort=review_record.builder_effort, source=build_worktree, claim=True, input_ptr=brief,
         builder_lineage=parent_pool,
         branch_lineage=review_record.branch_lineage or review_record.builder_lineage,
         builder_complexity=complexity,
         builder_effort=review_record.builder_effort,
         round=review_record.round, transfer_from=review_record.identity, session_lead=True,
+        review=review,
         capability_root=review_record.capability_root,
         capability_context=review_record.capability_context or "{}")
+
+
+def record_evidence(producer, record, _obs=None):
+    """Reconcile a verified Revise to its complete classified Review finding set."""
+    from agentflow import coordinated_review
+    from agentflow.evidence_pipeline import FixFact
+    from agentflow.review_policy import ReviewState
+
+    state = ReviewState.from_record(record)
+    parsed = source_facts(record)
+    if state is None or parsed is None or not record.target:
+        return None
+    _workdir, branch, _worktree = parsed
+    pr = github.open_pr_for_branch(record.repo, branch)
+    if pr is None or not pr.head_ref_oid or pr.head_ref_oid == record.target:
+        return None
+    review_id = coordinated_review._evidence_identity(record)
+    source = producer.review_source(
+        review_id, record.target, locator=f"pulls/{pr.number}",
+        observed_at=max(0, record.started_at))
+    findings = coordinated_review.record_evidence(producer, record, source=source)
+    finding_ids = tuple(item.finding_id for item in findings)
+    if not finding_ids:
+        return None
+    return producer.fix(FixFact(
+        review_id, record.target, pr.head_ref_oid, finding_ids, source,
+        coordinated_review._evidence_digest(
+            "review-revise-v1", review_id, record.target, pr.head_ref_oid),
+        "model_judged", max(0, record.started_at) + 1))
 
 
 def conflict_decision_revise_submission(review_record, verdict, *, parent_pool: str = "claude"):
@@ -157,7 +194,7 @@ def conflict_decision_revise_submission(review_record, verdict, *, parent_pool: 
         change_author_tool=parent_pool, handoff=decision)
     return Submission(
         repo=review_record.repo, subject=review_record.subject, stage="revise",
-        target=review_record.target, pool=parent_pool,
+        target=review_record.target, subject_revision=review_record.target or "", pool=parent_pool,
         complexity=review_record.builder_complexity or "deep",
         effort=review_record.builder_effort, source=build_worktree,
         claim=True, input_ptr=prompt, builder_lineage=parent_pool,
@@ -279,7 +316,8 @@ def _retire_dead_revises(coord) -> None:
     from agentflow.coordinator import tracer
     from agentflow.coordinator.record import RUNNING
     for record in tracer.load_records():
-        if record.stage != "revise" or record.retired or not record.claim:
+        if (not coord._manages_repository(record.repo)
+                or record.stage != "revise" or record.retired or not record.claim):
             continue
         parsed = source_facts(record)
         if parsed is None:

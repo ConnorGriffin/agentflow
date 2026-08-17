@@ -30,7 +30,10 @@ def _issue(complexity="standard", effort="high"):
     }
 
 
-def test_build_submission_launches_a_low_effort_fable_session_lead(make_coord, tmp_path):
+def test_build_submission_launches_a_low_effort_fable_session_lead(
+        make_coord, tmp_path, monkeypatch):
+    revision = "1" * 40
+    monkeypatch.setattr(coordinated_build, "capture_subject_revision", lambda _root: revision)
     cfg = SimpleNamespace(repo="o/r", workdir=str(tmp_path))
     submission = coordinated_build.build_submission(cfg, _issue())
     coord = make_coord()
@@ -41,6 +44,7 @@ def test_build_submission_launches_a_low_effort_fable_session_lead(make_coord, t
     prompt = command[command.index("-p") + 1]
 
     assert record.pool == "claude" and record.model == "fable"
+    assert record.subject_revision == revision
     assert command[command.index("--model") + 1] == "fable"
     assert command[command.index("--effort") + 1] == "low"
     assert "Session lead" in prompt
@@ -57,6 +61,23 @@ def test_build_submission_launches_a_low_effort_fable_session_lead(make_coord, t
         in prompt
     assert "- prototyping/UI mockups: Sol → Opus; never Luna" in prompt
     assert "- code review: routine Luna → Sonnet → Opus; load-bearing Opus; never Haiku" in prompt
+
+
+def test_build_submission_activates_slicing_from_its_durable_issue_brief(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        coordinated_build, "capture_subject_revision", lambda _root: "1" * 40)
+    issue = _issue(complexity="deep")
+    issue["body"] = """## Work order
+separability: slice-bearing
+### Domain facts
+- literal
+"""
+    cfg = SimpleNamespace(repo="o/r", workdir=str(tmp_path))
+
+    submission = coordinated_build.build_submission(cfg, issue)
+
+    assert submission is not None
+    assert "first in-session worker" in submission.input_ptr
 
 
 def test_the_lead_brief_follows_the_shipped_table_rather_than_prose(tmp_path):
@@ -104,6 +125,7 @@ def test_review_tier_uses_builder_complexity_and_pool_specific_models():
     build = Record(
         identity="o/r|7|build|-", stage="build", pool="claude", demand=5,
         repo="o/r", subject="7", complexity="standard",
+        builder_lineage="claude",
         source="/home/w/.agentflow/worktrees/claude/issue-7-fix-thing",
     )
     standard = coordinated_review.review_submission(build, "sha-1", "codex", 42)
@@ -141,6 +163,25 @@ def test_revise_and_re_review_keep_the_parent_and_original_tier(make_coord):
     assert re_review is not None and re_review.complexity == "standard"
     re_review_record = coord.submit_stage(replace(re_review, transfer_from=None))
     assert coord.stage_record(re_review_record).model == "luna"
+
+
+def test_revise_submission_activates_slicing_when_its_brief_carries_the_work_order():
+    review = Record(
+        identity="o/r|7|review|sha-1", stage="review", pool="codex", demand=1,
+        repo="o/r", subject="7", target="sha-1", builder_lineage="claude",
+        builder_complexity="deep", builder_effort="high",
+        source="/home/w/.agentflow/worktrees/codex-review/pr-42-fix-thing",
+    )
+    findings = """## Work order
+separability: slice-bearing
+### Domain facts
+- literal
+"""
+
+    submission = coordinated_revise.revise_submission(review, "deep", findings)
+
+    assert submission is not None
+    assert "first in-session worker" in submission.input_ptr
 
 
 def test_rate_card_estimates_from_the_price_snapshot_and_resolves_both_name_forms():
@@ -367,6 +408,106 @@ def test_the_lead_brief_tells_the_lead_to_fall_back_to_claude_on_a_codex_provide
     assert "unavailable for the rest of this session" in brief
     assert "record the substitution in the final handoff" in brief
     assert "is never a finding to re-delegate" in brief
+
+
+def test_a_resolvable_single_default_continues_privately_with_its_grounding():
+    brief = routing.session_lead_instructions("review", None)
+
+    assert "exactly one materially compatible outcome remains" in brief
+    assert "re-read that exact place at decision time" in brief
+    assert "confirm the resolved text supports the outcome" in brief
+    assert "continue the current stage" in brief
+    assert "no public park comment or maintainer notification" in brief
+    assert "Outcome:" in brief
+    assert "Citation:" in brief
+    assert "Resolved text:" in brief
+
+
+def test_an_unresolvable_default_citation_parks():
+    brief = routing.session_lead_instructions("review", None)
+
+    assert "If the citation cannot be resolved or read, park" in brief
+    assert "do not infer or reconstruct its contents" in brief
+
+
+def test_a_citation_whose_text_does_not_support_the_outcome_parks():
+    brief = routing.session_lead_instructions("review", None)
+
+    assert "If the resolved text does not support the claimed outcome, park" in brief
+    assert "self-asserted grounding is not evidence" in brief
+
+
+def test_two_materially_compatible_grounded_outcomes_still_park():
+    brief = routing.session_lead_instructions("review", None)
+
+    assert "more than one materially compatible outcome remains" in brief
+    assert "park even when every outcome has valid grounding" in brief
+
+
+def test_a_load_bearing_policy_choice_parks_even_with_a_perfect_citation():
+    brief = routing.session_lead_instructions("review", None)
+
+    assert "product intent, safety, security, permissions, or another load-bearing policy" in brief
+    assert "park even with a perfect citation" in brief
+
+
+def test_genuinely_unresolved_maintainer_intent_keeps_the_existing_park():
+    brief = routing.session_lead_instructions("review", None)
+
+    assert "genuinely unresolved maintainer intent" in brief
+    assert "existing two-option public decision handoff" in brief
+
+
+@pytest.mark.parametrize("task_brief", [
+    "Implement the scoped issue through the existing interface.",
+    "## Work order\nseparability: declined\n### Why indivisible\n- one atomic invariant",
+], ids=["no-work-order", "declined-work-order"])
+def test_a_brief_without_a_slice_bearing_work_order_keeps_the_existing_lead_contract_byte_identical(
+        task_brief):
+    ordinary = routing.session_lead_instructions("build", "medium")
+
+    rendered = routing.session_lead_instructions(
+        "build", "medium", brief=task_brief)
+
+    assert rendered == ordinary
+    assert "Slicer" not in rendered
+    assert ("Fable is lead-only and is never a delegate target.\n\n"
+            "Before parking for a decision") in rendered
+    assert ("Resolved text: <the text re-read from that place>\n\n"
+            "worker reasoning rung:") in rendered
+
+
+def test_a_slice_bearing_work_order_makes_the_lead_slice_first_and_commit_each_slice():
+    work_order = """## Work order
+separability: slice-bearing
+### Domain facts
+- the durable fact is literal
+### Fixtures
+- fixture_one
+### Named invariant tests
+- test_invariant
+"""
+
+    brief = routing.session_lead_instructions("build", "medium", brief=work_order)
+
+    assert "first in-session worker" in brief
+    assert "Slicer" in brief
+    assert "file-level slice list" in brief
+    assert "repository as it stands at pickup" in brief
+    assert "ordinary benchmarked capability ladder" in brief
+    assert "commit once per finished slice" in brief
+    assert "verify each slice" in brief
+
+
+def test_slice_workers_are_sealed_for_deciding_and_open_for_reading():
+    work_order = "## Work order\nseparability: slice-bearing\n"
+
+    brief = routing.session_lead_instructions("build", "medium", brief=work_order)
+
+    assert "no unnamed domain fact or scope choice" in brief
+    assert "read the repository freely" in brief
+    assert "match house style" in brief
+    assert "allow-list is a grounding floor, not a reading ceiling" in brief
 
 
 def test_the_lead_brief_stops_and_surfaces_a_provider_failure_with_no_opposite_rung():

@@ -599,20 +599,24 @@ def test_build_issue_submits_a_ready_issue_to_the_coordinator(monkeypatch):
     monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [])
     monkeypatch.setattr(coordinated_build, "resume_if_held", lambda sub, records: sub)
     submitted = []
+    logs = []
     waiting = Record(identity="o/r|5|build|-", stage="build", pool="claude", demand=5,
                      state=WAITING)
     coordinator = SimpleNamespace(
         submit_stage=lambda sub: submitted.append(sub) or "o/r|5|build|-",
         stage_record=lambda identity: waiting)
-    monkeypatch.setattr(pipeline, "build_coordinator", lambda: coordinator)
+    coordinator_kwargs = {}
+    monkeypatch.setattr(pipeline, "build_coordinator",
+                        lambda **kwargs: coordinator_kwargs.update(kwargs) or coordinator)
     reconciled = []
     monkeypatch.setattr(pipeline, "reconcile_and_project", reconciled.append)
 
-    out = build_issue(RepoConfig("o/r", "/tmp"), 5)
+    out = build_issue(RepoConfig("o/r", "/tmp"), 5, _log=logs.append)
 
     assert out == "#5: submitted to coordinator → claude (build)"
     assert submitted == [submission]
     assert reconciled == [coordinator]
+    assert coordinator_kwargs["_log"] is not None
     assert picked == [{"operator": True, "floodgates": False, "stage": "build",
                        "complexity": "standard", "effort": "medium"}]
 
@@ -649,7 +653,7 @@ def test_build_issue_resumes_an_exhausted_held_build_on_the_original_worktree(mo
     coordinator = SimpleNamespace(
         submit_stage=lambda sub: submitted.append(sub) or "o/r|5|build|-|s1",
         stage_record=lambda identity: resumed_rec)
-    monkeypatch.setattr(pipeline, "build_coordinator", lambda: coordinator)
+    monkeypatch.setattr(pipeline, "build_coordinator", lambda **_kwargs: coordinator)
     monkeypatch.setattr(pipeline, "reconcile_and_project", lambda c: None)
 
     out = build_issue(RepoConfig("o/r", "/tmp"), 5)
@@ -690,7 +694,7 @@ def test_build_issue_withdraws_the_submission_when_the_claim_race_is_lost(monkey
         submit_stage=lambda sub: "o/r|5|build|-",
         stage_record=lambda identity: waiting,
         withdraw_stage=lambda identity: withdrawn.append(identity) or True)
-    monkeypatch.setattr(pipeline, "build_coordinator", lambda: coordinator)
+    monkeypatch.setattr(pipeline, "build_coordinator", lambda **_kwargs: coordinator)
     monkeypatch.setattr(pipeline, "reconcile_and_project",
                         lambda c: pytest.fail("must not project a withdrawn submission"))
 
@@ -728,7 +732,7 @@ def test_build_issue_acknowledges_a_resume_already_running(monkeypatch):
     coordinator = SimpleNamespace(
         submit_stage=lambda sub: "o/r|5|build|-",
         stage_record=lambda identity: held)
-    monkeypatch.setattr(pipeline, "build_coordinator", lambda: coordinator)
+    monkeypatch.setattr(pipeline, "build_coordinator", lambda **_kwargs: coordinator)
 
     out = build_issue(RepoConfig("o/r", "/tmp"), 5)
 
@@ -1068,6 +1072,7 @@ def _stub_survivor_router(monkeypatch, *, rebase, profile="reviewed", conflict_r
     events = {"parked": [], "merged": []}
     monkeypatch.setattr(github, "pr_comment_rows", lambda _repo, _pr: [])
     monkeypatch.setattr(loop, "_conflict_revise_owns_head", lambda cfg, n, branch: False)
+    monkeypatch.setattr(loop, "_survivor_head_author", lambda cfg, n, branch: "claude")
     monkeypatch.setattr(loop, "_rebase_branch", lambda cfg, branch, wt: rebase)
     monkeypatch.setattr(loop, "_conflict_revise_survivor",
                         lambda cfg, pr, n, sl, tool, branch, rows: conflict_revise)
@@ -1075,7 +1080,8 @@ def _stub_survivor_router(monkeypatch, *, rebase, profile="reviewed", conflict_r
                         lambda cfg, pr, n: events["parked"].append(pr))
     monkeypatch.setattr(
         loop, "_merge_autonomous_survivor",
-        lambda cfg, pr, n, sl, tool, branch, rows: events["merged"].append(pr) or "merged")
+        lambda cfg, pr, n, sl, tool, branch, rows, *args, **kwargs:
+        events["merged"].append(pr) or "merged")
     return events
 
 
@@ -1144,17 +1150,61 @@ def test_autonomous_survivor_review_is_a_cold_coordinator_submission(monkeypatch
                         lambda *args, **kwargs: submission)
     submitted = []
     coord = SimpleNamespace(submit_stage=submitted.append)
-    monkeypatch.setattr(pipeline, "build_coordinator", lambda: coord)
+    monkeypatch.setattr(pipeline, "build_coordinator", lambda **_kwargs: coord)
     reconciled = []
     monkeypatch.setattr(pipeline, "reconcile_and_project",
                         lambda current: reconciled.append(current))
 
     result = loop._merge_autonomous_survivor(
         RepoConfig("o/r", "/tmp"), 42, 7, "fix", "claude",
-        "agentflow/claude/issue-7-fix", [])
+        "agentflow/claude/issue-7-fix", [], head_author_tool="claude")
 
     assert result == "review submitted"
     assert submitted == [submission] and reconciled == [coord]
+
+
+def test_autonomous_survivor_selects_against_the_recorded_head_author(monkeypatch):
+    """A lane is branch history; the re-review must oppose the current head's author."""
+    monkeypatch.setattr(loop, "_run", lambda argv: _FakeRun("head-a\n"))
+    monkeypatch.setattr(loop, "_issue_acceptance", lambda cfg, number: "Issue acceptance")
+    monkeypatch.setattr(loop, "claim", lambda repo, number, _label: True)
+    choices, captured = [], {}
+    monkeypatch.setattr(
+        loop, "pick_reviewer",
+        lambda tool, **kwargs: choices.append((tool, kwargs)) or "claude")
+    monkeypatch.setattr(
+        coordinated_review, "survivor_review_submission",
+        lambda _cfg, **kwargs: captured.update(kwargs) or SimpleNamespace(
+            stage="review", transfer_from=None))
+    coord = SimpleNamespace(submit_stage=lambda _submission: None)
+    monkeypatch.setattr(pipeline, "build_coordinator", lambda **_kwargs: coord)
+    monkeypatch.setattr(pipeline, "reconcile_and_project", lambda _coord: None)
+
+    result = loop._merge_autonomous_survivor(
+        RepoConfig("o/r", "/tmp"), 42, 7, "fix", "claude",
+        "agentflow/claude/issue-7-fix", [], head_author_tool="codex")
+
+    assert result == "review submitted"
+    assert choices == [("codex", {"allow_same_tool": False})]
+    assert captured["builder_tool"] == "claude"
+    assert captured["review"].change_author_tool == "codex"
+
+
+def test_rebased_survivor_threads_its_recorded_author_to_re_review(monkeypatch):
+    monkeypatch.setattr(loop, "_survivor_head_author", lambda *_args: "claude")
+    monkeypatch.setattr(loop, "_conflict_revise_owns_head", lambda *_args: False)
+    monkeypatch.setattr(loop, "_rebase_branch", lambda *_args: RebaseResult.CLEAN)
+    monkeypatch.setattr(loop, "remove_worktree_if_safe", lambda *_args: True)
+    captured = []
+    monkeypatch.setattr(
+        loop, "_merge_autonomous_survivor",
+        lambda *_args, head_author_tool=None: captured.append(head_author_tool) or "review submitted")
+
+    result = _rebase_survivor(
+        RepoConfig("o/r", "/tmp"), 42, "agentflow/codex/issue-7-fix", "autonomous", [])
+
+    assert result == "#42: review submitted"
+    assert captured == ["claude"]
 
 
 def test_autonomous_survivor_waits_instead_of_falling_back_to_same_tool(monkeypatch):
@@ -1176,11 +1226,12 @@ def test_autonomous_survivor_waits_instead_of_falling_back_to_same_tool(monkeypa
 
     monkeypatch.setattr(coordinated_review, "survivor_review_submission", fake_submission)
     monkeypatch.setattr(pipeline, "build_coordinator",
-                        lambda: SimpleNamespace(submit_stage=lambda s: None))
+                        lambda **_kwargs: SimpleNamespace(submit_stage=lambda s: None))
     monkeypatch.setattr(pipeline, "reconcile_and_project", lambda current: None)
 
     result = loop._merge_autonomous_survivor(
-        RepoConfig("o/r", "/tmp"), 42, 7, "fix", "claude", "agentflow/claude/issue-7-fix", [])
+        RepoConfig("o/r", "/tmp"), 42, 7, "fix", "claude", "agentflow/claude/issue-7-fix", [],
+        head_author_tool="claude")
 
     assert result == "no reviewer pool available — deferring"
     assert captured == {}
@@ -1189,6 +1240,7 @@ def test_autonomous_survivor_waits_instead_of_falling_back_to_same_tool(monkeypa
 
 def test_manual_same_tool_review_requires_warning_then_explicit_confirmation(monkeypatch):
     from agentflow import coordinated_build
+    from agentflow.coordinator.record import Record
     from agentflow.review_policy import ReviewAssignment
 
     warning = loop.review_pr(
@@ -1205,7 +1257,10 @@ def test_manual_same_tool_review_requires_warning_then_explicit_confirmation(mon
     monkeypatch.setattr(
         coordinated_review, "_review_assignment_facts",
         lambda *args, **kwargs: (ReviewAssignment(reason="one journey"), ("agentflow/x.py",)))
-    monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [])
+    monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [
+        Record(identity="known-head", stage="review", pool="codex", demand=1,
+               repo="o/r", subject="7", target="head", change_author_tool="claude",
+               review_sequence=0, review_passes=0, created_at=1)])
     monkeypatch.setattr(loop, "claim", lambda repo, issue, _label: True)
     captured = {}
     submission = SimpleNamespace(stage="review")
@@ -1215,7 +1270,7 @@ def test_manual_same_tool_review_requires_warning_then_explicit_confirmation(mon
     submitted = []
     monkeypatch.setattr(
         pipeline, "build_coordinator",
-        lambda: SimpleNamespace(submit_stage=submitted.append))
+        lambda **_kwargs: SimpleNamespace(submit_stage=submitted.append))
     monkeypatch.setattr(pipeline, "reconcile_and_project", lambda coord: [])
 
     result = loop.review_pr(
@@ -1259,7 +1314,7 @@ def test_manual_review_uses_latest_exact_head_author_not_branch_builder(monkeypa
         lambda *args, **kwargs: captured.append(kwargs) or SimpleNamespace(stage="review"))
     monkeypatch.setattr(
         pipeline, "build_coordinator",
-        lambda: SimpleNamespace(submit_stage=lambda _submission: None))
+        lambda **_kwargs: SimpleNamespace(submit_stage=lambda _submission: None))
     monkeypatch.setattr(pipeline, "reconcile_and_project", lambda _coord: None)
 
     assert loop.review_pr(RepoConfig("o/r", "/work"), 42) == "review submitted"
@@ -1294,7 +1349,8 @@ def test_survivor_review_defers_when_no_reviewer_pool_can_launch_it(monkeypatch)
     monkeypatch.setattr(loop, "claim", lambda repo, number, _label: claimed.append(number) or True)
 
     result = loop._merge_autonomous_survivor(
-        RepoConfig("o/r", "/tmp"), 42, 7, "fix", "claude", "agentflow/claude/issue-7-fix", [])
+        RepoConfig("o/r", "/tmp"), 42, 7, "fix", "claude", "agentflow/claude/issue-7-fix", [],
+        head_author_tool="claude")
 
     assert result == "no reviewer pool available — deferring"
     assert submitted == [] and claimed == []
@@ -1325,7 +1381,7 @@ def _stub_conflict_env(monkeypatch, *, priors, head="sha-conf", claim=True):
                         lambda **_kwargs: (SimpleNamespace(tool="claude"), None, ""))
     submitted = []
     monkeypatch.setattr(pipeline, "build_coordinator",
-                        lambda: SimpleNamespace(submit_stage=submitted.append))
+                        lambda **_kwargs: SimpleNamespace(submit_stage=submitted.append))
     reconciled = []
     monkeypatch.setattr(pipeline, "reconcile_and_project",
                         lambda coord: reconciled.append(coord))
@@ -1440,12 +1496,13 @@ def test_an_autonomous_re_review_takes_the_pr_back_from_the_maintainer(monkeypat
     monkeypatch.setattr(coordinated_review, "survivor_review_submission",
                         lambda *args, **kwargs: SimpleNamespace(stage="review", transfer_from=None))
     monkeypatch.setattr(pipeline, "build_coordinator",
-                        lambda: SimpleNamespace(submit_stage=lambda s: None))
+                        lambda **_kwargs: SimpleNamespace(submit_stage=lambda s: None))
     monkeypatch.setattr(pipeline, "reconcile_and_project", lambda current: None)
     rows = _clean_summary_pr(monkeypatch)
 
     result = loop._merge_autonomous_survivor(
-        RepoConfig("o/r", "/tmp"), 42, 7, "fix", "claude", "agentflow/claude/issue-7-fix", rows)
+        RepoConfig("o/r", "/tmp"), 42, 7, "fix", "claude", "agentflow/claude/issue-7-fix", rows,
+        head_author_tool="claude")
 
     assert result == "review submitted"
     assert "agentflow-superseded-review-summary" in rows[0]["body"]
@@ -1574,6 +1631,7 @@ def _survivor_world(monkeypatch, *, head="sha-conf", records=(), profile="review
     monkeypatch.setattr(loop, "_open_agentflow_prs", lambda cfg: [(8, _SURVIVOR_BRANCH)])
     monkeypatch.setattr(loop, "repo_profile", lambda wd: profile)
     monkeypatch.setattr(loop, "_base_advanced_for", lambda wd, branch: True)
+    monkeypatch.setattr(loop, "_survivor_head_author", lambda cfg, n, branch: "claude")
     monkeypatch.setattr(loop, "_run", run)
     monkeypatch.setattr(loop, "_rebase_branch", rebase_branch)
     monkeypatch.setattr(loop, "remove_worktree_if_safe", lambda workdir, wt: True)
@@ -1582,7 +1640,7 @@ def _survivor_world(monkeypatch, *, head="sha-conf", records=(), profile="review
     monkeypatch.setattr(loop, "pick_reviewer", lambda tool, **kwargs: "codex")
     monkeypatch.setattr(pipeline.tracer, "load_records", load_records)
     monkeypatch.setattr(pipeline, "build_coordinator",
-                        lambda: SimpleNamespace(submit_stage=world["submitted"].append))
+                        lambda **_kwargs: SimpleNamespace(submit_stage=world["submitted"].append))
     monkeypatch.setattr(pipeline, "reconcile_and_project", lambda coord: None)
     monkeypatch.setattr(coordinated_revise, "survivor_conflict_revise_submission",
                         lambda cfg, **kwargs: SimpleNamespace(stage="revise", **kwargs))

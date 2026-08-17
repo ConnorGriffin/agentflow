@@ -36,7 +36,7 @@ from agentflow.prompts import stage_prompt_spec
 from agentflow.repo_facts import surface_declaration
 from agentflow.runner import _run
 from agentflow.shell_crib import SHELL_CRIB
-from agentflow.worktree_ref import WorktreeKind, WorktreeRef
+from agentflow.worktree_ref import WorktreeKind, WorktreeRef, capture_subject_revision
 
 # The findings comment marker (per-ticket, stable across attempts and restarts) and the visible
 # disclaimer that fronts it, so a replay recognizes its own prior comment and never posts a second.
@@ -318,6 +318,7 @@ def research_submission(cfg, ticket: dict, tool: str, *, map_context: str = ""):
         map_context=block,
         findings_path=os.path.join(source, ".agentflow", f"research-findings-{n}.md")))
     return Submission(repo=cfg.repo, subject=str(n), stage="research", pool=tool, complexity="deep",
+                      subject_revision=capture_subject_revision(cfg.workdir),
                       source=source, claim=True, input_ptr=prompt, capability_root=cfg.workdir,
                       capability_context={"ui": bool(surface_declaration(cfg.workdir).surfaces)})
 
@@ -359,10 +360,13 @@ def _research_worktree_ready(record):
     if fetch.returncode != 0:
         return unprepared("fetch-failed",
                           f"`git -C {workdir} fetch origin` exited {fetch.returncode}")
-    added = _run(["git", "-C", workdir, "worktree", "add", "--detach", str(wt), "origin/main"])
+    added = _run(["git", "-C", workdir, "worktree", "add", "--detach", str(wt),
+                  record.subject_revision])
     if added.returncode != 0:
         return unprepared("worktree-add-failed",
                           f"`git worktree add --detach` at {wt} exited {added.returncode}")
+    from agentflow.worktree_ownership import mark_worktree_owned
+    mark_worktree_owned(wt, disposable=False)
     return PREPARED
 
 

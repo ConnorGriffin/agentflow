@@ -463,6 +463,36 @@ DIALS (only for "ready"):
   but landed ~80-150 lines). The dial now also sets builder reasoning depth (ADR 0046) — over-
   rating burns real capacity, so don't round up "to be safe".
 
+WORK ORDER (only for a "ready" brief whose complexity is "deep"):
+- Judge whether the grounded work is separable into independently verifiable outcomes that can
+  each leave the repository green. A large change is not automatically separable.
+- For separable work, append this durable half exactly:
+  `## Work order`
+  `separability: slice-bearing`
+  `### Domain facts` — the scope-defining facts as literals, with no inference left to a worker.
+  `### Fixtures` — the named fixtures and literal inputs that ground the work.
+  `### Named invariant tests` — the exact tests whose invariants every relevant slice preserves.
+- For indivisible work, still append a record instead of silently omitting the judgment:
+  `## Work order`
+  `separability: declined`
+  `### Why indivisible` — name the single invariant or coupled outcome that makes partial green
+  commits misleading or unsafe.
+- Do not add a Work order to a standard brief. Do not name file-level slices or freeze a file
+  allow-list here: the Session lead's first in-session Slicer reads the pickup checkout and cuts
+  those fresh.
+
+WORKED SEPARABILITY EXAMPLES (merged AgentFlow issues; follow the judgment, not their size):
+- Sliceable — [#516](https://github.com/ConnorGriffin/agentflow/issues/516) separately required
+  an unknown-spend marker, worker-usage capture, visibly estimated rate-card pricing, and
+  historical pricing. Each outcome had its own observable proof and could leave the repository
+  green, so Intake should record `separability: slice-bearing` plus their shared literals,
+  fixtures, and named invariant tests.
+- Not sliceable — [#627](https://github.com/ConnorGriffin/agentflow/issues/627) required policy,
+  capability, RouteCell safety, permit reservation, receipt persistence, and WAITING-to-RUNNING
+  to commit in one Store-owned transaction. Its outcome was the atomic invariant itself; landing
+  those responsibilities as independently "finished" slices would create unsafe intermediate
+  states, so Intake should record `separability: declined` and name that invariant.
+
 Your final response IS the decision as a structured object — the harness enforces its
 schema natively, so you do not hand-write or fence the JSON; just produce these fields:
 - "route": "ready" | "grill" | "mockup"

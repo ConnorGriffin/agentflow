@@ -275,7 +275,11 @@ def test_interrupted_build_continues_in_a_fresh_session_keeping_ownership(make_c
     fake = FakeSession()
     pr, prep = [False], [True]
     coord = make_coord(fake, adapter=_adapter(fake, pr=pr, prep=prep))
-    ident = coord.submit_stage(_build())
+    revision = "a" * 40
+    ident = coord.submit_stage(replace(_build(), subject_revision=revision))
+    initial = record_of(coord, ident)
+    route = (initial.route_id, initial.route_cell_digest, initial.launch_config_digest)
+    assert all(route)
     coord.cycle("claude")
     fake.end(ident, cause=ProviderCause.PROCESS)  # interrupted after local changes
 
@@ -286,6 +290,8 @@ def test_interrupted_build_continues_in_a_fresh_session_keeping_ownership(make_c
     assert rec.lineage == "claude"                 # pinned tool lineage held
     assert rec.claim is True                        # claim retained across the interruption
     assert rec.state == "running"
+    assert rec.subject_revision == revision          # continuation retains exact launch authority
+    assert (rec.route_id, rec.route_cell_digest, rec.launch_config_digest) == route
 
     pr[0] = True
     fake.end(ident, cause=ProviderCause.PROCESS)
@@ -512,18 +518,27 @@ def test_a_maintainer_resume_opens_a_fresh_bounded_build_on_the_retained_worktre
     fake = FakeSession()
     adapter = _adapter(fake, pr=[False], prep=[True], handoff=lambda record: "issue-proof")
     coord = make_coord(fake, adapter=adapter)
-    ident = coord.submit_stage(_build())
+    original_revision = "d" * 40
+    resumed_revision = "e" * 40
+    ident = coord.submit_stage(replace(_build(), subject_revision=original_revision))
     starts_until_held(coord, fake, ident, "claude")
-    assert record_of(coord, ident).state == "held"
+    held = record_of(coord, ident)
+    assert held.state == "held"
+    route = (held.route_id, held.route_cell_digest, held.launch_config_digest)
+    assert all(route)
 
     # The deliberate maintainer resume opens the next resume dimension — a genuinely new identity.
-    resume_ident = coord.submit_stage(replace(_build(), resume=1))
+    resume_ident = coord.submit_stage(replace(
+        _build(), resume=1, subject_revision=resumed_revision))
     assert resume_ident != ident and resume_ident.endswith("|s1")
     resumed = record_of(coord, resume_ident)
     assert resumed.state == "waiting"              # eligible to run, unlike the held record
     assert resumed.attempts == 0                   # a fresh bounded attempt budget
     assert resumed.source == "/wt/issue-7"         # same retained worktree recovered, not re-created
     assert resumed.lineage == "claude"             # builder lineage preserved
+    assert resumed.subject_revision == resumed_revision
+    assert (resumed.route_id, resumed.route_cell_digest,
+            resumed.launch_config_digest) == route
 
     coord.cycle("claude")                          # admits and launches a provider session
     started = record_of(coord, resume_ident)
@@ -594,19 +609,34 @@ def _gate_blocking(*pools):
 _SRC = "/work/o-r/.agentflow/worktrees/codex/issue-7-fix"
 
 
-def test_a_never_started_build_migrates_off_a_throttled_pool_instead_of_deadlocking(make_coord):
+def test_a_never_started_build_migrates_off_a_throttled_pool_instead_of_deadlocking(
+        make_coord, monkeypatch):
     """A waiting, zero-attempt build pinned to codex whose codex launch gate is blocked (weekly
     pacing) while claude has headroom migrates to claude within a single cycle and starts, rather
     than freezing forever behind its own live claim. Reproduces a guarded-project
     incident: before
     the fix the build could neither launch on codex nor fall back to claude, and its live claim
     shielded the building label from reclaim."""
+    from agentflow.coordinator.store import Store
+
+    identities = []
+    original = Store.route_selection_identity
+
+    def public_identity(store, selection):
+        identities.append((selection.provider, selection.model))
+        return original(store, selection)
+
+    monkeypatch.setattr(Store, "route_selection_identity", public_identity)
     fake = FakeSession()
     coord = make_coord(fake, gate=_gate_blocking("codex"),
                        adapter=_adapter(fake, pr=[False], prep=[True]))
-    ident = coord.submit_stage(_build("7", pool="codex", source=_SRC))
+    revision = "b" * 40
+    ident = coord.submit_stage(replace(
+        _build("7", pool="codex", source=_SRC), subject_revision=revision))
     coord.cycle("codex", now=0)                        # codex cannot launch it; ledger untouched
     frozen = record_of(coord, ident)
+    frozen_route = (
+        frozen.route_id, frozen.route_cell_digest, frozen.launch_config_digest)
     assert frozen.state == "waiting" and frozen.attempts == 0
     assert frozen.claim is True                        # the live claim that shields the label
     assert permits(coord, "codex") == 0
@@ -618,6 +648,10 @@ def test_a_never_started_build_migrates_off_a_throttled_pool_instead_of_deadlock
     assert moved.source == "/work/o-r/.agentflow/worktrees/claude/issue-7-fix"
     assert worktree_ref.source_facts(moved) is not None  # the real parser accepts the move
     assert permits(coord, "claude") == moved.demand
+    assert moved.subject_revision == revision
+    assert (moved.route_id, moved.route_cell_digest, moved.launch_config_digest) != frozen_route
+    assert all((moved.route_id, moved.route_cell_digest, moved.launch_config_digest))
+    assert identities == [("codex", "sol"), ("claude", "fable")]
 
 
 def test_durable_legacy_sol_build_migrates_but_marked_sol_parent_stays_pinned(make_coord):
@@ -687,9 +721,13 @@ def test_a_never_started_build_stays_home_when_both_pools_are_throttled(make_coo
     fake = FakeSession()
     coord = make_coord(fake, gate=_gate_blocking("codex", "claude"),
                        adapter=_adapter(fake, pr=[False], prep=[True]))
-    ident = coord.submit_stage(_build("7", pool="codex", source=_SRC))
+    revision = "c" * 40
+    ident = coord.submit_stage(replace(
+        _build("7", pool="codex", source=_SRC), subject_revision=revision))
     coord.cycle("codex", now=0)
-    home_demand = record_of(coord, ident).demand
+    home = record_of(coord, ident)
+    home_demand = home.demand
+    home_route = (home.route_id, home.route_cell_digest, home.launch_config_digest)
     for _ in range(3):                                 # several cycles, both pools blocked
         coord.cycle("codex", now=0)
         coord.cycle("claude", now=0)
@@ -697,6 +735,9 @@ def test_a_never_started_build_stays_home_when_both_pools_are_throttled(make_coo
     assert parked.pool == "codex" and parked.state == "waiting" and parked.attempts == 0
     assert parked.lineage == "codex" and parked.source == _SRC   # migration fields reverted
     assert parked.demand == home_demand                          # no half-move
+    assert parked.subject_revision == revision
+    assert (parked.route_id, parked.route_cell_digest,
+            parked.launch_config_digest) == home_route
     assert permits(coord, "claude") == 0
 
     coord._gate = _gate_blocking("claude")             # codex regains its weekly budget

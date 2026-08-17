@@ -21,10 +21,19 @@ ADRs in that format.
 
 ## Index
 
-- [ADR 653](adr-653-germanium-naming-stack.md) — The native operator product is Germanium and
-  its headless engine is Germanium Core. The Python distribution and import use
-  `germanium-core` and `germanium_core`, while the installed executable remains `germanium`;
-  migration and compatibility are planned separately rather than performed as a global rename.
+- [ADR 649](adr-649-owned-disposable-maintenance.md) — Temporary provider probes, explicit
+  per-worktree Git metadata, dry-run-first JSONL maintenance, and same-run-coupled graph pruning.
+- [ADR 594](adr-594-builds-keep-origin-main-base.md) — Builds retain one hard-coded
+  `origin/main` base; a native same-repository blocker edge orders lock-then-build work until its
+  mockup contract merges.
+- [ADR 694](adr-694-activate-promoted-review-methods.md) — Consecutive fleet-policy versions and
+  query-only successor activation carry approved Review methods into production briefings.
+- [ADR 635](adr-635-immutable-canary-reports.md) — One immutable, content-free report per
+  canary stage/version is derived from Store-owned attribution and decoded attempt telemetry;
+  retries return the committed final row rather than reinterpreting later telemetry.
+- [ADR 627](adr-627-composed-operational-admission.md) — One Store-owned production admission
+  transaction binds policy, capability, RouteCell, Safety, canary attribution, receipt, permit,
+  and historically recoverable launch authority.
 - [ADR 646](adr-646-immutable-route-selection.md) — Routing materializes one closed immutable
   launch artifact; OperationalSafety registers and decodes it for shared argv and supervision
   consumption without giving ordinary admission routing authority.
@@ -296,6 +305,12 @@ Issue-keyed records:
   but its tier follows the builder's complexity dial — cheap for standard, frontier for deep —
   and independence is measured against the session lead's tool rather than whichever worker
   wrote the diff. Weakens 0003; supersedes 0018's always-deep reviewer.
+- [ADR 511](adr-511-slicing-survives-under-the-session-lead.md)
+  — Slicing survives under ADR 498's session lead: a lead that decomposes work runs slices as
+  in-session subagents on one pull request, with ADR 465's non-self-scoping work order and ADR
+  468's commit-per-slice ledger retained. It supersedes ADR 466's separately-gated route and fixed
+  cheap/frontier pair, retires the switch-based revert condition, and records #469's **TUNE**
+  verdict; implementation of in-session slicing remains open work.
 - [ADR 540](adr-540-bounded-review-follow-up-proposals.md) — A review carries one bounded
   follow-up proposal instead of creating a GitHub issue; historical URLs remain references, and
   public parks use a 2,000-character operator envelope. Amends ADR 0047.

@@ -2,18 +2,17 @@
 
 Run as
 ``python -m agentflow.coordinator._launch_child <store_path> <identity> <token> <timeout>
-[--build-lease <provider> <silent> <test> <absolute>] --inherited-worktree [argv...]``.
+[--build-lease <provider> <silent> <test> <absolute>] --worktree <launch_root> [argv...]``.
 
 It double-forks so the provider family is reparented away from the daemon (and so an ended
 provider never lingers as a zombie the daemon would misread as alive), then makes a *guarded*
-durable ``started`` write with the detached supervisor's pid as the family — recorded only if
-this reservation still holds ``token``. Recording the fact before provider spawn is the crash
-boundary: the attempt is recoverable even if the provider exits immediately or the daemon
-dies before observing it. The guard is the second half of that boundary: if the coordinator
-already disowned this launch on a handshake timeout (rotating the token) or returned the
-record to waiting, the write is refused and the child exits *without* becoming a provider — and
-With no provider argv (the dormant slice) it exits after a successful start, which reconciliation
-reads as a started-but-ended attempt.
+durable ``started`` write with the detached supervisor's pid — recorded only if this reservation
+still holds ``token``. It then forks the provider into a separate session behind a pipe gate,
+durably expands the family to ``supervisor:provider-group``, and releases the provider to exec.
+If the coordinator already disowned this launch or another bootstrap won, the guarded write is
+refused and the child exits without becoming a provider. If the supervisor vanishes before the
+family expansion, pipe EOF makes the gated child exit without running provider code. With no
+provider argv (the dormant slice), the supervisor exits after the successful start claim.
 """
 
 from __future__ import annotations
@@ -37,8 +36,91 @@ from agentflow.coordinator.store import Store
 _HEAD_FILE_BYTES = 8 * 1024 * 1024
 _HEAD_OBSERVATION_S = 0.025
 _HEAD_HELPERS: set[int] = set()
-_INHERITED_WORKTREE = "--inherited-worktree"
+_WORKTREE = "--worktree"
 _NO_WORKTREE = "--no-worktree"
+
+
+class _ForkedProvider:
+    """A provider fork held behind a pipe gate until its process group is durable."""
+
+    def __init__(self, pid: int, command: list[str], gate_write: int) -> None:
+        self.pid = pid
+        self._command = command
+        self._gate_write: int | None = gate_write
+        self._returncode: int | None = None
+
+    def release(self) -> None:
+        try:
+            os.write(self._gate_write, b"1")
+        finally:
+            self._close_gate()
+
+    def refuse(self) -> None:
+        self._close_gate()  # EOF makes the child exit without executing provider code
+        self.wait()
+
+    def _close_gate(self) -> None:
+        if self._gate_write is None:
+            return
+        try:
+            os.close(self._gate_write)
+        finally:
+            self._gate_write = None
+
+    def _finish(self, status: int) -> int:
+        self._returncode = os.waitstatus_to_exitcode(status)
+        return self._returncode
+
+    def poll(self) -> int | None:
+        if self._returncode is not None:
+            return self._returncode
+        waited, status = os.waitpid(self.pid, os.WNOHANG)
+        return self._finish(status) if waited else None
+
+    def wait(self, timeout: float | None = None) -> int:
+        if self._returncode is not None:
+            return self._returncode
+        if timeout is None:
+            _, status = os.waitpid(self.pid, 0)
+            return self._finish(status)
+        deadline = time.monotonic() + timeout
+        while True:
+            result = self.poll()
+            if result is not None:
+                return result
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(self._command, timeout)
+            time.sleep(min(0.01, remaining))
+
+
+def _spawn_provider(provider: list[str], output, working_dir: str) -> _ForkedProvider:
+    """Fork a separate-session provider that cannot exec until its family is durable."""
+    gate_read, gate_write = os.pipe()
+    try:
+        pid = os.fork()
+    except OSError:
+        os.close(gate_read)
+        os.close(gate_write)
+        raise
+    if pid == 0:
+        os.close(gate_write)
+        try:
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            os.setsid()
+            os.dup2(output.fileno(), 1)
+            os.dup2(output.fileno(), 2)
+            released = os.read(gate_read, 1) == b"1"
+            os.close(gate_read)
+            if not released:
+                os._exit(0)
+            if working_dir:
+                os.chdir(working_dir)
+            os.execvp(provider[0], provider)
+        except OSError:
+            os._exit(127)
+    os.close(gate_read)
+    return _ForkedProvider(pid, provider, gate_write)
 
 
 def _reap_head_helpers() -> None:
@@ -856,10 +938,12 @@ def main(args: list[str]) -> None:
         progress_provider, silent, test_grace, absolute, *tail = tail[1:]
         build_lease = (float(silent), float(test_grace), float(absolute))
     launch_root, *provider = tail
-    if launch_root == _INHERITED_WORKTREE:
+    if launch_root == _WORKTREE:
         try:
-            working_dir = os.getcwd()
-        except OSError:
+            working_dir, *provider = provider
+        except ValueError:
+            return
+        if not working_dir:
             return
     elif launch_root == _NO_WORKTREE:
         working_dir = ""
@@ -882,34 +966,44 @@ def main(args: list[str]) -> None:
     signal.signal(signal.SIGTERM, request_stop)
     store = Store(store_path)
     won = store.child_start(identity, token, os.getpid())
-    store.close()
     if not won:
         # Our reservation is gone; starting a provider now would be unreserved. Role-override
         # generation only ever happens further down, immediately before this supervisor's own
         # Popen call — nothing has been generated yet at this point, so there is nothing to
         # clean up here.
+        store.close()
         os._exit(0)
     marker = _mark_active(working_dir)
     if not provider:
+        store.close()
         _clear_active(marker)
         os._exit(0)  # dormant: no provider to become; a started-then-ended attempt
-    # Remain as the recorded family supervisor while the provider runs in its own process
-    # group. Output streams directly to its durable artifact, so partial output survives a
-    # daemon crash. The supervisor records exit/signal/timeout facts after the whole provider
-    # family ends; it can terminate that family without killing itself when the deadline fires.
+    # Remain as the recorded supervisor while the provider runs in its own session. A small
+    # bootstrap gate prevents provider code from executing until that separate process group is
+    # part of the durable family; if this supervisor vanishes first, pipe EOF makes the gate exit.
+    # Output streams directly to its durable artifact, so partial output survives a daemon crash.
     events = events_path(store_path, token)
     events.parent.mkdir(parents=True, exist_ok=True)
     timed_out = False
     with events.open("w") as output:
         try:
-            process = subprocess.Popen(
-                provider, cwd=working_dir or None, stdout=output,
-                stderr=subprocess.STDOUT, start_new_session=True)
+            process = _spawn_provider(provider, output, working_dir)
         except OSError:
+            store.close()
             # No provider family ever came into existence for this attempt.
             write_result(store_path, token, exit_status=None, signal=None, timed_out=False)
             _clear_active(marker)
             os._exit(0)
+        attached = store.child_provider_group(identity, token, os.getpid(), process.pid)
+        store.close()
+        if not attached:
+            process.refuse()
+            _clear_active(marker)
+            os._exit(0)
+        try:
+            process.release()
+        except OSError:
+            pass
 
         def stop_provider() -> int:
             try:
@@ -934,9 +1028,9 @@ def main(args: list[str]) -> None:
                           "waiting for provider exit", file=output, flush=True)
                 return process.wait()
 
-        # Reconciliation signals this supervisor, not the provider's separate session. Turn that
-        # request into the same orderly process-group shutdown the deadline path uses, then keep
-        # the supervisor alive to write the provider's durable end facts.
+        # Reconciliation signals this supervisor. Turn that request into the same orderly
+        # process-group shutdown the deadline path uses, then keep the supervisor alive to write
+        # the provider's durable end facts.
         started_at = time.monotonic()
         deadline = started_at + float(timeout)
         silent_deadline = started_at + build_lease[0] if build_lease else deadline

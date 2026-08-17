@@ -15,6 +15,7 @@ import subprocess
 
 from agentflow.coordinator.verification import PREPARED, unprepared
 from agentflow.runner import _run
+from agentflow.worktree_ownership import mark_worktree_owned
 from agentflow.worktree_ref import source_facts
 
 
@@ -73,7 +74,7 @@ def worktree_ready(record):
         if remote:
             add += ["-b", branch, str(wt), f"origin/{branch}"]
         elif record.stage in {"build", "mockup"}:
-            add += ["-b", branch, str(wt), "origin/main"]
+            add += ["-b", branch, str(wt), record.subject_revision]
         else:
             return unprepared("branch-absent",
                               f"branch {branch} exists neither locally nor on origin, and a "
@@ -82,6 +83,7 @@ def worktree_ready(record):
     if added.returncode != 0:
         return unprepared("worktree-add-failed",
                           f"`git worktree add` for {branch} at {wt} exited {added.returncode}")
+    mark_worktree_owned(wt, disposable=True)
     try:
         runner.provision(wt)
     except subprocess.CalledProcessError as e:

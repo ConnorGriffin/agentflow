@@ -114,6 +114,14 @@ def test_deploy_and_status_fail_closed_for_a_divergent_target(tmp_path):
     assert target.read_bytes() == b"not an evidence store"
 
 
+def test_deploy_replaces_an_empty_initialized_evidence_store(tmp_path):
+    target = tmp_path / "evidence.db"
+    EvidenceStore(path=target)
+
+    assert evaluation_authority.deploy(path=target).status == "published"
+    assert evaluation_authority.status(path=target).status == "ready"
+
+
 def test_status_reports_missing_without_creating_anything(tmp_path):
     target = tmp_path / "missing" / "evidence.db"
 

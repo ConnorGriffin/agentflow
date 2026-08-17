@@ -10,6 +10,7 @@ import pytest
 
 from agentflow.capability_contracts import ContractRequirement
 from agentflow.cli import main
+from agentflow.enroll import enroll_repository
 
 
 def _git_commit(repo: Path, *args: str) -> None:
@@ -549,9 +550,20 @@ def test_enroll_apply_installs_repo_local_capabilities_idempotently(
     monkeypatch.setattr("agentflow.enroll._install_connor_skills", install_skills)
     monkeypatch.setattr("agentflow.enroll._install_methodology_skills",
                         lambda root: "DO:   installed methodology contracts")
+
+    def install_ui_runtime(root):
+        for agent_root in (".agents/skills", ".claude/skills"):
+            package = (
+                root / agent_root / "drive-local-webapp" / "node_modules" /
+                "playwright" / "package.json"
+            )
+            package.parent.mkdir(parents=True, exist_ok=True)
+            package.write_text('{"version": "1.61.1"}\n')
+        return "DO:   installed fake UI runtime"
+
     monkeypatch.setattr(
         "agentflow.enroll._install_ui_runtime",
-        lambda root: "DO:   installed fake UI runtime",
+        install_ui_runtime,
     )
 
     first = main(["enroll", str(tmp_path), "--apply"])
@@ -562,8 +574,24 @@ def test_enroll_apply_installs_repo_local_capabilities_idempotently(
     assert "ui-surfaces: frontend/" in (tmp_path / "AGENTS.md").read_text()
     assert (tmp_path / "CLAUDE.md").readlink() == Path("AGENTS.md")
     assert (tmp_path / ".gitignore").read_text() == (
-        ".agentflow/\n.agents/skills/**/node_modules/\n"
+        ".agentflow/\n.agents/skills/**/node_modules/\n.claude/skills/**/node_modules/\n"
     )
+    for provider in (".agents", ".claude"):
+        dependency = (
+            tmp_path / provider / "skills" / "drive-local-webapp" /
+            "node_modules" / "playwright" / "package.json"
+        )
+        assert subprocess.run(
+            ["git", "-C", str(tmp_path), "check-ignore", "--quiet", str(dependency)],
+            check=False,
+        ).returncode == 0
+    status = subprocess.run(
+        ["git", "-C", str(tmp_path), "status", "--short", "--untracked-files=all"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert "node_modules" not in status
     codex_skill = tmp_path / ".agents" / "skills" / "agentflow" / "SKILL.md"
     claude_skill = tmp_path / ".claude" / "skills" / "agentflow" / "SKILL.md"
     assert codex_skill.is_file()
@@ -720,6 +748,7 @@ def test_enroll_replaces_duplicate_instructions_with_a_recoverable_link(
     (tmp_path / "AGENTS.md").write_text(content)
     (tmp_path / "CLAUDE.md").write_text(content)
     monkeypatch.setattr("agentflow.enroll._checkout_problem", lambda root: None)
+    monkeypatch.setattr("agentflow.enroll._ignored_enrollment_path", lambda *_args: None)
     config = tmp_path.parent / f"{tmp_path.name}-config.toml"
     config.write_text(
         f'[[repositories]]\nrepo = "owner/project"\nworkdir = "{tmp_path}"\n'
@@ -736,7 +765,7 @@ def test_enroll_replaces_duplicate_instructions_with_a_recoverable_link(
 
     assert (tmp_path / "CLAUDE.md").is_symlink()
     assert (tmp_path / "CLAUDE.md").readlink() == Path("AGENTS.md")
-    assert (tmp_path / "CLAUDE.md.pre-agentflow").read_text() == content
+    assert not (tmp_path / "CLAUDE.md.pre-agentflow").exists()
 
 
 def test_enroll_promotes_incomplete_duplicate_instructions_without_splitting(
@@ -746,6 +775,7 @@ def test_enroll_promotes_incomplete_duplicate_instructions_without_splitting(
     (tmp_path / "AGENTS.md").write_text(content)
     (tmp_path / "CLAUDE.md").write_text(content)
     monkeypatch.setattr("agentflow.enroll._checkout_problem", lambda root: None)
+    monkeypatch.setattr("agentflow.enroll._ignored_enrollment_path", lambda *_args: None)
     config = tmp_path.parent / f"{tmp_path.name}-config.toml"
     config.write_text(
         f'[[repositories]]\nrepo = "owner/project"\nworkdir = "{tmp_path}"\n'
@@ -763,7 +793,7 @@ def test_enroll_promotes_incomplete_duplicate_instructions_without_splitting(
     assert (tmp_path / "CLAUDE.md").resolve() == (tmp_path / "AGENTS.md").resolve()
     assert "profile: reviewed" in (tmp_path / "AGENTS.md").read_text()
     assert "ui-surfaces: none" in (tmp_path / "AGENTS.md").read_text()
-    assert (tmp_path / "CLAUDE.md.pre-agentflow").read_text() == content
+    assert not (tmp_path / "CLAUDE.md.pre-agentflow").exists()
 
 
 def test_enroll_apply_refuses_a_dirty_checkout(tmp_path, capsys):
@@ -1068,6 +1098,75 @@ def test_enroll_rejects_drifted_public_skills_without_running_installer(
     ).stdout == ""
 
 
+def test_enroll_repairs_missing_claude_destinations_for_pinned_public_skills(
+    tmp_path, monkeypatch, capsys
+):
+    (tmp_path / "frontend").mkdir()
+    names = ("ui-craft", "drive-local-webapp")
+    for name in names:
+        skill = tmp_path / ".agents" / "skills" / name / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text(f"pinned {name}\n")
+    legacy = tmp_path / ".claude" / "skills" / "ui-craft"
+    legacy.parent.mkdir(parents=True)
+    legacy.symlink_to(Path("../../.agents/skills/ui-craft"))
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "remote", "add", "origin",
+         "git@github.com:owner/project.git"],
+        check=True,
+    )
+    subprocess.run(["git", "-C", str(tmp_path), "add", "."], check=True)
+    _git_commit(tmp_path, "-qm", "initial")
+    monkeypatch.setenv("AGENTFLOW_CONFIG", str(tmp_path.parent / "config.toml"))
+    monkeypatch.setattr("agentflow.enroll._tooling_problem", lambda _surfaces: None)
+    monkeypatch.setattr(
+        "agentflow.enroll._resolved_skill_release",
+        lambda manifest: (manifest["connor_skills"]["commit"], None),
+    )
+    monkeypatch.setattr(
+        "agentflow.enroll._public_skill_destination_states",
+        lambda root, _manifest: {
+            (location, name): (
+                "ok" if location == ".agents/skills" or not (root / location / name).is_symlink()
+                and (root / location / name).is_dir() else "absent"
+            )
+            for location in (".agents/skills", ".claude/skills")
+            for name in names
+        },
+    )
+    monkeypatch.setattr(
+        "agentflow.enroll._install_methodology_skills",
+        lambda _root: "ok:   methodology contracts supplied by focused fixture",
+    )
+    monkeypatch.setattr(
+        "agentflow.enroll._install_ui_runtime",
+        lambda _root: "ok:   UI runtime supplied by focused fixture",
+    )
+
+    enroll_repository(str(tmp_path), apply=True)
+
+    assert "repository left unchanged" not in capsys.readouterr().out
+    for name in names:
+        claude_skill = tmp_path / ".claude" / "skills" / name
+        assert claude_skill.is_dir()
+        assert not claude_skill.is_symlink()
+        assert (claude_skill / "SKILL.md").read_text() == f"pinned {name}\n"
+
+    subprocess.run(["git", "-C", str(tmp_path), "add", "."], check=True)
+    _git_commit(tmp_path, "-qm", "enroll")
+
+    enroll_repository(str(tmp_path), apply=True)
+
+    assert "Connor skill pack already installed" in capsys.readouterr().out
+    assert subprocess.run(
+        ["git", "-C", str(tmp_path), "status", "--porcelain"],
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout == ""
+
+
 @pytest.mark.parametrize("shape", ["regular-file", "broken-symlink", "empty-directory"])
 def test_enroll_treats_existing_non_skill_destinations_as_conflicts(
     tmp_path, monkeypatch, capsys, shape
@@ -1157,7 +1256,7 @@ def test_enroll_promotes_claude_only_instructions_and_is_idempotent(
     capsys.readouterr()
     assert claude.is_symlink()
     assert claude.resolve() == (tmp_path / "AGENTS.md").resolve()
-    assert (tmp_path / "CLAUDE.md.pre-agentflow").read_text() == "# Existing instructions\n"
+    assert not (tmp_path / "CLAUDE.md.pre-agentflow").exists()
     subprocess.run(["git", "-C", str(tmp_path), "add", "."], check=True)
     _git_commit(tmp_path, "-qm", "enrolled")
     assert main(["enroll", str(tmp_path), "--apply"]) == 0
@@ -1437,6 +1536,13 @@ def test_enroll_public_ui_command_path_reports_each_stage(
             )
             package.parent.mkdir(parents=True)
             package.write_text('{"version": "1.61.1"}\n')
+            (package.parent / "lib").mkdir()
+            (package.parent / "cli.js").write_text('require("./lib/program")\n')
+            (package.parent / "lib" / "program.js").write_text("module.exports = {}\n")
+            (package.parent.parent / ".bin").mkdir()
+            (package.parent.parent / ".bin" / "playwright").symlink_to(
+                "../playwright/cli.js"
+            )
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         if command == ["node", "--version"]:
             return SimpleNamespace(returncode=0, stdout="v20.0.0\n", stderr="")
@@ -1457,6 +1563,9 @@ def test_enroll_public_ui_command_path_reports_each_stage(
     )
     monkeypatch.setattr(
         "agentflow.provider_skills.skill_destination_status", destination_status
+    )
+    monkeypatch.setattr(
+        "agentflow.runtime_contracts.skill_destination_status", destination_status
     )
     monkeypatch.setattr(
         "agentflow.capability_contracts.provider_skill_status",

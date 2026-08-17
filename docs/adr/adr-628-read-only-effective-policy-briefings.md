@@ -27,9 +27,10 @@ module SHA-256 is
 
 One `EffectivePolicyResolver` exposes `brief_for(repository, stage, subject_revision)` and
 returns one immutable `briefing-v1` result. It reads only exact #584 receipts through
-`PromotionReceiptReader.read`, the pinned Evaluation policy bundle, and an injected
-`RepositoryOverlaySource.read`. It has no GitHub adapter, Evidence verb, coordinator Store
-type, persistence operation, policy transition, or mutable result state.
+`PromotionReceiptReader.read` and its query-only verified fleet-successor-chain read, the pinned
+Evaluation policy bundle, and an injected `RepositoryOverlaySource.read`. It has no GitHub
+adapter, Evidence verb, coordinator Store type, persistence operation, policy transition, or
+mutable result state.
 
 The resolver folds fleet policy, then a same-repository overlay, then stage applicability.
 An overlay can only remove existing receipt or capability entries, narrow an existing named
@@ -44,10 +45,11 @@ sorted keys, compact separators, non-ASCII preservation, JSON integers only, and
 numbers. Duplicate members are rejected recursively. Object arrays are ordered by element
 canonical bytes. Overlay and briefing self-digests omit only their declared identity fields.
 The overlay is bounded at 8 KiB and the final briefing at 16 KiB; collection and nested-bound
-limits are part of the closed contract. The exact effective-policy contract digest is
-`ea12ea2c28622dcbf2aeed7fa060f54250de3903d3942bfc8f6b8a04ffd53cef`.
+limits are part of the closed contract. The exact effective-policy contract digest, amended by
+#694's successor-chain activation, is
+`f87266dddb953ee684958d8acef2f65b0aaa22cb812199adcd8d4cf912cbb01f`.
 
-The result vocabulary is ready, not applicable, or a hold with one of the seven closed codes.
+The result vocabulary is ready, not applicable, or a hold with one of the eight closed codes.
 Holds contain only validated tokens or digests as references. Rejected content, source prose,
 provider output, findings, prompts, transcripts, and secrets never enter a result.
 
@@ -65,7 +67,26 @@ provider output, findings, prompts, transcripts, and secrets never enter a resul
 ## Consequences
 
 Briefing delivery is deterministic, content-free, and independently reusable by admission.
-Unavailable or mismatched authorities stop launch through a named immutable hold. Repository
-overlays can restrict but never widen fleet policy. Promotion and Evaluation remain unchanged;
-#627 must combine the returned briefing with coordinator identity and persist it atomically before
-permit acquisition.
+Overlay read errors, timeouts, and repositories or revisions unavailable at read time stop launch
+through retryable `invalid_overlay`. Malformed or invalid successfully read immutable objects and
+authority mismatches stop launch through `invalid_overlay_authority`. Repository overlays can
+restrict but never widen fleet policy. Promotion and Evaluation remain unchanged; #627 must
+combine the returned briefing with coordinator identity and persist it atomically before permit
+acquisition.
+
+Issue #571 adds one consumer check without widening resolver authority: a promoted method's exact
+artifact locator scopes it to its owning stage before the resolver constructs the stage briefing.
+Unrelated stages therefore keep the same briefing identity, prompt, admission receipt, and absence
+of use attribution before and after that method is promoted. Before Review uses its advisory
+receipt, its stage prompt verifies that the locator and SHA-256 name the deployed Review
+methodology artifact. The briefing still delivers only receipt authority and never method prose.
+A mismatch refuses before admission, and Store records the same receipt and method revision only
+after this check succeeds.
+
+Issue #694 supplies the missing publication read. The pinned Evaluation receipt anchors version 1;
+the reader revalidates every consecutive verified fleet successor, and the resolver selects the
+newest recognized advisory receipt for each owning stage. Fleet policy may therefore cite receipts
+from earlier transitions rather than requiring every receipt to carry the newest version. The
+briefing's version and applicability scope come from its newest applicable active receipt, preserving
+the #571 unrelated-stage identity guarantee, while repository overlays bind the newest global chain
+version before they may restrict it.
