@@ -122,7 +122,7 @@ def test_routing_config_is_validated_and_resolves_every_named_model(tmp_path):
 
 
 def test_sol_reasoning_floor_names_the_spellings_the_routing_table_resolves():
-    """ADR PRNUMBER floors the Sol session lead at ``medium``, keyed on Sol by name inside
+    """ADR 752 floors the Sol session lead at ``medium``, keyed on Sol by name inside
     ``agentflow/coordinator/profiles.py``. That module cannot read the pair off the routing table —
     ``routing`` already imports it, and the import-cycle gate in ``test_dispatch.py`` fails on the
     ring a deferred import would close — so the internal name and the provider CLI id are restated

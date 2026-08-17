@@ -192,7 +192,7 @@ class StageProfile:
         return self.allowed_tools is not None
 
 
-# ADR 498 pins the Build/Revise session lead to ``low``; ADR PRNUMBER floors Sol — and only Sol —
+# ADR 498 pins the Build/Revise session lead to ``low``; ADR 752 floors Sol — and only Sol —
 # at ``medium``, on the operator's judgment that Sol underperforms at the low rung. The floor lives
 # here because this module is the one place every session's reasoning rung is resolved: the durable
 # ``LaunchConfigV1`` routing freezes, the direct ``profile_for(record)`` launch path both provider
@@ -261,7 +261,7 @@ def profile_for(record) -> StageProfile:
     builder's Build ceiling through ``builder_complexity`` (ADR 0041); every other stage reads
     the per-stage table. Read-only stages carry a read/search allowlist; the rest keep the full
     surface (``allowed_tools is None``). The Fable session lead runs at low reasoning and the Sol
-    one at its ``medium`` floor (ADR PRNUMBER); either way the worker reasoning rung is
+    one at its ``medium`` floor (ADR 752); either way the worker reasoning rung is
     prompt-level routing policy, not a provider flag on the parent.
 
     A pre-admission ``Submission`` is also read here for its ceilings, and it carries only a

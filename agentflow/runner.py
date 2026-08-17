@@ -975,7 +975,7 @@ class CodexRunner(_WorktreeRunner):
         Claude.
 
         A legacy Codex build/revise profile carries the session lead's reasoning effort — the Sol
-        parent's ``medium`` floor (ADR PRNUMBER), or low for a lead without one. Codex has no
+        parent's ``medium`` floor (ADR 752), or low for a lead without one. Codex has no
         ``--effort`` flag — reasoning effort is a config override — so it is appended as another
         ``-c model_reasoning_effort=<level>`` alongside the existing ``-c`` overrides, before the
         positional prompt. Every other stage leaves it ``None`` (provider default); a rung above

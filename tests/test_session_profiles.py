@@ -225,7 +225,7 @@ def _codex_config(command: list[str]) -> list[str]:
 
 def test_build_parent_launches_at_its_leads_rung_on_both_provider_adapters(tmp_path):
     """The session-level flag is the lead's own rung — low for the Claude parent (ADR 498), Sol's
-    ``medium`` floor for the Codex one (ADR PRNUMBER); the issue effort is rendered into worker
+    ``medium`` floor for the Codex one (ADR 752); the issue effort is rendered into worker
     prompts either way."""
     for effort in ("extra", "low"):
         claude = provider_command(_record("build", str(tmp_path), complexity="deep", effort=effort))
@@ -249,7 +249,7 @@ def test_revise_parent_launches_at_its_leads_rung_while_retaining_builder_effort
 
 def test_sol_never_leads_a_build_or_revise_below_medium_reasoning(tmp_path):
     """Sol underperforms at the low rung, so the Sol parent is floored at ``medium`` (ADR
-    PRNUMBER) — including the deep cells, where the low pin would otherwise still apply. The
+    752) — including the deep cells, where the low pin would otherwise still apply. The
     floor holds for whichever spelling of the lead a record carries, the internal routing name
     or the provider CLI id, since both reach the launcher."""
     from agentflow.coordinator.profiles import profile_for
@@ -268,7 +268,7 @@ def test_sol_never_leads_a_build_or_revise_below_medium_reasoning(tmp_path):
 
 def test_a_terra_session_keeps_the_reasoning_rung_it_already_had(tmp_path):
     """The floor is keyed on Sol, not on the Codex pool: Terra's standard-tier build and revise
-    resolve exactly the low rung they did before ADR PRNUMBER, and its read-only stages still set
+    resolve exactly the low rung they did before ADR 752, and its read-only stages still set
     no reasoning flag at all."""
     from agentflow.coordinator.profiles import profile_for
 

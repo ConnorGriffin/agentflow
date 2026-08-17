@@ -1,4 +1,4 @@
-# ADR PRNUMBER — Sol never runs below medium reasoning
+# ADR 752 — Sol never runs below medium reasoning
 
 Status: Accepted
 
