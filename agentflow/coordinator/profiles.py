@@ -4,7 +4,8 @@ Every daemon session used to launch with one full tool surface, personal MCP con
 leaking in, and a single stage-blind two-hour timeout. This table keys a profile on the
 record's ``(stage, complexity, effort)`` — the keys the record already carries — and returns
 the read/search allowlist, the wall-clock ceiling, the turn ceiling, and the provider
-session reasoning effort (low for Build/Revise; every other stage stays provider-default) for that cell. The
+session reasoning effort (a Build/Revise lead's own rung — low, or Sol's ``medium`` floor; every
+other stage stays provider-default) for that cell. The
 allowlists are taken verbatim from the research table
 (``docs/research/session-profiles-and-ceilings-draft.md`` §3a); the ceilings began there too and
 have since been ratcheted onto the fleet's own recorded distribution (§3b′, #410; §3b″ per build
@@ -191,6 +192,34 @@ class StageProfile:
         return self.allowed_tools is not None
 
 
+# ADR 498 pins the Build/Revise session lead to ``low``; ADR PRNUMBER floors Sol — and only Sol —
+# at ``medium``, on the operator's judgment that Sol underperforms at the low rung. The floor lives
+# here because this module is the one place every session's reasoning rung is resolved: the durable
+# ``LaunchConfigV1`` routing freezes, the direct ``profile_for(record)`` launch path both provider
+# adapters fall back to, and the coordinator's telemetry row all read their rung from
+# ``profile_for_facts`` below. Fable keeps ``low``, and no other model's rung moves.
+#
+# Both of Sol's spellings are named here rather than read off the routing table: ``routing`` already
+# imports this module, and the import-cycle gate in ``tests/test_dispatch.py`` tolerates exactly one
+# ring, so reaching back into it — even from a deferred import — is the defect that test catches.
+# The routing table stays the source of truth for the pair, so this is a copy, and a test rather
+# than an import keeps it honest: ``test_capability_routing.py`` asserts this constant against
+# ``routing.cli_identifier("codex", "sol")``, and fails by name if the CLI id is renamed there
+# without a matching edit here.
+_SOL_REASONING_FLOOR = "medium"
+_SOL_IDENTITIES = frozenset({"sol", "gpt-5.6-sol"})  # internal routing name, provider CLI id
+
+
+def _lead_reasoning(model: str | None) -> str:
+    """The reasoning rung a Build/Revise session lead launches at, for the lead ``model``.
+
+    ``model`` is whichever identity the caller already carries — a record stamped with the
+    internal routing name, or an admitted launch carrying the provider CLI id — so both
+    spellings of the same lead resolve alike.
+    """
+    return _SOL_REASONING_FLOOR if model in _SOL_IDENTITIES else "low"
+
+
 def _build_ceiling(complexity: str | None, effort: str | None) -> tuple[int, int]:
     key = (complexity or "deep", effort or "")
     if key in _BUILD_CEILINGS:
@@ -206,15 +235,21 @@ def _build_lease(complexity: str | None, effort: str | None) -> tuple[int, int, 
 
 def profile_for_facts(stage: str, complexity: str | None = None,
                       effort: str | None = None,
-                      builder_complexity: str | None = None) -> StageProfile:
-    """Resolve one production profile without requiring a coordinator Record."""
+                      builder_complexity: str | None = None,
+                      model: str | None = None) -> StageProfile:
+    """Resolve one production profile without requiring a coordinator Record.
+
+    ``model`` is the session lead's identity, which the reasoning rung keys off for Build and
+    Revise (:func:`_lead_reasoning`); every other stage leaves the rung at the provider default,
+    so it is ignored there.
+    """
     if stage == "build":
         _wall, turns = _build_ceiling(complexity, effort)
         lease = _build_lease(complexity, effort)
-        return StageProfile(None, lease[2], turns, "low", lease)
+        return StageProfile(None, lease[2], turns, _lead_reasoning(model), lease)
     if stage == "revise":
         wall, turns = _build_ceiling(builder_complexity or complexity, effort)
-        return StageProfile(None, wall, turns, "low")
+        return StageProfile(None, wall, turns, _lead_reasoning(model))
     wall, turns = _STAGE_CEILINGS.get(stage, _DEFAULT_CEILING)
     return StageProfile(_READ_ONLY_TOOLS.get(stage), wall, turns)
 
@@ -225,8 +260,15 @@ def profile_for(record) -> StageProfile:
     Build sizes its ceiling on its own complexity/effort; Revise inherits the original
     builder's Build ceiling through ``builder_complexity`` (ADR 0041); every other stage reads
     the per-stage table. Read-only stages carry a read/search allowlist; the rest keep the full
-    surface (``allowed_tools is None``). Both session leads run at low reasoning; their worker
-    reasoning rung is prompt-level routing policy, not a provider flag on the parent.
+    surface (``allowed_tools is None``). The Fable session lead runs at low reasoning and the Sol
+    one at its ``medium`` floor (ADR PRNUMBER); either way the worker reasoning rung is
+    prompt-level routing policy, not a provider flag on the parent.
+
+    A pre-admission ``Submission`` is also read here for its ceilings, and it carries only a
+    ``pool`` — the coordinator picks the model at admission — so the lead identity is absent
+    rather than unknown. Nothing launches from that read; the launch, supervision, and telemetry
+    paths all resolve against a Record that has one.
     """
     return profile_for_facts(
-        record.stage, record.complexity, record.effort, record.builder_complexity)
+        record.stage, record.complexity, record.effort, record.builder_complexity,
+        getattr(record, "model", None))

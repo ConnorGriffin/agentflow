@@ -121,6 +121,20 @@ def test_routing_config_is_validated_and_resolves_every_named_model(tmp_path):
         CapabilityRouting.from_path(unknown_area)
 
 
+def test_sol_reasoning_floor_names_the_spellings_the_routing_table_resolves():
+    """ADR PRNUMBER floors the Sol session lead at ``medium``, keyed on Sol by name inside
+    ``agentflow/coordinator/profiles.py``. That module cannot read the pair off the routing table —
+    ``routing`` already imports it, and the import-cycle gate in ``test_dispatch.py`` fails on the
+    ring a deferred import would close — so the internal name and the provider CLI id are restated
+    there as a constant. This test is what keeps the copy honest, and it lives here because this is
+    where importing ``routing`` is legitimate: it fails the moment the CLI id changes in the table
+    without a matching edit in ``profiles.py``.
+    """
+    from agentflow.coordinator.profiles import _SOL_IDENTITIES
+
+    assert _SOL_IDENTITIES == {"sol", routing.cli_identifier("codex", "sol")}
+
+
 def test_review_tier_uses_builder_complexity_and_pool_specific_models():
     build = Record(
         identity="o/r|7|build|-", stage="build", pool="claude", demand=5,

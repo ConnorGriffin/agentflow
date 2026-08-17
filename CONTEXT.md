@@ -192,10 +192,11 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
   review round keeps the original tier (ADR 498).
 
 - **Effort** — the second dial intake stamps alongside complexity: `low | medium |
-  high | extra` — how much work the issue warrants. The selected Fable or Sol parent launches at
-  low reasoning; the dial maps to the worker reasoning rung in its brief (`extra` → `xhigh`)
+  high | extra` — how much work the issue warrants. The selected Fable parent launches at low
+  reasoning and the Sol one never below `medium` (ADR PRNUMBER); the dial maps to the worker
+  reasoning rung in its brief (`extra` → `xhigh`)
   and retains the established ceiling. Revise inherits it; non-build stages use provider
-  defaults (ADR 0044/0046/498).
+  defaults (ADR 0044/0046/498/PRNUMBER).
 
 - **Session lead** — the fixed parent accountable for a Build or Revise session. It plans,
   delegates by the benchmarked capability table, verifies results, and ships; it never writes
