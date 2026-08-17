@@ -18,6 +18,15 @@ ui-surfaces: agentflow/webui/src/
   the snapshot the daemon publishes — it never queries GitHub (ADR 0026). **Any UI
   change goes through `/ui-craft lock` first** (charter gate), and must honor
   `PRODUCT.md`/`DESIGN.md` (no side-stripe accents, etc.).
+- **Never `git stash` in a fleet worktree.** The stash is a single repo-wide stack shared by
+  every worktree of this repo, so a `stash push` here is visible to — and poppable by — a
+  session working somewhere else entirely. A concurrent `pop` silently moves another issue's
+  uncommitted work into your tree, which then contaminates whatever you test and can strand the
+  owning session's only copy. This has happened (2026-08-17: issue #736's liveness work was
+  pulled into an unrelated worktree by a stash race, and the two copies diverged).
+  To set changes aside, commit them on your own branch — a WIP commit you amend or drop later
+  is worktree-local and costs nothing. If you find work in your tree you did not write, do not
+  discard it: save it (`git diff > <patch>`) and say so.
 - **Driving the pipeline by hand needs the daemon's env.** `AGENTFLOW_PERMIT_BUDGET=25` lives
   only in the launchd plist, so a by-hand `build_issue` / `review_pr` reads the packaged default
   of 5 and reports `no pool has headroom` against a budget the daemon is not using. Prefix
