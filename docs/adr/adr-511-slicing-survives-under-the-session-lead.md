@@ -12,6 +12,9 @@
   (the retained commit-per-slice ledger), and
   [ADR 498](adr-498-capability-routed-session-led-dispatch.md) (the implemented session lead and
   provenance-stamped capability ladder)
+- Amended: 2026-08-16 — the settled mechanism shipped the same day in `9fa005d`
+  ([#722](https://github.com/ConnorGriffin/agentflow/pull/722)); the Consequences bullet
+  describing it as open work is corrected below
 
 ## Context
 
@@ -63,8 +66,8 @@ model-pair rule are dropped.
 ## Consequences
 
 - ADR 498 remains the implemented Build/Revise dispatch decision. No behavior changes here.
-- In-session slicing, the commit-per-slice ledger, and the slice-bearing work-order mechanism are
-  not implemented today. Implementing in-session slicing under the lead remains open work; this
-  record clears the way but does not deliver it.
+- In-session slicing, the commit-per-slice ledger, and the slice-bearing work-order mechanism
+  shipped in commit `9fa005d` (PR [#722](https://github.com/ConnorGriffin/agentflow/pull/722),
+  2026-08-16), the same day this record was accepted.
 - The map #463 deep-build measurement remains an input to #277's routing recalibration and explains
   why slicing is worth retaining under the lead.
