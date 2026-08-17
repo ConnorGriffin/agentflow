@@ -949,6 +949,12 @@ ACTION_REQUIRED_REASON = "has a check on its reviewed head that is asking for a 
 PENDING_CHECK_REASON = "has a required check on its reviewed head that is still pending"
 UI_VERIFICATION_UNAVAILABLE_REASON = "could not run the required UI verification"
 UI_VERIFICATION_UNKNOWN_REASON = "could not determine whether UI verification was required"
+# Distinct from the generic UNAVAILABLE reason above: this names the specific, evidenced cause —
+# the reviewing tool itself has no browser-escalation mechanism — rather than an unexplained
+# execution failure a maintainer might mistake for something repairable (#737).
+UI_VERIFICATION_NO_ESCALATION_REASON = (
+    "could not run the required UI verification because the reviewing tool has no "
+    "browser-escalation mechanism")
 
 
 def _red_check_lines(checks) -> tuple[str, ...]:
@@ -1144,31 +1150,31 @@ def _settle_review(record) -> str | None:
             autonomous=autonomous, checks=verdict.checks,
             missing="The pipeline could not determine whether the reviewed change requires UI "
                     "verification.")
-    claude_browser_unavailable = (
+    claude_no_escalation = (
         record.pool == "claude"
         and ui_verification_needed
         and verdict.ui_verification.value == "unavailable"
-        and "HEADLESS-SANDBOX-BLOCKED" in "\n".join(verdict.checks)
-        and not verdict.blocking
-        and not verdict.actions)
-    if not ui_gap and verdict.ui_verification.value == "unavailable" and not claude_browser_unavailable:
+        and "HEADLESS-SANDBOX-BLOCKED" in "\n".join(verdict.checks))
+    if not ui_gap and verdict.ui_verification.value == "unavailable":
+        # Claude's launcher exposes no browser-escalation mechanism, so an evidenced blocked
+        # driver there names that tool limitation instead of the generic unavailable-verification
+        # reason — but it still parks: an unavailable UI verification can never settle clean
+        # (parser invariant, agentflow/review_policy.py), and a maintainer decides from here (#737).
+        reason = (UI_VERIFICATION_NO_ESCALATION_REASON if claude_no_escalation
+                 else UI_VERIFICATION_UNAVAILABLE_REASON)
+        missing = ("The reviewing tool has no browser-escalation mechanism, so the required UI "
+                  "verification could not run." if claude_no_escalation else
+                  "The reviewer could not execute the required UI verification.")
         return _park_review_settlement(
-            record, verdict, workdir, pr, reason=UI_VERIFICATION_UNAVAILABLE_REASON,
-            autonomous=autonomous, checks=verdict.checks,
-            missing="The reviewer could not execute the required UI verification.")
-    if (ui_verification_needed and verdict.ui_verification.value != "passed"
-            and not claude_browser_unavailable):
+            record, verdict, workdir, pr, reason=reason,
+            autonomous=autonomous, checks=verdict.checks, missing=missing)
+    if ui_verification_needed and verdict.ui_verification.value != "passed":
         return _park_review_settlement(
             record, verdict, workdir, pr,
             reason="did not record the required UI verification", autonomous=autonomous,
             checks=verdict.checks,
             missing="The reviewed change touches a declared UI surface but has no runnable UI "
                     "verification result.")
-    if claude_browser_unavailable:
-        # Claude's launcher forbids unsandboxed commands and exposes no escalation mechanism. A
-        # blocked shared driver in checks is therefore a tool limitation, not a repairable review
-        # action; normalize only this evidenced structured result for settlement (#737).
-        verdict = replace(verdict, clean=True)
     # The head check gate (ADR 417): a clean exit first reads the checks on the exact reviewed
     # head, from GitHub — a reviewer cannot clear it by not looking. It is consulted only on the
     # exits that would otherwise finish clean: an unreadable answer defers only the clean

@@ -925,9 +925,13 @@ def test_repair_notice_cannot_turn_the_next_clean_settlement_into_a_maintainer_r
     assert settled.parked == [] and settled.merged == [42]
 
 
-def test_evidenced_claude_browser_unavailable_settles_without_a_false_park(monkeypatch):
-    """Claude cannot recover a driver blocked by its enforced sandbox. An exact recorded blocked
-    command closes the review honestly; it is not an action a maintainer can resolve (#737)."""
+def test_evidenced_claude_browser_unavailable_parks_with_a_distinct_reason(monkeypatch):
+    """Claude cannot recover a driver blocked by its enforced sandbox, and an unavailable UI
+    verification can never settle a pass (agentflow/review_policy.py's parser invariant). The
+    exact recorded blocked command still earns a distinct, accurate park reason naming the tool
+    limitation rather than the generic "could not run" wording, so a maintainer reading the park
+    knows this is not a repairable review action (#737)."""
+    from agentflow.coordinated_review import UI_VERIFICATION_NO_ESCALATION_REASON
     from agentflow.review_policy import UIVerification
     from agentflow.reviewer import Verdict
 
@@ -935,7 +939,7 @@ def test_evidenced_claude_browser_unavailable_settles_without_a_false_park(monke
     record.pool = "claude"
     record.builder_lineage = "codex"
     record.change_author_tool = "codex"
-    finished, summarized = [], []
+    parked = []
     monkeypatch.setattr(
         coordinated_review, "_review_verdict",
         lambda _r: Verdict(clean=False, parsed=True,
@@ -948,15 +952,24 @@ def test_evidenced_claude_browser_unavailable_settles_without_a_false_park(monke
     monkeypatch.setattr("agentflow.github.pr_comment_rows", lambda _repo, _pr: [])
     monkeypatch.setattr("agentflow.gate.ui_evidence_gap", lambda *_args: False)
     monkeypatch.setattr("agentflow.gate.ui_verification_required", lambda *_args: True)
-    monkeypatch.setattr("agentflow.github.commit_head_checks",
-                        lambda _repo, sha: github.HeadChecks(sha=sha))
-    monkeypatch.setattr("agentflow.gate.post_clean_review_summary",
-                        lambda *_args: summarized.append(True) or True)
-    monkeypatch.setattr("agentflow.coordinated_review._finish_review",
-                        lambda *args, **kwargs: finished.append(True))
 
-    assert coordinated_review._settle_review(record) == "https://github.com/o/r/pull/42"
-    assert summarized == [True] and finished == [True]
+    posted = []
+
+    def _park(_repo, _pr, _verdict, *, reason, proof_marker, **_kwargs):
+        parked.append(reason)
+        posted.append(f"> *agentflow: parked for human review.*\n<!-- {proof_marker} -->")
+
+    monkeypatch.setattr("agentflow.gate.park", _park)
+    monkeypatch.setattr(
+        "agentflow.github.pr_comments",
+        lambda _repo, _pr: [github.Comment(body=body, created_at="") for body in posted])
+    monkeypatch.setattr("agentflow.notify.notify", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr("agentflow.coordinated_review._finish_review",
+                        lambda *args, **kwargs: None)
+    monkeypatch.setattr("agentflow.ratchet.record_once", lambda *args, **kwargs: None)
+
+    assert coordinated_review._settle_review(record) is not None
+    assert parked == [UI_VERIFICATION_NO_ESCALATION_REASON]
 
 
 def test_clean_taint_clearing_autonomous_review_reenters_full_merge_gate(monkeypatch):
