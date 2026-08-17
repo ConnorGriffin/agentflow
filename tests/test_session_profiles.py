@@ -191,7 +191,7 @@ def test_explicit_timeouts_replace_build_lease_and_other_stages_never_get_one(
 
 
 def test_profile_pins_session_leads_low_and_other_stages_use_provider_default(tmp_path):
-    """The work dial survives for workers while every build/revise parent stays low."""
+    """The work dial survives for workers while a non-Sol build/revise parent stays low."""
     from agentflow.coordinator.profiles import profile_for
 
     for dial in ("low", "medium", "high", "extra"):
@@ -219,28 +219,72 @@ def _codex_record(stage: str, source: str, **kw) -> Record:
                   model="sol", source=source, input_ptr="do the stage", **kw)
 
 
-def test_build_parent_launches_at_low_reasoning_on_both_provider_adapters(tmp_path):
-    """The session-level flag is low; the issue effort is rendered into worker prompts."""
+def _codex_config(command: list[str]) -> list[str]:
+    return [command[i + 1] for i, arg in enumerate(command[:-1]) if arg == "-c"]
+
+
+def test_build_parent_launches_at_its_leads_rung_on_both_provider_adapters(tmp_path):
+    """The session-level flag is the lead's own rung — low for the Claude parent (ADR 498), Sol's
+    ``medium`` floor for the Codex one (ADR 752); the issue effort is rendered into worker
+    prompts either way."""
     for effort in ("extra", "low"):
         claude = provider_command(_record("build", str(tmp_path), complexity="deep", effort=effort))
         assert _flag(claude, "--effort") == "low"
 
         codex = provider_command(
             _codex_record("build", str(tmp_path), complexity="deep", effort=effort))
-        codex_config = [codex[i + 1] for i, arg in enumerate(codex[:-1]) if arg == "-c"]
-        assert "model_reasoning_effort=low" in codex_config
+        assert "model_reasoning_effort=medium" in _codex_config(codex)
         assert "--effort" not in codex                 # Codex has no such flag
 
 
-def test_revise_parent_launches_low_while_retaining_builder_effort(tmp_path):
+def test_revise_parent_launches_at_its_leads_rung_while_retaining_builder_effort(tmp_path):
     claude = provider_command(
         _record("revise", str(tmp_path), builder_complexity="deep", effort="extra"))
     assert _flag(claude, "--effort") == "low"
 
     codex = provider_command(
         _codex_record("revise", str(tmp_path), builder_complexity="deep", effort="extra"))
-    codex_config = [codex[i + 1] for i, arg in enumerate(codex[:-1]) if arg == "-c"]
-    assert "model_reasoning_effort=low" in codex_config
+    assert "model_reasoning_effort=medium" in _codex_config(codex)
+
+
+def test_sol_never_leads_a_build_or_revise_below_medium_reasoning(tmp_path):
+    """Sol underperforms at the low rung, so the Sol parent is floored at ``medium`` (ADR
+    752) — including the deep cells, where the low pin would otherwise still apply. The
+    floor holds for whichever spelling of the lead a record carries, the internal routing name
+    or the provider CLI id, since both reach the launcher."""
+    from agentflow.coordinator.profiles import profile_for
+
+    for model in ("sol", "gpt-5.6-sol"):
+        for dial in ("low", "medium", "high", "extra"):
+            build = Record("codex-build", "build", "codex", 1, model=model,
+                           source=str(tmp_path), input_ptr="do the stage",
+                           complexity="deep", effort=dial)
+            revise = Record("codex-revise", "revise", "codex", 1, model=model,
+                            source=str(tmp_path), input_ptr="do the stage",
+                            complexity="deep", builder_complexity="deep", effort=dial)
+            assert profile_for(build).reasoning_effort == "medium"
+            assert profile_for(revise).reasoning_effort == "medium"
+
+
+def test_a_terra_session_keeps_the_reasoning_rung_it_already_had(tmp_path):
+    """The floor is keyed on Sol, not on the Codex pool: Terra's standard-tier build and revise
+    resolve exactly the low rung they did before ADR 752, and its read-only stages still set
+    no reasoning flag at all."""
+    from agentflow.coordinator.profiles import profile_for
+
+    def terra(stage: str, **kw) -> Record:
+        return Record(f"codex-{stage}", stage, "codex", 1, model="gpt-5.6-terra",
+                      source=str(tmp_path), input_ptr="do the stage", **kw)
+
+    assert profile_for(
+        terra("build", complexity="standard", effort="low")).reasoning_effort == "low"
+    assert profile_for(
+        terra("revise", complexity="standard", builder_complexity="standard",
+              effort="low")).reasoning_effort == "low"
+    assert profile_for(terra("review", complexity="standard")).reasoning_effort is None
+
+    codex = provider_command(terra("build", complexity="standard", effort="low"))
+    assert "model_reasoning_effort=low" in _codex_config(codex)
 
 
 def test_non_build_stages_set_no_reasoning_flag(tmp_path):

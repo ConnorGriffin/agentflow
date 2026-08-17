@@ -912,8 +912,9 @@ class ClaudeRunner(_WorktreeRunner):
         the same code-graph access Build has — it is the withheld
         *edit* tools, not the local read-only MCP tools, that a read-only stage loses.
 
-        A build/revise profile carries the session lead's low reasoning effort (ADR 498), handed to
-        Claude's first-class ``--effort`` flag; every other stage leaves it ``None``. A
+        A build/revise profile carries the session lead's reasoning effort — low for every Claude
+        parent (ADR 498) — handed to Claude's first-class ``--effort`` flag; every other stage
+        leaves it ``None``. A
         rung above Claude's ladder clamps to its top rather than failing the launch.
         """
         from agentflow.operational_safety import READ_ONLY_WITHHELD_TOOLS_V1
@@ -973,7 +974,8 @@ class CodexRunner(_WorktreeRunner):
         read-only ones. The wall ceiling is applied per-record by the launcher, the same as for
         Claude.
 
-        A legacy Codex build/revise profile carries the session lead's low reasoning effort. Codex has no
+        A legacy Codex build/revise profile carries the session lead's reasoning effort — the Sol
+        parent's ``medium`` floor (ADR 752), or low for a lead without one. Codex has no
         ``--effort`` flag — reasoning effort is a config override — so it is appended as another
         ``-c model_reasoning_effort=<level>`` alongside the existing ``-c`` overrides, before the
         positional prompt. Every other stage leaves it ``None`` (provider default); a rung above

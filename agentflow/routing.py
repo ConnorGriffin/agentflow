@@ -250,7 +250,7 @@ class CapabilityRouting:
 
         profile_id = self._stage_profile_id(
             stage, complexity, effort, builder_complexity)
-        profile = profile_for_facts(stage, complexity, effort, builder_complexity)
+        profile = profile_for_facts(stage, complexity, effort, builder_complexity, model)
         schema_json, schema_digest = canonical_result_schema(stage_result_schema(stage))
         timeout = os.environ.get("AGENTFLOW_SESSION_TIMEOUT")
         try:
