@@ -91,11 +91,15 @@ attempt, receipt, or attribution.
 
 Capability repair is deliberately narrower than enrollment. Claude destinations are copied only
 when every selected `.agents` source matches the manifest and every corresponding `.claude`
-destination is absent or already pinned. A pinned Playwright runtime is installed only when its
-provider-local `node_modules` destination is wholly absent. Launch materialization restores the
-screenshot harness only when it is absent or matches a manifest-listed known-old digest. Existing
-drift, symlinks, occupied runtimes, unknown harness bytes, invalid discovery receipts, and all other
-incompatible states remain human-owned refusals. Enrollment's per-root durable lock serializes
+destination is absent or already pinned — a fully intact installed runtime does not block that
+copy ([ADR 729](adr-729-receipt-repair-convergence.md)). A pinned Playwright runtime is installed
+only when its provider-local `node_modules` destination is wholly absent. Launch materialization
+restores the screenshot harness only when it is absent or matches a manifest-listed known-old
+digest. A missing or verbatim-stale native-discovery receipt is re-proven by the discovery probe
+as a tail step of the same repair call (ADR 729, superseding this paragraph's earlier blanket
+clause). Existing drift, symlinks, occupied runtimes, unknown harness bytes, unreadable receipts,
+and all other incompatible states remain human-owned refusals. Enrollment's per-root durable lock
+serializes
 writers. Failure rollback is limited to unchanged paths claimed by that attempt; content that
 appears or changes concurrently is preserved.
 

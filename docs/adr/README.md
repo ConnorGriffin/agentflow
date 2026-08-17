@@ -21,6 +21,11 @@ ADRs in that format.
 
 ## Index
 
+- [ADR 729](adr-729-receipt-repair-convergence.md) — Capability repair does every deterministic
+  repair it can and then proves discovery: missing and verbatim-stale native-discovery receipts
+  are re-proven in the same call, an intact installed runtime no longer blocks other repairs, and
+  `ready` in a repair log line is earned by a re-probe. Supersedes the never-rewritten receipt
+  clauses of ADR 582 and ADR 627.
 - [ADR 649](adr-649-owned-disposable-maintenance.md) — Temporary provider probes, explicit
   per-worktree Git metadata, dry-run-first JSONL maintenance, and same-run-coupled graph pruning.
 - [ADR 594](adr-594-builds-keep-origin-main-base.md) — Builds retain one hard-coded

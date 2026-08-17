@@ -78,6 +78,61 @@ def _ui_runtime_requirement():
     return (ContractRequirement("playwright", "1.61.1", runtime=True),)
 
 
+def _ui_skill_requirements():
+    """The real UI requirement chain: ui-craft → drive-local-webapp → pinned runtime."""
+    manifest = tomllib.loads(files("agentflow").joinpath("capabilities.toml").read_text())
+    specs = {item["id"]: item for item in manifest["capabilities"]}
+    return (
+        ContractRequirement("ui-craft", specs["ui-craft"]["version"]),
+        ContractRequirement("drive-local-webapp", specs["drive-local-webapp"]["version"]),
+        ContractRequirement("playwright", manifest["playwright"]["version"], runtime=True),
+    )
+
+
+def _stub_discovery_receipts(tmp_path, monkeypatch, *, probe_returncode=0):
+    """Point receipts at a private directory and script the provider probe deterministically."""
+    receipts = tmp_path / "receipts"
+    monkeypatch.setattr(
+        "agentflow.provider_skills._repository_key", lambda _root: ("repo-key", receipts)
+    )
+    monkeypatch.setattr(
+        "agentflow.provider_skills._provider_fingerprint",
+        lambda provider: (f"/providers/{provider}", f"{provider}-sha"),
+    )
+    probes = []
+
+    def probe(_root, provider):
+        probes.append(provider)
+        skill_event = f'{{"name":"Skill","input":{{"skill":"{NATIVE_DISCOVERY_SKILL}"}}}}\n'
+        proof = (skill_event if provider == "claude" else "") + NATIVE_DISCOVERY_MARKER
+        return SimpleNamespace(returncode=probe_returncode, stdout=proof, stderr="")
+
+    monkeypatch.setattr("agentflow.provider_skills._run_native_discovery_probe", probe)
+    return receipts, probes
+
+
+def _stub_runnable_node(monkeypatch):
+    """Answer the runtime contract's Node checks so a runtime verdict reflects the tree,
+    not whether this machine has Node on PATH."""
+    executable = shutil.which
+    monkeypatch.setattr(
+        "agentflow.capability_contracts.shutil.which",
+        lambda name: "/bin/node" if name == "node" else executable(name),
+    )
+    monkeypatch.setattr(
+        "agentflow.runtime_contracts._run_command",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout="v22.0.0\n"),
+    )
+
+
+def _stale_receipt(root, provider):
+    receipt = record_native_discovery_receipt(root, provider)
+    payload = json.loads(receipt.read_text())
+    payload["manifest_sha256"] = "stale"
+    receipt.write_text(json.dumps(payload))
+    return receipt
+
+
 def test_native_discovery_prompts_are_provider_and_mode_specific():
     claude = (
         f"Invoke the project-local skill named {NATIVE_DISCOVERY_SKILL} using only native "
@@ -437,6 +492,8 @@ def test_capability_repair_installs_an_absent_pinned_runtime(tmp_path, monkeypat
     import agentflow.enroll as enrollment
 
     root = _ready_ui_launch_source(tmp_path)
+    # Repair now proves discovery after the install, so the receipt seams are scripted.
+    _receipts, probes = _stub_discovery_receipts(tmp_path, monkeypatch)
     runtime = root / ".agents" / "skills" / "drive-local-webapp" / "node_modules"
     shutil.rmtree(runtime)
     installs = []
@@ -467,13 +524,9 @@ def test_capability_repair_materializes_claude_ui_skills_before_runtime(
     import agentflow.enroll as enrollment
 
     root = _ready_ui_launch_source(tmp_path)
-    manifest = tomllib.loads(files("agentflow").joinpath("capabilities.toml").read_text())
-    specs = {item["id"]: item for item in manifest["capabilities"]}
-    requirements = (
-        ContractRequirement("ui-craft", specs["ui-craft"]["version"]),
-        ContractRequirement("drive-local-webapp", specs["drive-local-webapp"]["version"]),
-        ContractRequirement("playwright", manifest["playwright"]["version"], runtime=True),
-    )
+    # Repair now proves discovery after the materialization, so the receipt seams are scripted.
+    _receipts, probes = _stub_discovery_receipts(tmp_path, monkeypatch)
+    requirements = _ui_skill_requirements()
     installs = []
 
     def install(selected_root, *, provider=None):
@@ -631,6 +684,143 @@ def test_capability_repair_refuses_an_unreadable_native_discovery_receipt(
     assert result is None
     assert not probes
     assert receipt.read_text() == "operator-authored receipt\n"
+
+
+def _runtime_intact_claude_root(tmp_path):
+    """A Claude UI root whose drive skill and runtime are installed and fully intact."""
+    root = _ready_ui_launch_source(tmp_path)
+    destination = root / ".claude" / "skills" / "drive-local-webapp"
+    shutil.copytree(
+        root / ".agents" / "skills" / "drive-local-webapp", destination, symlinks=True
+    )
+    return root
+
+
+@pytest.mark.parametrize("receipt_state", ("valid", "stale"))
+def test_capability_repair_materializes_a_destination_the_intact_runtime_used_to_swallow(
+    tmp_path, monkeypatch, receipt_state
+):
+    import agentflow.enroll as enrollment
+
+    root = _runtime_intact_claude_root(tmp_path)
+    _receipts, probes = _stub_discovery_receipts(tmp_path, monkeypatch)
+    _stub_runnable_node(monkeypatch)
+    if receipt_state == "valid":
+        record_native_discovery_receipt(root, "claude")
+    else:
+        _stale_receipt(root, "claude")
+    monkeypatch.setattr(
+        enrollment, "_install_ui_runtime",
+        lambda *_args, **_kwargs: pytest.fail("an intact runtime must not be reinstalled"),
+    )
+
+    result = repair_capability_refusal(root, "claude", _ui_skill_requirements())
+
+    assert result is not None and result.repaired
+    assert "Claude" in result.detail and "Playwright" not in result.detail
+    assert (root / ".claude" / "skills" / "ui-craft" / "SKILL.md").is_file()
+    if receipt_state == "valid":
+        assert probes == []
+    else:
+        assert probes == ["claude"]
+        assert "native-discovery receipt" in result.detail
+    from agentflow.provider_skills import native_discovery_status
+
+    assert native_discovery_status(root, "claude")[0] == "ok"
+
+
+@pytest.mark.parametrize("receipt_state", ("stale", "missing"))
+def test_capability_repair_reproves_the_receipt_on_a_runtime_intact_root(
+    tmp_path, monkeypatch, receipt_state
+):
+    root = _ready_ui_launch_source(tmp_path)
+    _receipts, probes = _stub_discovery_receipts(tmp_path, monkeypatch)
+    _stub_runnable_node(monkeypatch)
+    if receipt_state == "stale":
+        _stale_receipt(root, "codex")
+
+    result = repair_capability_refusal(root, "codex", _ui_skill_requirements())
+
+    assert result is not None and result.repaired
+    assert "native-discovery receipt" in result.detail
+    assert probes == ["codex"]
+    from agentflow.provider_skills import native_discovery_status
+
+    assert native_discovery_status(root, "codex")[0] == "ok"
+
+
+@pytest.mark.parametrize("runtime_fault", ("symlinked", "partial"))
+def test_capability_repair_refuses_a_stale_receipt_on_an_occupied_runtime(
+    tmp_path, monkeypatch, runtime_fault
+):
+    root = _ready_ui_launch_source(tmp_path)
+    _receipts, probes = _stub_discovery_receipts(tmp_path, monkeypatch)
+    _stub_runnable_node(monkeypatch)
+    runtime = root / ".agents" / "skills" / "drive-local-webapp" / "node_modules"
+    if runtime_fault == "symlinked":
+        operator_runtime = tmp_path / "operator-runtime"
+        shutil.move(runtime, operator_runtime)
+        runtime.symlink_to(operator_runtime, target_is_directory=True)
+    else:
+        (runtime / ".bin" / "playwright").unlink()
+    package = runtime / "playwright" / "package.json"
+    before = package.read_bytes()
+    _stale_receipt(root, "codex")
+
+    result = repair_capability_refusal(root, "codex", _ui_skill_requirements())
+
+    assert result is None
+    assert probes == []
+    assert package.read_bytes() == before
+    assert runtime.is_symlink() is (runtime_fault == "symlinked")
+    if runtime_fault == "partial":
+        assert not (runtime / ".bin" / "playwright").exists()
+
+    # Positive control: under identical stubs an intact sibling root does repair, so the
+    # refusal above is attributable to the runtime fault, not to an absent Node.
+    sibling = _ready_ui_launch_source(tmp_path / "sibling")
+    control = repair_capability_refusal(sibling, "codex", _ui_skill_requirements())
+    assert control is not None and control.repaired
+    assert probes == ["codex"]
+
+
+def test_capability_repair_refuses_an_unreadable_receipt_on_a_runtime_intact_root(
+    tmp_path, monkeypatch
+):
+    root = _ready_ui_launch_source(tmp_path)
+    _receipts, probes = _stub_discovery_receipts(tmp_path, monkeypatch)
+    _stub_runnable_node(monkeypatch)
+    receipt = record_native_discovery_receipt(root, "codex")
+    receipt.write_text("operator-authored receipt\n")
+
+    result = repair_capability_refusal(root, "codex", _ui_skill_requirements())
+
+    assert result is None
+    assert probes == []
+    assert receipt.read_text() == "operator-authored receipt\n"
+
+
+def test_failed_probe_after_materialization_reports_failure_without_rollback(
+    tmp_path, monkeypatch
+):
+    import agentflow.enroll as enrollment
+
+    root = _runtime_intact_claude_root(tmp_path)
+    _receipts, probes = _stub_discovery_receipts(tmp_path, monkeypatch, probe_returncode=1)
+    _stub_runnable_node(monkeypatch)
+    _stale_receipt(root, "claude")
+    monkeypatch.setattr(
+        enrollment, "_install_ui_runtime",
+        lambda *_args, **_kwargs: pytest.fail("an intact runtime must not be reinstalled"),
+    )
+
+    result = repair_capability_refusal(root, "claude", _ui_skill_requirements())
+
+    assert result is not None and not result.repaired
+    assert "materialized absent pinned capability destinations for Claude" in result.detail
+    assert "did not prove native project skill discovery" in result.detail
+    assert probes == ["claude"]
+    assert (root / ".claude" / "skills" / "ui-craft" / "SKILL.md").is_file()
 
 
 @pytest.mark.parametrize("destination_kind", ("drifted", "symlinked"))
@@ -1122,8 +1312,9 @@ def test_launch_materialization_refreshes_a_known_old_pinned_harness(tmp_path):
     ).read_bytes()
     assert lines == [
         f"capability repair root={destination} requirements=screenshot-harness; "
-        "outcome=ready — materialized missing codex capabilities into the launch root"
+        "outcome=materialized — copied missing codex capabilities into the launch root"
     ]
+    assert all("ready" not in line for line in lines)
 
 
 @pytest.mark.parametrize("harness_kind", ("unknown", "symlinked"))

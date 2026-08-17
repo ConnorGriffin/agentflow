@@ -714,6 +714,8 @@ def materialize_launch_capabilities(
         tree_status, detail = runtime_tree_status(destination_runtime)
         if tree_status != "ok":
             return failed(f"{provider} copied Playwright runtime is incompatible: {detail}")
+    # The audit line reports only what was copied: readiness belongs to the preflight that
+    # runs against the launch root afterward, which this function never observes.
     detail = f"materialized missing {provider} capabilities into the launch root"
-    audit("ready", detail)
+    audit("materialized", f"copied missing {provider} capabilities into the launch root")
     return True, detail
