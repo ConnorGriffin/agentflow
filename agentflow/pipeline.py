@@ -847,6 +847,10 @@ def _open_revise_on_blocking_review(coord: Coordinator, review_identity: str) ->
             if review.review_passes + 1 >= 3:
                 coord.park_completed(review_identity)
                 return
+            # Tell the watching operator the chain is alive before the private handoff goes
+            # quiet (#737). Best-effort on purpose: the durable envelope posts at most once,
+            # and an unreadable comment thread must never stall the successor review.
+            coordinated_review.post_repair_notice(review, verdict)
             successor = coordinated_review.review_successor_submission(review, verdict)
             if successor is not None:
                 coord.submit_stage(successor)

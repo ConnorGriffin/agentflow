@@ -79,6 +79,20 @@ def test_unavailable_ui_verification_cannot_settle_a_pass():
     assert result.parsed is True and result.clean is False
 
 
+def test_every_agentflow_pr_comment_carries_the_authorship_mark(monkeypatch):
+    """The PR-comment boundary is the guard against our own notice becoming a maintainer reply.
+    Any new caller without the marker fails before GitHub receives an unreadable comment (#737)."""
+    from agentflow import github
+    from agentflow.gate import PR_MARK
+
+    monkeypatch.setattr(github, "_gh", lambda *_args, **_kwargs: type("Result", (), {
+        "returncode": 0})())
+    with pytest.raises(ValueError, match="PR_MARK"):
+        github.pr_comment("o/r", 7, "A bare progress note")
+
+    assert github.pr_comment("o/r", 7, f"> *{PR_MARK} progress.*")
+
+
 def test_follow_up_proposal_is_zero_or_one_and_required_exactly_for_its_finding():
     base = {
         "verdict": "PASS", "depth": "targeted", "depth_reason": "one journey",
@@ -532,7 +546,7 @@ def test_reviewed_reviewer_fix_uses_immediate_same_tool_fallback_without_forced_
 
 
 def test_reviewer_fix_waits_for_capacity_but_third_mutating_pass_parks(monkeypatch):
-    from agentflow import coordinated_review, pipeline, pr_park
+    from agentflow import coordinated_review, github, pipeline, pr_park
     from agentflow.coordinator.record import Record
     from agentflow.reviewer import Verdict
 
@@ -548,6 +562,13 @@ def test_reviewer_fix_waits_for_capacity_but_third_mutating_pass_parks(monkeypat
     monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [record])
     monkeypatch.setattr(coordinated_review, "_review_verdict", lambda _record: verdict)
     monkeypatch.setattr(coordinated_review, "pick_reviewer", lambda *args, **kwargs: None)
+    posted = []
+    monkeypatch.setattr(github, "pr_comments",
+                        lambda _repo, _pr: [github.Comment(body=body, created_at="")
+                                            for body in posted])
+    monkeypatch.setattr(github, "pr_comment",
+                        lambda _repo, _pr, body: bool(posted.append(body)) or True)
+    monkeypatch.setattr("agentflow.notify.notify", lambda *_args, **_kwargs: True)
     events = []
     coord = SimpleNamespace(
         submit_stage=lambda submission: events.append("submit"),
@@ -555,10 +576,14 @@ def test_reviewer_fix_waits_for_capacity_but_third_mutating_pass_parks(monkeypat
 
     pipeline._open_revise_on_blocking_review(coord, record.identity)
     assert events == []
+    # The repair-pushing pass told the watching operator the chain is alive (#737).
+    assert len(posted) == 1 and "pushed repairs" in posted[0]
 
     record.review_passes = 2
     pipeline._open_revise_on_blocking_review(coord, record.identity)
     assert events == ["park"]
+    # The parked third pass hands to a human; no alive notice is stacked on the park.
+    assert len(posted) == 1
 
 
 def test_full_product_pass_opens_a_separate_read_only_standards_pass():
@@ -1264,6 +1289,104 @@ def test_a_park_counts_any_stored_parsed_verdict_including_prior_push_provenance
     assert "1 review pass recorded a verdict" in body
     assert "No review verdict was recorded for this exact head" not in body
     assert "the review executions failed" not in body
+
+
+def test_a_clock_killed_review_parks_naming_the_wall_clock_not_a_flat_failure(monkeypatch):
+    """A review the 45-minute wall killed three times used to park with the same flat sentence as
+    every other dead execution. The park now names the clock (#737)."""
+    record = _chain_record(
+        "clock", sequence=0, created=100, axis="combined", held=True,
+        hold_reason="continuation budget exhausted — the last attempt was cut off at its "
+                    "wall-clock ceiling")
+
+    body = _park_body(monkeypatch, record)
+
+    assert "cut off at its 45-minute wall-clock limit having produced nothing" in body
+    assert "the review executions failed rather than judging the change" not in body
+    assert "`/agentflow review 479`" in body
+
+
+def test_a_refused_verdict_park_names_the_refusal_and_never_claims_nothing_judged(monkeypatch):
+    """A verdict refused for listing no proof of what it checked made the park headline claim
+    nothing judged the change while the line beneath it named the refused verdict (#737)."""
+    record = _chain_record(
+        "refused", sequence=0, created=100, axis="combined", held=True,
+        hold_reason="continuation budget exhausted — last unverified check: verdict-parse: "
+                    "review checks are missing")
+    record.verify_miss = "verdict-parse: review checks are missing"
+
+    body = _park_body(monkeypatch, record)
+
+    assert "refused for naming no proof of what it checked" in body
+    assert "the review executions failed" not in body
+    assert "nothing has judged this change yet" not in body
+    assert "the review this change never got" not in body
+    assert "Last unverified check: verdict-parse: review checks are missing" in body
+
+
+def test_empty_reviewer_output_after_three_crashes_never_invents_a_refused_verdict(monkeypatch):
+    """Three crashed attempts leave the finalizer's empty-output parse miss, not evidence that
+    any attempt returned a verdict. The park retains the generic no-verdict ending (#737)."""
+    from agentflow import pipeline
+    from agentflow.pr_park import verdict_refused
+
+    record = _chain_record(
+        "crashed", sequence=0, created=100, axis="combined", held=True,
+        hold_reason="continuation budget exhausted — last unverified check: verdict-parse: "
+                    "empty reviewer output")
+    record.attempts = 3
+    record.verify_miss = "verdict-parse: empty reviewer output"
+    monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [record])
+
+    body = _park_body(monkeypatch, record)
+
+    assert not verdict_refused(record)
+    assert "the review executions failed rather than judging the change" in body
+    assert "returned a verdict" not in body
+    assert "the change was looked at" not in body
+
+
+def test_a_repair_pushing_pass_posts_one_alive_notice_and_never_a_second(monkeypatch):
+    """A repair-pushing pass hands off privately, so from the PR a working chain looked identical
+    to a dead session. It now posts one short alive notice — once: a repeat cycle observes the
+    existing comment and does not post again, and the notice is not a verdict (#737)."""
+    from types import SimpleNamespace
+
+    from agentflow import coordinated_review, github
+
+    record = _chain_record("push", sequence=1, created=100, axis="combined")
+    verdict = SimpleNamespace(pushed_sha="33549ff7bae01970c38b14711da5b38117c9f6872")
+    posted = []
+    monkeypatch.setattr(github, "pr_comments",
+                        lambda _repo, _pr: [github.Comment(body=body, created_at="")
+                                            for body in posted])
+    monkeypatch.setattr(github, "pr_comment",
+                        lambda _repo, _pr, body: bool(posted.append(body)) or True)
+    monkeypatch.setattr("agentflow.notify.notify", lambda *_args, **_kwargs: True)
+
+    assert coordinated_review.post_repair_notice(record, verdict) is not None
+    assert len(posted) == 1
+    assert "pushed repairs" in posted[0]
+    assert "not a verdict" in posted[0]
+    from agentflow.gate import MergeDecision, PR_MARK, decide_merge, reply_pending
+    from agentflow.reviewer import Verdict
+
+    comments = [{"body": posted[0]}]
+    assert PR_MARK in posted[0]
+    assert not reply_pending(comments)
+    assert decide_merge(
+        verdict=Verdict(clean=True, reviewer_tool="codex", change_author_tool="claude"),
+        ci_green=True, reviewer_tool="codex", builder_tool="claude", revises_used=0,
+        ui_evidence_missing=False, reply_pending=reply_pending(comments)) is MergeDecision.MERGE
+
+    # A repeat cycle or crash resume proves the existing comment instead of posting a second.
+    assert coordinated_review.post_repair_notice(record, verdict) is not None
+    assert len(posted) == 1
+
+    # A pass that pushed nothing stays silent.
+    assert coordinated_review.post_repair_notice(
+        record, SimpleNamespace(pushed_sha="")) is None
+    assert len(posted) == 1
 
 
 @pytest.mark.parametrize("hold_reason,cause,remedy", [

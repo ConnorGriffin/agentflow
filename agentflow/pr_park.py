@@ -158,14 +158,28 @@ def _recorded_review_passes(record) -> int:
     return record.review_passes + int(own_verdict)
 
 
+def verdict_refused(record) -> bool:
+    """Whether the last attempt returned a verdict that verification refused to record (#737).
+
+    ``verify_miss`` durably names the first failed verification conjunct. Only a parse miss with
+    a non-empty payload proves the session returned a final answer; an empty reviewer output is a
+    dead execution and must reach the generic ending rather than inventing a verdict (#737).
+    """
+    return (getattr(record, "verify_miss", "").startswith("verdict-parse")
+            and "empty reviewer output" not in getattr(record, "verify_miss", ""))
+
+
 def review_park_missing(record) -> str:
     """What a parked review tells the maintainer from its durable outcome and hold facts.
 
     The missing-outcome cause keeps its established precedence: a never-started session, then a
-    turn-capped session, then the generic failure. Once the ledger proves an earlier pass or this
-    record's stored outcome parses to a verdict, unsupported claims that nobody judged the change
-    are replaced by the count those durable facts prove. Pure (test surface, #501)."""
-    from agentflow.coordinator.coordinator import ended_at_turn_cap, refused_before_start
+    turn-capped session, then a wall-clock-killed session, then a refused verdict, then the
+    generic failure. Once the ledger proves an earlier pass or this record's stored outcome
+    parses to a verdict, unsupported claims that nobody judged the change are replaced by the
+    count those durable facts prove. Pure (test surface, #501)."""
+    from agentflow.coordinator.coordinator import (ended_at_turn_cap, ended_at_wall_clock,
+                                                   refused_before_start)
+    from agentflow.coordinator.profiles import profile_for
     hold_reason = getattr(record, "hold_reason", None)
     passes = _recorded_review_passes(record)
     noun = "pass" if passes == 1 else "passes"
@@ -194,6 +208,26 @@ def review_park_missing(record) -> str:
         return ("No review verdict was recorded for this exact head: the last review session was "
                 "cut off at its per-stage turn ceiling before it could reach one — it was stopped "
                 "mid-review, not left short of an answer. Do not treat this as a clean review.")
+    if ended_at_wall_clock(hold_reason):
+        wall_minutes = profile_for(record).wall_ceiling_s // 60
+        if passes:
+            return (f"The last review session was cut off at its {wall_minutes}-minute wall-clock limit "
+                    f"having produced nothing — it went silent, not judged the change. "
+                    f"{pass_sentence} Do not treat this as a clean review.")
+        return ("No review verdict was recorded for this exact head: the last review session was "
+                f"cut off at its {wall_minutes}-minute wall-clock limit having produced nothing — it went "
+                "silent and the clock killed it, so nothing here judged the change or cleared "
+                "it. Do not treat this as a clean review.")
+    if verdict_refused(record):
+        why = ("for naming no proof of what it checked"
+               if "review checks are missing" in getattr(record, "verify_miss", "")
+               else "because it could not be verified against the reviewed head")
+        if passes:
+            return (f"The last review session returned a verdict, but it was refused {why}, so "
+                    f"it was not recorded. {pass_sentence} Do not treat this as a clean review.")
+        return ("No usable review verdict was recorded for this exact head: the last review "
+                f"session returned one, but it was refused {why} — the change was looked at; "
+                "the judgment could not be trusted. Do not treat this as a clean review.")
     if passes:
         return f"{pass_sentence} Do not treat this as a clean review."
     return ("No review verdict was recorded for this exact head: the review executions failed "
@@ -290,12 +324,22 @@ def park_pr(record) -> str | None:
         # The options, consequences and recommendation follow the same rule that line does:
         # nothing may name an uncertainty this park deliberately does not have, or an option it
         # does not offer (#344).
+        refused = verdict_refused(record)
         wording = pass_wording or ParkCopy(
             options=(f"Resume the review on this exact head: `/agentflow review {pr}`.",
                      "Review the retained change by hand and decide this PR yourself."),
-            consequences=("Resuming runs the review this change never got; judging it by hand "
-                          "leaves this head with no agentflow review at all."),
-            recommendation="Resume the review — nothing has judged this change yet.",
+            consequences=(
+                # A refused verdict was still a review that ran and judged; claiming the change
+                # "never got" one would contradict the refused verdict named right above (#737).
+                "Resuming seeks a verdict that can actually be recorded; judging it by hand "
+                "keeps the refused verdict as evidence without treating it as a clean review."
+                if refused else
+                "Resuming runs the review this change never got; judging it by hand "
+                "leaves this head with no agentflow review at all."),
+            recommendation=("Resume the review — its judgment was refused, so no recorded "
+                            "verdict covers this change yet."
+                            if refused else
+                            "Resume the review — nothing has judged this change yet."),
             next_action=f"Run `/agentflow review {pr}` to resume the review at this exact head.")
         notice = "review parked for your action"
     elif record.conflict_round:

@@ -16,6 +16,25 @@ Keep it free of ``{`` / ``}`` — the prompts that carry it are ``str.format``-r
 unescaped brace here would break every render.
 """
 
+# How a session independently verifies a user-facing change by actually running the app (#737).
+# Codex's launcher adds its narrow browser-escalation recovery; Claude's strict sandbox exposes no
+# equivalent. State both contracts in the review prompt so a reviewer never pretends it can recover
+# on Claude or reports an unavailable browser without the evidence settlement needs. Same brace
+# constraint as the harness above: the prompts carrying it are format-rendered.
+UI_VERIFICATION_PROCEDURE = (
+    "When the change touches a declared user-facing surface, verify it by running the app "
+    "yourself, headless — the same procedure a build follows. Boot the app locally, then drive it "
+    "with the shared drive-local-webapp driver to load the affected screens and exercise the "
+    "changed behavior. When that driver prints HEADLESS-SANDBOX-BLOCKED, the sandbox blocked the "
+    "browser, not the change. On Codex, use the Codex-only browser recovery supplied by your "
+    "launcher and continue; keep the app server and every other command inside the workspace "
+    "sandbox. On Claude, the strict launcher provides no sandbox-escalation mechanism, so do not "
+    "claim a "
+    "recovery exists: report ui_verification as unavailable, including the exact command and "
+    "HEADLESS-SANDBOX-BLOCKED in checks. Never substitute a written explanation for actually "
+    "running the app."
+)
+
 SCREENSHOT_HARNESS = (
     "Capture them with the canonical harness: `node scripts/screenshots.mjs <config.json>` — "
     "write a small per-issue config (url, theme, out per shot) and run the script. If this repo "

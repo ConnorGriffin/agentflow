@@ -890,8 +890,17 @@ def comment(repo: str, issue: int, body: str) -> bool:
                 "--body", body]).returncode == 0
 
 
+PR_MARK = "agentflow:"
+
+
 def pr_comment(repo: str, pr: int, body: str) -> bool:
-    """Post a comment on the PR. Returns whether the command succeeded."""
+    """Post an agentflow-authored comment on a PR.
+
+    The merge and Respond gates distinguish our notices from maintainer questions through this
+    marker.  Enforce it at the one write boundary so a future caller cannot park its own PR.
+    """
+    if PR_MARK not in body:
+        raise ValueError("agentflow PR comments must carry PR_MARK")
     return _gh(["pr", "comment", str(pr), "--repo", repo,
                 "--body", body]).returncode == 0
 

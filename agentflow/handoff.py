@@ -75,8 +75,7 @@ def marked_body(body: str, marker: str) -> str:
     record's hold would then read the first record's comment as proof of its own and go silent —
     the collision this marker exists to prevent. So the marker goes after the first paragraph, or
     failing that after the first line. A body that is a single line has nowhere to hide it and
-    falls back to appending; nothing composes one today, and the legacy matching this protects is
-    itself transitional.
+    falls back to appending. The legacy matching this protects is itself transitional.
     """
     head, separator, tail = body.partition("\n\n")
     if separator:

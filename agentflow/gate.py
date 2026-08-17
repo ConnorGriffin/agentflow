@@ -108,7 +108,7 @@ def conflict_revises_used(records, repo, subject) -> list:
 # marker in its disclaimer, so we can tell our own comments from the maintainer's — the
 # same discipline intake uses on issues (INTAKE_MARK). The bot posts as the maintainer,
 # so we key on the marker, not authorship.
-PR_MARK = "agentflow:"
+PR_MARK = github.PR_MARK
 # The park handoff's own visible disclaimer. It is the durable dedup key for the current park
 # comment, and — because a maintainer replies underneath the question they are answering — the
 # signal that a following reply is that park's decision rather than PR discussion (#344).

@@ -141,6 +141,18 @@ def ended_at_turn_cap(hold_reason: str | None) -> bool:
     return TURN_CAP_HOLD_CLAUSE in (hold_reason or "")
 
 
+# The sibling clause for the other clock-class ceiling (#737): the supervisor's wall-clock
+# deadline killed the last attempt before it produced anything. The daemon log already named
+# which ceiling stopped a session; this stamps the same distinction onto the durable record so
+# a park can say "cut off at the clock" instead of the flat executions-failed sentence.
+WALL_CLOCK_HOLD_CLAUSE = " — the last attempt was cut off at its wall-clock ceiling"
+
+
+def ended_at_wall_clock(hold_reason: str | None) -> bool:
+    """Whether a durable hold reason records the wall clock as what stopped its last attempt."""
+    return WALL_CLOCK_HOLD_CLAUSE in (hold_reason or "")
+
+
 def _cut_off_at_turn_cap(obs) -> bool:
     """Whether an observation says the per-stage turn cap is what stopped this attempt."""
     return getattr(obs, "ending_reason", EndingReason.UNSPECIFIED) is EndingReason.TURN_CAP
@@ -1535,8 +1547,11 @@ class Coordinator:
         prompt (issue #225). At the budget the stage holds for a human, exactly as an exhausted
         continuation always has."""
         if record.attempts >= ATTEMPT_BUDGET:
+            ceiling_clause = (TURN_CAP_HOLD_CLAUSE if _cut_off_at_turn_cap(obs)
+                              else WALL_CLOCK_HOLD_CLAUSE
+                              if obs.cause is ProviderCause.TIMEOUT else "")
             record.hold_reason = ("continuation budget exhausted"
-                                  + (TURN_CAP_HOLD_CLAUSE if _cut_off_at_turn_cap(obs) else "")
+                                  + ceiling_clause
                                   + (f" — last unverified check: {record.verify_miss}"
                                      if record.verify_miss else ""))
             if not self._hold(record):

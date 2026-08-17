@@ -43,7 +43,7 @@ from agentflow.review_policy import (
     Uncertainty,
     parse_review_result,
 )
-from agentflow.screenshot_crib import SCREENSHOT_HARNESS
+from agentflow.screenshot_crib import SCREENSHOT_HARNESS, UI_VERIFICATION_PROCEDURE
 from agentflow.shell_crib import SHELL_CRIB
 from agentflow.stage_result_contracts import REVIEW_VERDICT_SCHEMA
 from agentflow.worktree_ref import WorktreeRef
@@ -237,6 +237,8 @@ individually named cause, never wholesale because the set matches `main`. A loca
 to read is unusable evidence: say so, and lean on the PR's own checks instead of reasoning
 around the noise.
 
+""" + UI_VERIFICATION_PROCEDURE + """
+
 You own bounded cleanup in this review; do not merely report work you can safely finish:
 - Fix every clear in-scope correctness, security, acceptance, or charter issue yourself.
 - Fix grounded stale helpers, broken evidence, misleading prose, and naming/style defects when they
@@ -324,9 +326,11 @@ schema natively, so you do not hand-write or fence the JSON; just produce these 
 - "checks": exact proof/checks you completed
 - "ui_verification": "not_required" when the PR changes no declared user-facing surface,
   "passed" only after you ran the required UI verification, or "unavailable" when the browser
-  verification could not run. If it is unavailable after the prescribed recovery, return `BLOCK`
-  and record the exact failed command and environment cause in "checks"; never replace UI proof
-  with an explanation.
+  verification could not run. On Codex, first apply the Codex-only recovery supplied by the
+  launcher; on Claude, `HEADLESS-SANDBOX-BLOCKED` has no escalation recovery, so `unavailable` is
+  the honest answer. In either case return `BLOCK` and record the exact failed command and
+  environment cause in "checks"; a Claude unavailable result must include
+  `HEADLESS-SANDBOX-BLOCKED`. Never replace UI proof with an explanation.
 - "follow_ups": zero or one necessary follow-up proposal as {{"evidence", "desired_outcome"}}.
   Supply exactly one when a `necessary_follow_up` finding is present, otherwise supply none.
 - "findings": unresolved/discarded observations as {{"action", "file", "line", "summary",

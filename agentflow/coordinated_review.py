@@ -949,6 +949,12 @@ ACTION_REQUIRED_REASON = "has a check on its reviewed head that is asking for a 
 PENDING_CHECK_REASON = "has a required check on its reviewed head that is still pending"
 UI_VERIFICATION_UNAVAILABLE_REASON = "could not run the required UI verification"
 UI_VERIFICATION_UNKNOWN_REASON = "could not determine whether UI verification was required"
+# Distinct from the generic UNAVAILABLE reason above: this names the specific, evidenced cause —
+# the reviewing tool itself has no browser-escalation mechanism — rather than an unexplained
+# execution failure a maintainer might mistake for something repairable (#737).
+UI_VERIFICATION_NO_ESCALATION_REASON = (
+    "could not run the required UI verification because the reviewing tool has no "
+    "browser-escalation mechanism")
 
 
 def _red_check_lines(checks) -> tuple[str, ...]:
@@ -1043,6 +1049,39 @@ def _park_review_settlement(record, verdict, workdir: str, pr: int,
     return url
 
 
+def post_repair_notice(record, verdict) -> str | None:
+    """One short public note that this review pass pushed repairs and a verdict is still coming.
+
+    A repair-pushing pass hands its work to the next pass privately, so from the PR a working
+    chain and a dead session used to look identical — repairs appear and no comment ever follows
+    (#737). This line tells a watching operator the chain is alive. It settles nothing and is not
+    a verdict; the chain still speaks its real verdict only at the end. Posted through the shared
+    post-once-then-notify envelope (ADR 0042) keyed on this pass and its pushed head, so a repeat
+    cycle or a crash resume observes the existing comment and never posts a second.
+    """
+    from agentflow.gate import PR_MARK
+    from agentflow.handoff import (DurableHandoff, Notification, Subject, marked_body,
+                                   proof_marker)
+
+    facts = review_source_facts(record)
+    if facts is None or not verdict.pushed_sha:
+        return None
+    _workdir, pr = facts
+    marker = proof_marker(record.identity, f"repairs-pushed:{verdict.pushed_sha}",
+                          tag="review-repairs")
+    body = marked_body(
+        f"> *{PR_MARK} review progress.*\n\n"
+        "The independent review pushed repairs to this pull request's branch. This is progress, "
+        "not a verdict — the review chain posts its verdict when it finishes.", marker)
+    return DurableHandoff().hand_off(
+        Subject(repo=record.repo, number=pr, kind="pr"),
+        identity=record.identity, stage="review-repairs", marker=marker,
+        action=lambda: github.pr_comment(record.repo, pr, body),
+        notification=Notification(
+            "agentflow progress",
+            f"{record.repo} PR #{pr}: review pushed repairs; verdict still coming"))
+
+
 def _settle_review(record) -> str | None:
     """Consume a parsed exact-head verdict through the established repository merge policy."""
     from agentflow import ratchet
@@ -1111,11 +1150,24 @@ def _settle_review(record) -> str | None:
             autonomous=autonomous, checks=verdict.checks,
             missing="The pipeline could not determine whether the reviewed change requires UI "
                     "verification.")
+    claude_no_escalation = (
+        record.pool == "claude"
+        and ui_verification_needed
+        and verdict.ui_verification.value == "unavailable"
+        and "HEADLESS-SANDBOX-BLOCKED" in "\n".join(verdict.checks))
     if not ui_gap and verdict.ui_verification.value == "unavailable":
+        # Claude's launcher exposes no browser-escalation mechanism, so an evidenced blocked
+        # driver there names that tool limitation instead of the generic unavailable-verification
+        # reason — but it still parks: an unavailable UI verification can never settle clean
+        # (parser invariant, agentflow/review_policy.py), and a maintainer decides from here (#737).
+        reason = (UI_VERIFICATION_NO_ESCALATION_REASON if claude_no_escalation
+                 else UI_VERIFICATION_UNAVAILABLE_REASON)
+        missing = ("The reviewing tool has no browser-escalation mechanism, so the required UI "
+                  "verification could not run." if claude_no_escalation else
+                  "The reviewer could not execute the required UI verification.")
         return _park_review_settlement(
-            record, verdict, workdir, pr, reason=UI_VERIFICATION_UNAVAILABLE_REASON,
-            autonomous=autonomous, checks=verdict.checks,
-            missing="The reviewer could not execute the required UI verification.")
+            record, verdict, workdir, pr, reason=reason,
+            autonomous=autonomous, checks=verdict.checks, missing=missing)
     if ui_verification_needed and verdict.ui_verification.value != "passed":
         return _park_review_settlement(
             record, verdict, workdir, pr,

@@ -501,6 +501,41 @@ def test_unattended_stage_submissions_offer_narrow_codex_browser_recovery_only(t
         assert "sandbox_permissions" not in claude[claude.index("-p") + 1]
 
 
+def test_review_sessions_on_both_tools_carry_the_browser_recovery_exactly_once(tmp_path):
+    """The blocked-browser recovery used to be attached only by the Codex launcher, so a Claude
+    review was asked to report UI verification without ever being taught the procedure or the
+    "prescribed recovery" its instructions referenced (#737). The review prompt now carries the
+    procedure itself — reaching both tools — and the Codex launcher does not stack its own copy
+    on top."""
+    from agentflow.coordinator.providers import ClaudeProviderAdapter, CodexProviderAdapter
+    from agentflow.coordinator.record import Record
+    from agentflow.reviewer import REVIEW_PROMPT
+
+    prompt = REVIEW_PROMPT.format(
+        pr=7, issue=3, starting_sha="abc123", acceptance="works",
+        surfaces="`frontend/`")
+    # Codex can request the narrow escalation; Claude's strict launcher has no equivalent and
+    # is explicitly instructed to return an evidenced unavailable result instead of bluffing.
+    assert "On Claude, the strict launcher provides no sandbox-escalation mechanism" in prompt
+    assert "a Claude unavailable result must include" in prompt
+
+    repo = _repo_with_origin(tmp_path)
+    codex = CodexProviderAdapter().command(Record(
+        "codex-review", "review", "codex", 1,
+        model="terra", source=str(repo), input_ptr=prompt))
+    claude = ClaudeProviderAdapter().command(Record(
+        "claude-review", "review", "claude", 1,
+        model="sonnet", source=str(repo), input_ptr=prompt))
+
+    codex_prompt = codex[-1]
+    claude_prompt = claude[claude.index("-p") + 1]
+    for launched in (codex_prompt, claude_prompt):
+        assert launched.count("When that driver prints HEADLESS-SANDBOX-BLOCKED") == 1
+        assert "On Claude, the strict launcher provides no sandbox-escalation mechanism" in launched
+    assert "sandbox_permissions=require_escalated" in codex_prompt
+    assert "sandbox_permissions=require_escalated" not in claude_prompt
+
+
 def test_codex_account_fact_uses_typed_limit_windows(monkeypatch):
     monkeypatch.setenv("AGENTFLOW_CAPACITY_HELPER", "/test/capacity-helper")
     payload = json.dumps({

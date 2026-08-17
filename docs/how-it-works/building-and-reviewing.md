@@ -92,7 +92,7 @@ ceiling, a turn ceiling, a reasoning-effort rung, and a tool allowlist
 ([ADR 0044](https://github.com/ConnorGriffin/agentflow/blob/main/docs/adr/0044-stage-session-profiles-and-ceilings.md)).
 Read-only stages — intake, research, attack — get read and search tools only, with edit
 tools mechanically withheld rather than merely discouraged. Intake runs 20 minutes and
-80 turns; review 30 minutes and 120; mockup 60 minutes and 200. Review deliberately keeps
+80 turns; review 45 minutes and 120; mockup 60 minutes and 200. Review deliberately keeps
 the full edit surface, because its contract includes shipping bounded fixes.
 
 ### The progress lease
