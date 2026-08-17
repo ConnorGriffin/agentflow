@@ -138,13 +138,6 @@ def _receipt_path(root: Path, provider: str) -> tuple[str, Path]:
     return repository, directory / f"{provider}.json"
 
 
-def clear_native_discovery_receipt(root: str | Path, provider: str) -> None:
-    """Invalidate an earlier proof before a fresh positive probe runs."""
-    _repository, path = _receipt_path(Path(root), provider)
-    if path.is_file() and not path.is_symlink():
-        path.unlink()
-
-
 def record_native_discovery_receipt(root: str | Path, provider: str) -> Path:
     """Record a receipt only after the caller has validated the native positive probe output."""
     checkout = Path(root)
