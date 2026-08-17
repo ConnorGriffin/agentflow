@@ -243,6 +243,17 @@ def test_thin_extension_fixture_runs_end_to_end(tmp_path):
 
     assert result.returncode == 0, f"thin extension run failed:\n{output}"
     assert (tmp_path / "ext.png").exists()
+    # The whole point of the seam: the repo-local behavior ran without the pinned file moving.
+    import hashlib
+    import tomllib
+
+    manifest = tomllib.loads(
+        (Path(__file__).parent.parent / "agentflow" / "capabilities.toml").read_text())
+    spec = next(item for item in manifest["capabilities"] if item["id"] == "screenshot-harness")
+    assert hashlib.sha256(SCRIPT.read_bytes()).hexdigest() == spec["sha256"], (
+        "the extension run required editing the pinned harness — the seam has regressed to "
+        "the fork-or-brick choice #735 removed."
+    )
 
 
 def test_importing_the_module_does_not_run_the_cli():

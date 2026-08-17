@@ -306,3 +306,30 @@ def test_build_prompt_names_the_repo_local_capture_entry_only_when_declared(tmp_
 
     (tmp_path / "AGENTS.md").write_text("# repo\n\nui-surfaces: frontend/\n")
     assert "local capture entry point" not in render(tmp_path)
+
+
+def test_manifest_pin_matches_the_shipped_harness_bytes():
+    """The recorded digest moves in lockstep with the harness bytes (#735).
+
+    This is the owner repo's own blocking check: editing scripts/screenshots.mjs without the
+    matching re-pin in agentflow/capabilities.toml fails CI here, before merge. Half a re-pin is
+    a broken enrollment for every enrolled repo, so the digest and the bytes may only move
+    together — with the superseded digest retained in known_old_sha256 so enrolled repos still
+    holding it upgrade cleanly instead of all failing at once.
+    """
+    import hashlib
+    import tomllib
+
+    manifest = tomllib.loads(
+        (Path(__file__).parent.parent / "agentflow" / "capabilities.toml").read_text())
+    spec = next(item for item in manifest["capabilities"] if item["id"] == "screenshot-harness")
+    digest = hashlib.sha256(SCRIPT.read_bytes()).hexdigest()
+    assert spec["sha256"] == digest, (
+        "scripts/screenshots.mjs no longer matches the screenshot-harness sha256 recorded in "
+        "agentflow/capabilities.toml — re-pin deliberately: update sha256 and append the "
+        "superseded digest to known_old_sha256 in the same change (docs/capabilities.md)."
+    )
+    assert digest not in spec.get("known_old_sha256", []), (
+        "the current harness digest also appears in known_old_sha256 — the previous-pin list "
+        "must hold only superseded digests."
+    )
