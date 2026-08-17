@@ -40,8 +40,10 @@ from agentflow.coordinator.store import (
 from agentflow.gate import MAX_REVISES, revise_round_budget_remains
 from agentflow.labels import BUILDING, DRAWING, RESOLVING, TRIAGING
 from agentflow.pr_park import park_pr
-from agentflow.repo_facts import repo_profile
+from agentflow.repo_facts import (repo_profile, screenshot_entry, surface_declaration,
+                                  surfaces_phrase)
 from agentflow.review_policy import CONFLICT_UNCERTAINTY_PREFIX, current_head_author
+from agentflow.screenshot_crib import screenshot_entry_note
 from agentflow.stage_worktree import worktree_ready
 from agentflow.worktree_ref import source_facts
 
@@ -937,10 +939,13 @@ def _open_revise_on_blocking_review(coord: Coordinator, review_identity: str) ->
         coord.park_completed(review_identity)
         return
     findings = "\n".join(f"- {f.summary}" for f in verdict.blocking)
+    workdir, _pr_number = facts
     lead, _reviewer, _block_msg = pick_session_lead(
         stage="revise", complexity=complexity, effort=review.builder_effort)
     submission = (coordinated_revise.revise_submission(
         review, complexity, findings, target_sha=verdict.final_sha or review.target,
+        surfaces=surfaces_phrase(surface_declaration(workdir)),
+        screenshot_entry_note=screenshot_entry_note(screenshot_entry(workdir)),
         parent_pool=lead.tool) if lead is not None else None)
     if submission is not None:
         coord.submit_stage(submission)
@@ -992,6 +997,8 @@ def _open_revise_on_red_check(coord: Coordinator, review, records: dict) -> None
         stage="revise", complexity=complexity, effort=review.builder_effort)
     submission = (coordinated_revise.revise_submission(
         review, complexity, findings, target_sha=reviewed_head,
+        surfaces=surfaces_phrase(surface_declaration(workdir)),
+        screenshot_entry_note=screenshot_entry_note(screenshot_entry(workdir)),
         parent_pool=lead.tool) if lead is not None else None)
     if submission is not None:
         coord.submit_stage(submission)

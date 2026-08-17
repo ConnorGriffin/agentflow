@@ -636,6 +636,23 @@ def pr_content(repo: str, pr: int) -> PrContent | None:
         comments=_comments_of(data))
 
 
+def file_at_ref(repo: str, path: str, ref: str) -> bytes | None:
+    """The exact bytes of one file at one commit, or ``None`` if it can't be read — the file
+    doesn't exist at that ref, the read failed, or the Contents API payload isn't a well-formed
+    file blob. Reads through the Contents API at an exact commit, never the working tree or a
+    branch's moving head (mirrors the read `promotion_authority_read` does inline for one artifact
+    path, minimal and reusable for any pinned-path digest check)."""
+    data = _read_json(
+        ["api", f"repos/{repo}/contents/{quote(path, safe='/')}?ref={quote(ref, safe='')}"])
+    if (not isinstance(data, dict) or data.get("type") != "file"
+            or data.get("encoding") != "base64" or not isinstance(data.get("content"), str)):
+        return None
+    try:
+        return base64.b64decode("".join(data["content"].splitlines()), validate=True)
+    except binascii.Error:
+        return None
+
+
 def issue_comments(repo: str, issue: int) -> list[Comment] | None:
     """The issue's comments, or ``None`` if they can't be read. A real empty thread
     returns an empty list."""

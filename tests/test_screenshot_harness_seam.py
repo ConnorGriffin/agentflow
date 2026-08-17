@@ -205,7 +205,18 @@ def test_selector_crop_is_smaller_than_viewport(tmp_path):
 
 
 def test_js_clicks_and_focus_presses_change_captured_state(tmp_path):
-    """Per-shot synthetic clicks and keyboard steps capture the states they reveal."""
+    """Per-shot synthetic clicks and keyboard steps capture the states they reveal.
+
+    ``jsClicks`` is proven by comparing captured bytes: ``el.click()`` visibly repaints the page,
+    so a broken jsClicks step collapses the click shot's digest onto the initial shot's. ``presses``
+    cannot use that trick — Playwright's ``focus()`` alone draws a visible focus ring, so a shot
+    with `focus` set and NO `presses` already differs from the initial capture; a regression that
+    silently dropped the presses loop would still leave three pairwise-distinct digests and pass a
+    cardinality check. ``presses`` is proven instead through the harness's own ``assert`` block —
+    the mechanism the sibling tests in this file already use — which reads the exact page state
+    only the ArrowRight handler sets, so a broken ``presses`` step fails the run itself rather than
+    slipping past a digest comparison it was never positioned to catch.
+    """
     page = tmp_path / "interactions.html"
     page.write_text(
         "<!DOCTYPE html><html><body style='margin:0;background:white;height:100vh'>"
@@ -228,6 +239,11 @@ def test_js_clicks_and_focus_presses_change_captured_state(tmp_path):
                 "focus": "#keys",
                 "presses": ["ArrowRight"],
                 "out": str(tmp_path / "key-press.png"),
+                # The discriminating check: only the ArrowRight handler paints this exact blue.
+                # Focusing #keys alone (no press) leaves the background white, and a focus ring
+                # never satisfies a computed-backgroundColor assert.
+                "assert": {"theme": {"selector": "body", "value": None,
+                                     "backgroundColor": "rgb(0, 0, 255)"}},
             },
         ]
     }
@@ -238,11 +254,9 @@ def test_js_clicks_and_focus_presses_change_captured_state(tmp_path):
     output = _skip_if_env_unavailable(result)
 
     assert result.returncode == 0, f"interaction run failed:\n{output}"
-    digests = {
-        hashlib.sha256((tmp_path / name).read_bytes()).hexdigest()
-        for name in ("initial.png", "js-click.png", "key-press.png")
-    }
-    assert len(digests) == 3, "the interaction steps did not produce distinct captured states"
+    initial_digest = hashlib.sha256((tmp_path / "initial.png").read_bytes()).hexdigest()
+    click_digest = hashlib.sha256((tmp_path / "js-click.png").read_bytes()).hexdigest()
+    assert click_digest != initial_digest, "the jsClicks step did not visibly change the capture"
 
 
 def test_scroll_top_false_preserves_a_page_scroll_position(tmp_path):

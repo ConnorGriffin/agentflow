@@ -342,12 +342,14 @@ def _wire_opener(monkeypatch, review, *, head_checks, pr_state="OPEN", pr_head="
     captured = {}
     real_submission = coordinated_revise.revise_submission
 
-    def _submission(review_record, complexity, findings, *, target_sha="", parent_pool="claude"):
+    def _submission(review_record, complexity, findings, *, target_sha="", surfaces="",
+                    screenshot_entry_note="", parent_pool="claude"):
         captured.update(complexity=complexity, findings=findings, target_sha=target_sha,
+                        surfaces=surfaces, screenshot_entry_note=screenshot_entry_note,
                         parent_pool=parent_pool)
         return real_submission(
-            review_record, complexity, findings, target_sha=target_sha,
-            parent_pool=parent_pool)
+            review_record, complexity, findings, target_sha=target_sha, surfaces=surfaces,
+            screenshot_entry_note=screenshot_entry_note, parent_pool=parent_pool)
 
     monkeypatch.setattr("agentflow.coordinated_revise.revise_submission", _submission)
     monkeypatch.setattr(pipeline, "pick_session_lead",

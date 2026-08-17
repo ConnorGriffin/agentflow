@@ -4,6 +4,7 @@ The one thing that must never happen: MERGE without independent review + green C
 + clean verdict.
 """
 
+import hashlib
 import json
 import time
 from dataclasses import replace
@@ -407,11 +408,69 @@ class TestPinnedMutationGate:
         assert pinned_mutation_gap("o/r", 7) is None
 
     def test_the_live_gap_reads_the_prs_changed_files(self, monkeypatch):
+        # Path membership alone is a candidate gap, not the verdict: the digest read below is what
+        # actually confirms these are repo-local tampering rather than a legitimate re-addition.
         content = github.PrContent(
             body="", paths=("scripts/screenshots.mjs",), comments=[])
         monkeypatch.setattr(gate.github, "pr_content", lambda *a: content)
         monkeypatch.setattr(gate, "_owns_pin_manifest", lambda repo: False)
+        monkeypatch.setattr(gate.github, "pr_facts",
+                            lambda *a: github.PrFacts("branch", "deadbeef", "OPEN", ()))
+        monkeypatch.setattr(gate, "_pinned_digests", lambda: frozenset({"the-canonical-digest"}))
+        monkeypatch.setattr(gate.github, "file_at_ref", lambda *a: b"repo-local tampering")
         assert pinned_mutation_gap("o/r", 7) is True
+
+    def test_a_pr_that_adds_back_exactly_the_canonical_bytes_is_not_a_gap(self, monkeypatch):
+        # screenshot_crib.py tells every session without a copy of the harness to port agentflow's
+        # own in at exactly this path — that PR's changed-file set touches the pinned path, but it
+        # ships the canonical bytes and must not be parked as a mutation (#735).
+        canonical = b"canonical harness bytes"
+        content = github.PrContent(
+            body="", paths=("scripts/screenshots.mjs",), comments=[])
+        monkeypatch.setattr(gate.github, "pr_content", lambda *a: content)
+        monkeypatch.setattr(gate, "_owns_pin_manifest", lambda repo: False)
+        monkeypatch.setattr(gate.github, "pr_facts",
+                            lambda *a: github.PrFacts("branch", "deadbeef", "OPEN", ()))
+        monkeypatch.setattr(
+            gate, "_pinned_digests",
+            lambda: frozenset({hashlib.sha256(canonical).hexdigest()}))
+        monkeypatch.setattr(gate.github, "file_at_ref", lambda *a: canonical)
+        assert pinned_mutation_gap("o/r", 7) is False
+
+    def test_a_pr_that_restores_a_known_old_pin_is_not_a_gap(self, monkeypatch):
+        # A digest the manifest once canonically held (before a deliberate re-pin) is also not a
+        # mutation — the harness's own drift-repair path can land one of these too.
+        old_bytes = b"a previously-canonical harness revision"
+        content = github.PrContent(
+            body="", paths=("scripts/screenshots.mjs",), comments=[])
+        monkeypatch.setattr(gate.github, "pr_content", lambda *a: content)
+        monkeypatch.setattr(gate, "_owns_pin_manifest", lambda repo: False)
+        monkeypatch.setattr(gate.github, "pr_facts",
+                            lambda *a: github.PrFacts("branch", "deadbeef", "OPEN", ()))
+        monkeypatch.setattr(
+            gate, "_pinned_digests",
+            lambda: frozenset({"unrelated-current-digest", hashlib.sha256(old_bytes).hexdigest()}))
+        monkeypatch.setattr(gate.github, "file_at_ref", lambda *a: old_bytes)
+        assert pinned_mutation_gap("o/r", 7) is False
+
+    def test_unreadable_bytes_at_the_pr_head_defer_rather_than_park(self, monkeypatch):
+        content = github.PrContent(
+            body="", paths=("scripts/screenshots.mjs",), comments=[])
+        monkeypatch.setattr(gate.github, "pr_content", lambda *a: content)
+        monkeypatch.setattr(gate, "_owns_pin_manifest", lambda repo: False)
+        monkeypatch.setattr(gate.github, "pr_facts",
+                            lambda *a: github.PrFacts("branch", "deadbeef", "OPEN", ()))
+        monkeypatch.setattr(gate, "_pinned_digests", lambda: frozenset({"anything"}))
+        monkeypatch.setattr(gate.github, "file_at_ref", lambda *a: None)
+        assert pinned_mutation_gap("o/r", 7) is None
+
+    def test_an_unreadable_head_sha_defers_rather_than_parks(self, monkeypatch):
+        content = github.PrContent(
+            body="", paths=("scripts/screenshots.mjs",), comments=[])
+        monkeypatch.setattr(gate.github, "pr_content", lambda *a: content)
+        monkeypatch.setattr(gate, "_owns_pin_manifest", lambda repo: False)
+        monkeypatch.setattr(gate.github, "pr_facts", lambda *a: None)
+        assert pinned_mutation_gap("o/r", 7) is None
 
 
 # --- issue #18: an unanswered maintainer comment blocks auto-merge --------------

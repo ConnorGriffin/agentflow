@@ -1254,6 +1254,45 @@ def test_decision_revise_waits_for_capacity_without_parking_the_completed_review
     assert coord.parked == []
 
 
+def test_a_declaring_repos_revise_prompt_carries_its_entry_point_a_silent_repos_does_not(
+        tmp_path, monkeypatch):
+    """Issue #735 acceptance criterion 10: a repo that declares `screenshot-entry:` gets every
+    stage's capture instruction routed through its wrapper — including Revise, the stage most
+    likely to be fixing a missing screenshot. A repo that declares nothing keeps the unchanged
+    canonical instruction."""
+    review = Record(
+        identity="o/r|7|review|sha-a", stage="review", pool="codex", demand=1,
+        repo="o/r", subject="7", target="sha-a", builder_lineage="claude",
+        branch_lineage="claude", builder_complexity="deep", builder_effort="low",
+        source="/work/.agentflow/worktrees/codex-review/pr-42-fix")
+    monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [review])
+    monkeypatch.setattr(coordinated_review, "_review_verdict",
+                        lambda _r: Verdict(clean=False, findings=(Finding("blocking", "fix it"),)))
+    monkeypatch.setattr(pipeline, "pick_session_lead",
+                        lambda **_kwargs: (SimpleNamespace(tool="claude"), None, ""))
+
+    for declares in (True, False):
+        workdir = tmp_path / ("declaring" if declares else "silent")
+        workdir.mkdir()
+        text = "# repo\n\nui-surfaces: frontend/\n"
+        if declares:
+            text += "screenshot-entry: scripts/screenshots.local.mjs\n"
+        (workdir / "AGENTS.md").write_text(text)
+        monkeypatch.setattr(coordinated_revise, "_revise_builder_source",
+                            lambda _review, _workdir=str(workdir): (_workdir, 42))
+        submitted = []
+        coord = SimpleNamespace(
+            submit_stage=submitted.append,
+            park_completed=lambda *_a: pytest.fail("must not park"))
+
+        pipeline._open_revise_on_blocking_review(coord, review.identity)
+
+        assert len(submitted) == 1
+        carries_entry_point = (
+            "This repo declares a local capture entry point" in submitted[0].input_ptr)
+        assert carries_entry_point is declares
+
+
 def test_resolved_private_conflict_decision_reopens_full_product_review(monkeypatch):
     """The PR body may propose Focused, but the resolved decision remains Full and must restart
     the product→standards sequence over the resolved head."""
