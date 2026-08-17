@@ -11,6 +11,13 @@ pushed commit, and applies the repository's merge policy.
 > **macOS beta:** AgentFlow launches authenticated local coding agents, GitHub
 > CLI, Git, and uv. Run it only where unattended coding sessions are acceptable.
 
+## Documentation
+
+The full docs site is at
+[connorgriffin.github.io/agentflow](https://connorgriffin.github.io/agentflow/),
+starting with [How it works](https://connorgriffin.github.io/agentflow/how-it-works/).
+Serve it locally with `uv run --group docs mkdocs serve`.
+
 ## Mental model
 
 GitHub and the repository are the durable authority. AgentFlow executes ordinary
