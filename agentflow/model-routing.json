@@ -2,7 +2,9 @@
   "provenance": {
     "source": "ConnorGriffin/skills skills/orchestrate/references/routing-table.md",
     "benchmark_date": "2026-08-03",
-    "price_snapshot": "Per million input/output tokens: Opus $5/$25; Sonnet $3/$15; Haiku $1/$5; Sol $5/$30; Terra $2.50/$15; Luna $1/$6.",
+    "price_snapshot": "Per million input/cached-read/output tokens, verified 2026-08-17 against platform.claude.com/docs/en/about-claude/pricing and developers.openai.com/api/docs/pricing: Opus $5/$0.50/$25; Sonnet $2/$0.20/$10; Haiku $1/$0.10/$5; Sol $5/$0.50/$30; Terra $2/$0.20/$12; Luna $0.20/$0.02/$1.20.",
+    "price_verified_date": "2026-08-17",
+    "context_note": "Codex prices are the short-context tier; the long-context tier is 2x input/cached-read and 1.5x output. Telemetry records no context length, so estimates use short context and understate any long-context attempt (ADR 750).",
     "alias_note": "Claude aliases are unversioned; re-verify this benchmark stamp when Anthropic rolls a snapshot."
   },
   "models": {
@@ -15,12 +17,12 @@
     "luna": {"provider": "codex", "cli_id": "gpt-5.6-luna", "role": "worker"}
   },
   "rate_card": {
-    "opus": {"input": 5, "output": 25},
-    "sonnet": {"input": 3, "output": 15},
-    "haiku": {"input": 1, "output": 5},
-    "sol": {"input": 5, "output": 30},
-    "terra": {"input": 2.5, "output": 15},
-    "luna": {"input": 1, "output": 6}
+    "opus": {"input": 5, "cached_input": 0.5, "output": 25},
+    "sonnet": {"input": 2, "cached_input": 0.2, "output": 10},
+    "haiku": {"input": 1, "cached_input": 0.1, "output": 5},
+    "sol": {"input": 5, "cached_input": 0.5, "output": 30},
+    "terra": {"input": 2, "cached_input": 0.2, "output": 12},
+    "luna": {"input": 0.2, "cached_input": 0.02, "output": 1.2}
   },
   "worker_reasoning": {
     "low": "low",

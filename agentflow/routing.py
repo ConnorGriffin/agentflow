@@ -38,6 +38,8 @@ class Provenance:
     source: str
     benchmark_date: str
     price_snapshot: str
+    price_verified_date: str = ""   # when the snapshot was last checked against vendor pricing
+    context_note: str = ""          # which context tier the prices are, when a vendor tiers them
     alias_note: str = ""
 
 
@@ -124,13 +126,14 @@ class CapabilityRouting:
     def _validate_rate_card(rate_card, models: dict) -> dict[str, tuple[float, float]]:
         """Per-million-token USD rates, keyed by internal model name. Absent entirely on a
         table with no priced models; a model priced here must already exist in ``models``, and
-        a malformed rate is a load-time config error rather than a silent zero. No cached-read
-        rate is ever carried — cached reads are excluded from every estimate that reads this."""
+        a malformed rate is a load-time config error rather than a silent zero. ``cached_input``
+        is optional: a model without one leaves its cached reads unpriced and disclosed rather
+        than charged at the fresh-input rate (ADR 750)."""
         if rate_card is None:
             return {}
         if not isinstance(rate_card, dict):
             raise RoutingConfigError("rate_card must be an object")
-        checked: dict[str, tuple[float, float]] = {}
+        checked: dict[str, tuple[float, float, float | None]] = {}
         for name, rates in rate_card.items():
             if name not in models:
                 raise RoutingConfigError(f"rate_card prices unknown model {name!r}")
@@ -139,13 +142,14 @@ class CapabilityRouting:
             try:
                 input_rate = float(rates["input"])
                 output_rate = float(rates["output"])
+                cached_rate = None if rates.get("cached_input") is None else float(rates["cached_input"])
             except (KeyError, TypeError, ValueError) as exc:
                 raise RoutingConfigError(f"rate_card entry {name!r} has a malformed rate") from exc
-            if isinstance(rates.get("input"), bool) or isinstance(rates.get("output"), bool):
+            if any(isinstance(rates.get(key), bool) for key in ("input", "output", "cached_input")):
                 raise RoutingConfigError(f"rate_card entry {name!r} has a malformed rate")
-            if input_rate < 0 or output_rate < 0:
+            if input_rate < 0 or output_rate < 0 or (cached_rate is not None and cached_rate < 0):
                 raise RoutingConfigError(f"rate_card entry {name!r} has a negative rate")
-            checked[name] = (input_rate, output_rate)
+            checked[name] = (input_rate, output_rate, cached_rate)
         return checked
 
     @staticmethod
@@ -274,12 +278,22 @@ class CapabilityRouting:
         return RouteSelection(
             repository, stage, provider, model, f"production/{profile_id}", launch)
 
+    def prices_cached_reads(self, model: str) -> bool:
+        """Whether the rate card carries a cached-read price for this model, so a caller can
+        disclose the omission for one that does not (ADR 750)."""
+        name = self._resolve_model_name(model)
+        rates = self._rate_card.get(name) if name is not None else None
+        return rates is not None and rates[2] is not None
+
     def estimate_cost_usd(self, model: str, *, input_tokens: int | None = None,
                           output_tokens: int | None = None,
-                          reasoning_output_tokens: int | None = None) -> float | None:
-        """A dollar estimate for one model's fresh input plus output tokens, priced from the rate
-        card (per-million-token USD). Cached reads are never priced — they are not even accepted
-        here. ``reasoning_output_tokens`` is priced at the output rate only as a *fallback* when
+                          reasoning_output_tokens: int | None = None,
+                          cached_input_tokens: int | None = None) -> float | None:
+        """A dollar estimate for one model's fresh input, cached reads, and output tokens, priced
+        from the rate card (per-million-token USD). Cached reads are charged at the card's
+        ``cached_input`` rate; a model the card gives no cached rate leaves them out of the
+        estimate entirely rather than charging them at the fresh-input rate, and the caller
+        discloses the omission (ADR 750). ``reasoning_output_tokens`` is priced at the output rate only as a *fallback* when
         ``output_tokens`` is absent, never added on top of it: Codex's usage shape reports
         reasoning tokens as a subset of the blended output total (codex-rs's ``TokenUsage`` sums
         non-cached input and output for the blended total; reasoning is informational detail
@@ -287,7 +301,8 @@ class CapabilityRouting:
         it. Resolves both internal model names and provider/CLI ids; returns ``None`` for an
         unknown or unpriced model, or when no token fact was given at all — never a guessed
         figure."""
-        if input_tokens is None and output_tokens is None and reasoning_output_tokens is None:
+        if (input_tokens is None and output_tokens is None and reasoning_output_tokens is None
+                and cached_input_tokens is None):
             return None
         name = self._resolve_model_name(model)
         if name is None:
@@ -295,10 +310,12 @@ class CapabilityRouting:
         rates = self._rate_card.get(name)
         if rates is None:
             return None
-        input_rate, output_rate = rates
+        input_rate, output_rate, cached_rate = rates
         fresh_in = input_tokens or 0
         out = output_tokens if output_tokens is not None else (reasoning_output_tokens or 0)
-        return (fresh_in / 1_000_000) * input_rate + (out / 1_000_000) * output_rate
+        cached_in = (cached_input_tokens or 0) if cached_rate is not None else 0
+        return ((fresh_in / 1_000_000) * input_rate + (out / 1_000_000) * output_rate
+                + (cached_in / 1_000_000) * (cached_rate or 0))
 
     def cli_identifier(self, provider: str, model: str) -> str:
         """Resolve an internal model name (or already-resolved id) for one provider."""

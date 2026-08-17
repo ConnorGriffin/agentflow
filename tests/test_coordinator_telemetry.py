@@ -259,7 +259,7 @@ def test_rolling_projection_prices_codex_from_the_rate_card_and_marks_it_estimat
 
     totals = project(store).total
 
-    expected = 200 * 1 / 1_000_000 + 40 * 6 / 1_000_000
+    expected = 200 * 0.2 / 1_000_000 + 40 * 1.2 / 1_000_000
     assert totals.cost_usd == 0
     assert totals.estimated_cost_usd == pytest.approx(expected)
     assert totals.cost_missing == 0
@@ -274,7 +274,7 @@ def test_rolling_projection_prices_an_unbilled_attributed_codex_worker(tmp_path)
 
     totals = project(store).total
 
-    expected = 200 * 2.5 / 1_000_000 + 40 * 15 / 1_000_000
+    expected = 200 * 2 / 1_000_000 + 40 * 12 / 1_000_000
     assert totals.cost_usd == 0
     assert totals.estimated_cost_usd == pytest.approx(expected)
     assert totals.cost_missing == 0
@@ -350,14 +350,14 @@ def test_spend_report_uses_delegate_models_and_keeps_token_only_codex_rows(tmp_p
     assert rows[("build", "fable")].tokens == 120
     assert rows[("build", "sonnet")].cost_usd == pytest.approx(0.12)
     assert rows[("build", "gpt-5.6-terra")].tokens == 360
-    # Terra ($2.50/$15 per million in/out) prices from the rate card since it is not billed.
+    # Terra ($2/$12 per million in/out) prices from the rate card since it is not billed.
     assert rows[("build", "gpt-5.6-terra")].cost_usd == pytest.approx(
-        300 * 2.5 / 1_000_000 + 60 * 15 / 1_000_000)
+        300 * 2 / 1_000_000 + 60 * 12 / 1_000_000)
     assert rows[("build", "gpt-5.6-terra")].estimated is True
     assert rows[("review", "luna")].tokens == 240
     # Luna prices from the card too (input/output tokens only, from the fallback usage row).
     assert rows[("review", "luna")].cost_usd == pytest.approx(
-        200 * 1 / 1_000_000 + 40 * 6 / 1_000_000)
+        200 * 0.2 / 1_000_000 + 40 * 1.2 / 1_000_000)
     assert rows[("review", "luna")].estimated is True
 
 
@@ -387,7 +387,9 @@ def test_format_spend_report_flags_every_estimated_row_and_a_total_would_mix_est
             assert "est" not in line   # provider-billed, never flagged
 
 
-def test_spend_report_discloses_cached_input_omitted_from_an_estimate(tmp_path):
+def test_spend_report_prices_cached_reads_and_drops_the_omission_note(tmp_path):
+    # ADR 750: luna's cached reads are charged at $0.02/M, so they are in the dollar figure and
+    # there is nothing left to disclose. Cached reads dominate real attempts — 95 of 101 here.
     store = tmp_path / "records.db"
     record_attempt(store, _entry(
         token="cached", stage="review", model="luna",
@@ -398,6 +400,30 @@ def test_spend_report_discloses_cached_input_omitted_from_an_estimate(tmp_path):
     (row,) = report.rows
 
     assert row.estimated is True
+    assert row.cost_usd == pytest.approx(
+        5 * 0.2 / 1_000_000 + 95 * 0.02 / 1_000_000 + 1 * 1.2 / 1_000_000)
+    assert row.unpriced_cached_input_tokens == 0
+    assert "cached input not priced" not in format_spend_report(report)
+
+
+def test_spend_report_still_discloses_cached_input_for_a_model_with_no_cached_rate(
+        tmp_path, monkeypatch):
+    # The #531 fail-closed path survives for any model priced before its cached rate is known.
+    from agentflow.routing import routing as routing_table
+
+    input_rate, output_rate, _cached = routing_table._rate_card["luna"]
+    monkeypatch.setitem(routing_table._rate_card, "luna", (input_rate, output_rate, None))
+    store = tmp_path / "records.db"
+    record_attempt(store, _entry(
+        token="cached", stage="review", model="luna",
+        usage=AttemptUsage(model_costs=(
+            ModelCost("luna", None, input_tokens=5, cached_input_tokens=95, output_tokens=1),))))
+
+    report = spend_report(store, start=50, end=150)
+    (row,) = report.rows
+
+    assert row.estimated is True
+    assert row.cost_usd == pytest.approx(5 * 0.2 / 1_000_000 + 1 * 1.2 / 1_000_000)
     assert row.unpriced_cached_input_tokens == 95
     assert "cached input not priced (95 tokens)" in format_spend_report(report)
 
