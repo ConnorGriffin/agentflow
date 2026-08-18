@@ -27,9 +27,11 @@ ui-surfaces: agentflow/webui/src/
   To set changes aside, commit them on your own branch — a WIP commit you amend or drop later
   is worktree-local and costs nothing. If you find work in your tree you did not write, do not
   discard it: save it (`git diff > <patch>`) and say so.
-- **Driving the pipeline by hand needs the daemon's env.** `AGENTFLOW_PERMIT_BUDGET=25` lives
-  only in the launchd plist, so a by-hand `build_issue` / `review_pr` reads the packaged default
-  of 5 and reports `no pool has headroom` against a budget the daemon is not using. Prefix
+- **Driving the pipeline by hand needs the daemon's env.** The daemon's `AGENTFLOW_*` tuning
+  (including `AGENTFLOW_PERMIT_BUDGET=25`) comes from the operator's environment at service
+  install time: `install()` copies every set `AGENTFLOW_*` variable into the generated launchd
+  plist. A by-hand `build_issue` / `review_pr` doesn't see that plist, reads the packaged default
+  of 5, and reports `no pool has headroom` against a budget the daemon is not using. Prefix
   `AGENTFLOW_PERMIT_BUDGET=25` on by-hand invocations. A by-hand verb reporting Codex as
   `capacity helper not configured` is the same launchd-only blind spot (#727), not a real
   misconfiguration — never diagnose Codex capacity from it.

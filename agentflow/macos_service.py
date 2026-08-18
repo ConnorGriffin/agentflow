@@ -139,6 +139,13 @@ def install(config: Path) -> None:
     helper = os.environ.get("AGENTFLOW_CAPACITY_HELPER")
     if helper:
         daemon_environment["AGENTFLOW_CAPACITY_HELPER"] = str(_validated_helper_path(helper))
+    # Every other AGENTFLOW_* knob the operator has set (permit budget, session
+    # ceiling, stage concurrency, tick timings, …) rides along verbatim so the
+    # daemon runs on the operator's values instead of packaged defaults. The
+    # keys above stay authoritative: the helper only enters via validation.
+    for name, value in sorted(os.environ.items()):
+        if name.startswith("AGENTFLOW_") and value and name not in daemon_environment:
+            daemon_environment[name] = value
     daemon_plist = _write_service(
         DAEMON_LABEL,
         [executable, "daemon"],

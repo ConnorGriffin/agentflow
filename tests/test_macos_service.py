@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import plistlib
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -103,6 +105,96 @@ def test_probe_console_reports_unreachable_on_a_non_ok_status():
     finally:
         server.shutdown()
         thread.join(timeout=5)
+
+
+@pytest.fixture
+def installed_plists(tmp_path, monkeypatch):
+    """Run ``install()`` against a scratch home with launchctl stubbed out.
+
+    Returns a callable that installs and hands back the parsed daemon and console
+    plists, with every ambient ``AGENTFLOW_*`` variable cleared first so tests
+    control the operator environment exactly."""
+    home = tmp_path / "home"
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setattr(macos_service, "_bootstrap", lambda label, plist: None)
+    monkeypatch.setattr(macos_service, "_executable", lambda: tmp_path / "agentflow")
+    for name in [n for n in os.environ if n.startswith("AGENTFLOW_")]:
+        monkeypatch.delenv(name)
+    config = tmp_path / "agentflow.toml"
+    config.write_text("")
+
+    def run():
+        install(config)
+        agents = home / "Library" / "LaunchAgents"
+        return (
+            plistlib.loads((agents / "agentflow.daemon.plist").read_bytes()),
+            plistlib.loads((agents / "agentflow.console.plist").read_bytes()),
+        )
+
+    return run
+
+
+def test_install_carries_the_operator_permit_budget_into_the_daemon_job(
+    installed_plists, monkeypatch
+):
+    monkeypatch.setenv("AGENTFLOW_PERMIT_BUDGET", "25")
+
+    daemon, _ = installed_plists()
+
+    assert daemon["EnvironmentVariables"]["AGENTFLOW_PERMIT_BUDGET"] == "25"
+
+
+def test_install_carries_every_set_runtime_knob_into_the_daemon_job(
+    installed_plists, monkeypatch
+):
+    knobs = {
+        "AGENTFLOW_MAX_SESSIONS": "6",
+        "AGENTFLOW_TRIAGE_CONCURRENCY": "4",
+        "AGENTFLOW_BUILD_CONCURRENCY": "3",
+    }
+    for name, value in knobs.items():
+        monkeypatch.setenv(name, value)
+
+    daemon, _ = installed_plists()
+
+    for name, value in knobs.items():
+        assert daemon["EnvironmentVariables"][name] == value
+
+
+def test_install_without_runtime_knobs_writes_only_the_explicit_values(
+    installed_plists, tmp_path
+):
+    daemon, console = installed_plists()
+
+    assert set(daemon["EnvironmentVariables"]) == {
+        "AGENTFLOW_CONFIG",
+        "AGENTFLOW_STATE",
+        "PATH",
+    }
+    assert daemon["EnvironmentVariables"]["AGENTFLOW_CONFIG"] == str(
+        (tmp_path / "agentflow.toml").resolve()
+    )
+    assert set(console["EnvironmentVariables"]) == {"AGENTFLOW_STATE", "PATH"}
+
+
+def test_install_keeps_the_console_job_free_of_dispatch_tuning(
+    installed_plists, monkeypatch
+):
+    monkeypatch.setenv("AGENTFLOW_PERMIT_BUDGET", "25")
+
+    _, console = installed_plists()
+
+    assert set(console["EnvironmentVariables"]) == {"AGENTFLOW_STATE", "PATH"}
+
+
+def test_install_validates_the_capacity_helper_even_with_pass_through(
+    installed_plists, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("AGENTFLOW_CAPACITY_HELPER", str(tmp_path / "missing-helper"))
+    monkeypatch.setenv("AGENTFLOW_PERMIT_BUDGET", "25")
+
+    with pytest.raises(ServiceError, match="AGENTFLOW_CAPACITY_HELPER"):
+        installed_plists()
 
 
 def test_install_rejects_a_capacity_helper_that_does_not_resolve_to_a_file(
