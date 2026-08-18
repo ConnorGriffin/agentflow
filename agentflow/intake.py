@@ -496,7 +496,12 @@ WORKED SEPARABILITY EXAMPLES (merged AgentFlow issues; follow the judgment, not 
 Your final response IS the decision as a structured object — the harness enforces its
 schema natively, so you do not hand-write or fence the JSON; just produce these fields:
 - "route": "ready" | "grill" | "mockup"
-- "title": the rewritten title
+- "title": the rewritten title, in plain language a tired maintainer scans in a list. Name
+  the user-visible behavior or outcome in the words a person would say out loud — never
+  internal vocabulary the reader must already know (module names, estimator names, coined
+  terms like "gate spec" or "assertion floor") unless the repo's own docs use them as
+  user-facing words. Test: someone who has never read the codebase should know what the
+  ticket is about from the title alone. A filed title that already reads this way stays
 - "body": the Markdown to post (put all human-facing prose here)
 - "complexity": "standard" | "deep" — REQUIRED for "ready"; null for a hold
 - "effort": "low" | "medium" | "high" | "extra" — for "ready"; null for a hold
