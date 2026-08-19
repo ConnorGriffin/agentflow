@@ -463,7 +463,10 @@ class CapabilityRouting:
             "and non-zero result as the worker outcome. If a yielded agentflow-codex-worker command "
             "returns a running handle, poll that exact handle until terminal and never relaunch it "
             "while active; use its eventual result. Never use `spawn_agent`, `agent_type`, or hidden "
-            "role fields."
+            "role fields. If the command itself cannot be resolved (exit 127 / command not found), "
+            "that is a named environment failure of this session's runtime, not a worker outcome: "
+            "report it as an environment failure in the final handoff instead of silently doing "
+            "the work yourself."
         )
         slicing = ""
         current_brief = "\n" + brief.partition(self._ORIGINAL_ISSUE_MARK)[0]

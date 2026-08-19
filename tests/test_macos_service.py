@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import plistlib
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -137,6 +138,74 @@ def test_install_rejects_a_relative_capacity_helper(tmp_path, monkeypatch):
         install(config)
 
     assert not (home / "Library" / "LaunchAgents" / "agentflow.daemon.plist").exists()
+
+
+def test_install_prepends_the_executable_directory_to_the_daemon_path(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "home"
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setattr(macos_service, "_bootstrap", lambda label, plist_path: None)
+
+    script_dir = tmp_path / "venv" / "bin"
+    script_dir.mkdir(parents=True)
+    monkeypatch.setattr(macos_service, "_executable", lambda: script_dir / "agentflow")
+
+    narrow_path = "/usr/bin:/bin"
+    monkeypatch.setenv("PATH", narrow_path)
+
+    config = tmp_path / "agentflow.toml"
+    config.write_text("")
+
+    install(config)
+
+    daemon_plist = home / "Library" / "LaunchAgents" / "agentflow.daemon.plist"
+    daemon_service = plistlib.loads(daemon_plist.read_bytes())
+    assert daemon_service["EnvironmentVariables"]["PATH"] == f"{script_dir}:{narrow_path}"
+
+
+def test_install_leaves_the_console_path_unchanged(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setattr(macos_service, "_bootstrap", lambda label, plist_path: None)
+
+    script_dir = tmp_path / "venv" / "bin"
+    script_dir.mkdir(parents=True)
+    monkeypatch.setattr(macos_service, "_executable", lambda: script_dir / "agentflow")
+
+    narrow_path = "/usr/bin:/bin"
+    monkeypatch.setenv("PATH", narrow_path)
+
+    config = tmp_path / "agentflow.toml"
+    config.write_text("")
+
+    install(config)
+
+    console_plist = home / "Library" / "LaunchAgents" / "agentflow.console.plist"
+    console_service = plistlib.loads(console_plist.read_bytes())
+    assert console_service["EnvironmentVariables"]["PATH"] == narrow_path
+
+
+def test_install_does_not_duplicate_the_script_dir_already_in_path(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setattr(macos_service, "_bootstrap", lambda label, plist_path: None)
+
+    script_dir = tmp_path / "venv" / "bin"
+    script_dir.mkdir(parents=True)
+    monkeypatch.setattr(macos_service, "_executable", lambda: script_dir / "agentflow")
+
+    already_present_path = f"/usr/bin:{script_dir}:/bin"
+    monkeypatch.setenv("PATH", already_present_path)
+
+    config = tmp_path / "agentflow.toml"
+    config.write_text("")
+
+    install(config)
+
+    daemon_plist = home / "Library" / "LaunchAgents" / "agentflow.daemon.plist"
+    daemon_service = plistlib.loads(daemon_plist.read_bytes())
+    assert daemon_service["EnvironmentVariables"]["PATH"] == already_present_path
 
 
 def test_install_rejects_a_capacity_helper_with_relative_path_segments(

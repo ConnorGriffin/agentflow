@@ -127,14 +127,21 @@ def install(config: Path) -> None:
     stale copy of either is never left running after an install."""
     agents = Path.home() / "Library" / "LaunchAgents"
     agents.mkdir(parents=True, exist_ok=True)
-    executable = str(_executable())
+    executable_path = _executable()
+    executable = str(executable_path)
     state = str(_runtime_path("AGENTFLOW_STATE", "~/.agentflow"))
     path = os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+
+    script_dir = str(executable_path.parent)
+    if script_dir in path.split(os.pathsep):
+        daemon_path = path
+    else:
+        daemon_path = f"{script_dir}{os.pathsep}{path}"
 
     daemon_environment = {
         "AGENTFLOW_CONFIG": str(config.resolve()),
         "AGENTFLOW_STATE": state,
-        "PATH": path,
+        "PATH": daemon_path,
     }
     helper = os.environ.get("AGENTFLOW_CAPACITY_HELPER")
     if helper:
