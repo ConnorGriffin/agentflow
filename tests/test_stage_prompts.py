@@ -333,3 +333,31 @@ def test_pushing_stage_forbids_the_improvisations_sessions_reached_for(stage):
 @pytest.mark.parametrize("stage", sorted(set(STAGE_PROMPTS) - set(PUSHING_STAGES)))
 def test_non_pushing_stage_carries_no_remote_access_guidance(stage):
     assert "gh auth git-credential" not in _rendered(stage)
+
+
+# The stages that run the repository's test gate under a lease. Recognition is what grants the
+# long lease, so the shape the briefing recommends must be the shape the coordinator recognizes.
+TESTING_STAGES = ("build", "revise")
+
+
+@pytest.mark.parametrize("stage", TESTING_STAGES)
+def test_testing_stage_demands_a_bare_test_command(stage):
+    rendered = _rendered(stage)
+    assert "BARE command" in rendered
+    assert "2>&1 | tail" in rendered
+
+
+@pytest.mark.parametrize("stage", TESTING_STAGES)
+def test_the_shape_the_briefing_recommends_is_the_shape_supervision_recognizes(stage):
+    """Guard the drift that cost issue #767 all three of its attempts.
+
+    The briefing is only useful if the command it names actually earns the long lease, so
+    assert it against the recognizer itself rather than against a copy of its rules.
+    """
+    from agentflow.coordinator._launch_child import _recognized_test
+    rendered = _rendered(stage)
+    for recommended in ("uv run pytest -q", "pytest -q"):
+        assert recommended in rendered
+        assert _recognized_test(recommended, "claude")
+    for refused in ("uv run pytest -q 2>&1 | tail -5", "VAR=x uv run pytest -q"):
+        assert not _recognized_test(refused, "claude")
