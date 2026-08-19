@@ -134,6 +134,20 @@ PLAIN_LANGUAGE_RULE = ("Keep the PR body in plain app language for the human who
 # helper is reachable from inside one (issue #768).  Until worktree preparation configures this,
 # name the two forms that actually work — sessions that are left to discover it improvise askpass
 # scripts and on-disk token files, which is both wasteful and the wrong shape.
+# A Build session's silent lease is short; the longer lease that covers a real test run is only
+# granted when the coordinator RECOGNIZES the command as a test, and recognition deliberately
+# refuses shell composition (`_recognized_test`).  A session that pipes its suite to `tail` or
+# prefixes it with an env assignment silently forfeits that lease and is killed mid-run — which
+# is exactly how issue #767 lost all three of its attempts while its work sat finished and
+# committed.  The sandbox guidance above pushes toward composition, so say this explicitly.
+TEST_COMMAND_SHAPE = """Run the repository's test gate as a BARE command — nothing before it and
+nothing after it. `uv run pytest -q` or `pytest -q`, not `... 2>&1 | tail -5`, not
+`VAR=x uv run pytest -q`, not a wrapper script you wrote. Only the bare form is recognized as a
+test run, and only a recognized test run gets the long lease that a full suite needs; a piped or
+prefixed one is treated as ordinary work and your session is killed part-way through it, losing
+the attempt with your work unshipped. Let the output be long — that costs you nothing here, and
+truncating it costs you the whole attempt."""
+
 GIT_REMOTE_ACCESS = """Reaching GitHub from this worktree: the `origin` remote is SSH and fails
 here with `nc: authentication method negotiation failed`. Don't debug that, don't write a token
 to a file, and don't edit any git config — use the repository's HTTPS URL with gh's credential
@@ -158,6 +172,8 @@ public interface** — and, where it fits, one that **failed first for the right
 (the charter test standard) — then make the suite green. Run the `/tdd` skill for the
 test cycle — it owns the vertical-slice cadence and the public-interface test rules; the
 sentence above is its summary, not its replacement.
+
+""" + TEST_COMMAND_SHAPE + """
 
 Before every push, ensure every non-merge commit you create or amend is DCO-signed: use
 `git commit -s` for new commits and `git commit --amend -s` for amendments. Each
@@ -211,6 +227,8 @@ of guessing.""" + SHELL_CRIB
 
 REVISE_PROMPT = """Address the blocking review findings on PR #{n} in this worktree,
 push to the same branch, and keep the test suite green. Do NOT open a new PR.
+
+""" + TEST_COMMAND_SHAPE + """
 
 Before every push, ensure every non-merge commit you create or amend is DCO-signed: use
 `git commit -s` for new commits and `git commit --amend -s` for amendments. Each
