@@ -302,3 +302,34 @@ def test_methodology_preflight_fails_closed_for_release_or_dependency_incompatib
     result = preflight(tmp_path, "build", "codex", (requirement,))
 
     assert result.state == "incompatible"
+
+
+# The stages that push are the only ones that need the remote-access guidance; a session left to
+# discover it improvises askpass scripts and on-disk token files instead (issue #768).
+PUSHING_STAGES = ("build", "revise", "respond", "mockup")
+
+
+def _rendered(stage: str) -> str:
+    spec = STAGE_PROMPTS[stage]
+    import re
+    fields = set(re.findall(r"{(\w+)}", spec.template))
+    return spec.render(**{field: "X" for field in fields})
+
+
+@pytest.mark.parametrize("stage", PUSHING_STAGES)
+def test_pushing_stage_names_the_remote_access_that_works(stage):
+    rendered = _rendered(stage)
+    assert "credential.helper='!gh auth git-credential'" in rendered
+    assert "main:refs/remotes/origin/main" in rendered
+
+
+@pytest.mark.parametrize("stage", PUSHING_STAGES)
+def test_pushing_stage_forbids_the_improvisations_sessions_reached_for(stage):
+    rendered = _rendered(stage)
+    assert "don't write a token" in rendered
+    assert "don't edit any git config" in rendered
+
+
+@pytest.mark.parametrize("stage", sorted(set(STAGE_PROMPTS) - set(PUSHING_STAGES)))
+def test_non_pushing_stage_carries_no_remote_access_guidance(stage):
+    assert "gh auth git-credential" not in _rendered(stage)

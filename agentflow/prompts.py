@@ -130,6 +130,20 @@ UI_GAP_REASON = ("touches a user-facing surface but has no before/after screensh
 PLAIN_LANGUAGE_RULE = ("Keep the PR body in plain app language for the human who merges — no "
                        "file/function/test names or CSS/API specifics.")
 
+# Fleet worktrees carry an SSH `origin` the sandboxed session cannot open, and no credential
+# helper is reachable from inside one (issue #768).  Until worktree preparation configures this,
+# name the two forms that actually work — sessions that are left to discover it improvise askpass
+# scripts and on-disk token files, which is both wasteful and the wrong shape.
+GIT_REMOTE_ACCESS = """Reaching GitHub from this worktree: the `origin` remote is SSH and fails
+here with `nc: authentication method negotiation failed`. Don't debug that, don't write a token
+to a file, and don't edit any git config — use the repository's HTTPS URL with gh's credential
+helper instead:
+- fetch: `git fetch https://github.com/<owner>/<repo>.git main:refs/remotes/origin/main`
+- push: `git -c credential.helper='!gh auth git-credential' push https://github.com/<owner>/<repo>.git HEAD:<branch>`
+If a push is rejected for a missing `workflow` scope, that is a limit on the operator's
+credential, not something to work around: say so plainly and stop."""
+
+
 
 BUILD_PROMPT = """Implement {repo} issue #{n}: {title}
 
@@ -150,6 +164,8 @@ Before every push, ensure every non-merge commit you create or amend is DCO-sign
 `Signed-off-by` email must match the Git commit author email. On a continuation, inspect
 the existing work and history first; repair an unsigned existing commit with an amendment
 where appropriate, never a separate sign-off-only or duplicate-work commit.
+
+""" + GIT_REMOTE_ACCESS + """
 
 Before opening the PR, check any module you introduced against the charter's deletion
 test and interface-depth rule, and deepen or inline whatever fails. Run `/codebase-design`
@@ -202,6 +218,8 @@ Before every push, ensure every non-merge commit you create or amend is DCO-sign
 the existing work and history first; repair an unsigned existing commit with an amendment
 where appropriate, never a separate sign-off-only or duplicate-work commit.
 
+""" + GIT_REMOTE_ACCESS + """
+
 Make the implementation judgment yourself when the issue brief, current `main`, surrounding code,
 and tests establish a safe answer. A merge conflict is not by itself missing context: reconcile
 both intended behaviors wherever they are compatible; neither side wins merely because it is newer.
@@ -244,6 +262,8 @@ Before every push, ensure every non-merge commit you create or amend is DCO-sign
 `Signed-off-by` email must match the Git commit author email. On a continuation, inspect
 the existing work and history first; repair an unsigned existing commit with an amendment
 where appropriate, never a separate sign-off-only or duplicate-work commit.
+
+""" + GIT_REMOTE_ACCESS + """
 
 Before doing anything, inspect both the conversation and the branch. This prompt may be a
 continuation after a partial outcome:
@@ -334,6 +354,8 @@ Before every push, ensure every non-merge commit you create or amend is DCO-sign
 `Signed-off-by` email must match the Git commit author email. On a continuation, inspect
 the existing work and history first; repair an unsigned existing commit with an amendment
 where appropriate, never a separate sign-off-only or duplicate-work commit.
+
+""" + GIT_REMOTE_ACCESS + """
 
 This may be a continuation after an interrupted session. Before changing anything, inspect the
 branch, worktree, and issue comments. Reuse committed or local variants and finish only missing
