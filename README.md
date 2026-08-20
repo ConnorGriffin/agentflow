@@ -1,5 +1,17 @@
 # AgentFlow
 
+## Archived
+
+AgentFlow is archived. The daemon no longer runs, the repository is no longer
+developed, and no issue, pull request, support, compatibility, or security
+response should be expected.
+
+The autonomous pipeline was too inconsistent and too expensive to keep running.
+The process it encoded now runs interactively through the
+[`ticket`](https://github.com/ConnorGriffin/skills/tree/main/skills/drivers/ticket)
+skill — `triage`, `start`, `revise`, `finalize` — which composes `scope`,
+`orchestrate`, `review`, and `ui-craft`. The source here stays public as a record.
+
 [![CI](https://github.com/ConnorGriffin/agentflow/actions/workflows/ci.yml/badge.svg)](https://github.com/ConnorGriffin/agentflow/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey.svg)](docs/public-beta.md)
